@@ -1,0 +1,12 @@
+node_modules/
+dist/
+release/
+.build/
+parity-output/
+coverage/
+*.webporpid
+*.wpp-spool
+*.tmp
+*.o
+*.s
+.DS_Store

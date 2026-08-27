@@ -1,0 +1,17 @@
+dataset: synthetic_toy
+samples:
+  sample_1:
+    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA
+    sec_str_primer: TAGG
+    panel: panels/toy_panel.fasta
+    ff_ref: panels/toy_functional_reference.fasta
+contaminationPanel: panels/toy_background_panel.fasta
+parameters:
+  minLength: 20
+  maxLength: 300
+  primerTolerance: 0
+  primerWindow: 100
+  contaminationFilter: false
+  panelThreshold: 1000
+  functionalMatchThreshold: 0.5
+  spoolPartitions: 8

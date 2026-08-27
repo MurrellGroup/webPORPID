@@ -1,0 +1,455 @@
+#include "webporpid/core.hpp"
+#include "webporpid/binary.hpp"
+
+#include <algorithm>
+#include <cmath>
+#include <map>
+#include <numbers>
+#include <numeric>
+#include <unordered_map>
+
+#ifdef __wasm_simd128__
+#include <wasm_simd128.h>
+#endif
+
+namespace webporpid {
+namespace {
+
+// Keep these 32 KiB vectors off the small WASI stack. Three simultaneous
+// std::array temporaries were enough to corrupt allocator metadata in release
+// builds even though native builds appeared healthy.
+using Kmers = std::vector<double>;
+
+int base_index(char value) {
+  switch (std::toupper(static_cast<unsigned char>(value))) {
+    case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; default: return -1;
+  }
+}
+
+Kmers kmer_counts(std::string_view sequence) {
+  Kmers counts(4096, 0.0); std::size_t code = 0, valid = 0;
+  for (char value : sequence) {
+    const int base = base_index(value);
+    if (base < 0) { code = 0; valid = 0; continue; }
+    code = ((code << 2) | static_cast<std::size_t>(base)) & 4095; ++valid;
+    if (valid >= 6) counts[code] += 1.0;
+  }
+  return counts;
+}
+
+double corrected_distance(const Kmers& left, const Kmers& right) {
+  double squared = 0.0, total = 0.0;
+#ifdef __wasm_simd128__
+  v128_t squared2 = wasm_f64x2_splat(0.0), total2 = wasm_f64x2_splat(0.0);
+  for (std::size_t index = 0; index < 4096; index += 2) {
+    const auto a = wasm_v128_load(left.data() + index), b = wasm_v128_load(right.data() + index);
+    const auto delta = wasm_f64x2_sub(a, b);
+    squared2 = wasm_f64x2_add(squared2, wasm_f64x2_mul(delta, delta));
+    total2 = wasm_f64x2_add(total2, wasm_f64x2_add(a, b));
+  }
+  squared = wasm_f64x2_extract_lane(squared2, 0) + wasm_f64x2_extract_lane(squared2, 1);
+  total = wasm_f64x2_extract_lane(total2, 0) + wasm_f64x2_extract_lane(total2, 1);
+#else
+  for (std::size_t index = 0; index < 4096; ++index) {
+    const double difference = left[index] - right[index]; squared += difference * difference;
+    total += left[index] + right[index];
+  }
+#endif
+  return total == 0.0 ? 0.0 : squared / (6.0 * total);
+}
+
+std::string mode(const std::vector<std::string>& values) {
+  if (values.empty()) return {};
+  std::unordered_map<std::string, std::size_t> counts;
+  std::string best = values.front(); std::size_t maximum = 1; counts[best] = 1;
+  for (std::size_t index = 1; index < values.size(); ++index) {
+    const auto count = ++counts[values[index]];
+    if (count > maximum) { maximum = count; best = values[index]; }
+  }
+  return best;
+}
+
+std::string degap(std::string_view value) {
+  std::string output; output.reserve(value.size());
+  for (char base : value) if (base != '-') output.push_back(base);
+  return output;
+}
+
+std::vector<std::size_t> reference_map(const Alignment& alignment) {
+  std::vector<std::size_t> output; output.reserve(alignment.reference.size());
+  for (std::size_t index = 0; index < alignment.reference.size(); ++index)
+    if (alignment.reference[index] != '-') output.push_back(index);
+  return output;
+}
+
+std::string centroid(const std::vector<std::string>& reads) {
+  Kmers mean(4096, 0.0);
+  for (const auto& read : reads) {
+    const auto counts = kmer_counts(read);
+    for (std::size_t index = 0; index < mean.size(); ++index) mean[index] += counts[index];
+  }
+  for (auto& value : mean) value /= reads.size();
+  std::size_t best = 0; double distance = std::numeric_limits<double>::infinity();
+  for (std::size_t index = 0; index < reads.size(); ++index) {
+    const auto counts = kmer_counts(reads[index]);
+    const double candidate = corrected_distance(counts, mean);
+    if (candidate < distance) { distance = candidate; best = index; }
+  }
+  return reads[best];
+}
+
+struct MappedAlignment { Alignment alignment; std::vector<std::size_t> map; };
+
+std::vector<MappedAlignment> align_reads(std::string_view reference, const std::vector<std::string>& reads, bool seeded = true) {
+  std::vector<MappedAlignment> output; output.reserve(reads.size());
+  for (const auto& read : reads) {
+    auto alignment = seeded ? seeded_global_align(reference, read) : needleman_wunsch(reference, read);
+    auto map = reference_map(alignment); output.push_back({std::move(alignment), std::move(map)});
+  }
+  return output;
+}
+
+std::string extension_consensus(std::vector<std::string> values, bool front) {
+  std::string consensus;
+  const auto longest = [&] {
+    std::size_t maximum = 0;
+    for (const auto& value : values) maximum = std::max(maximum, value.size());
+    return maximum;
+  }();
+  for (std::size_t iteration = 0; iteration <= longest
+       && std::count_if(values.begin(), values.end(), [](const auto& value) { return !value.empty(); }) > values.size() / 2.0;
+       ++iteration) {
+    std::vector<std::string> active;
+    for (const auto& value : values) if (!value.empty()) active.push_back(value);
+    consensus = mode(active);
+    auto alignments = align_reads(consensus, active, false);
+    std::vector<std::string> next; next.reserve(alignments.size());
+    for (const auto& mapped : alignments) {
+      if (mapped.map.empty()) { next.emplace_back(); continue; }
+      if (front) next.push_back(degap(std::string_view(mapped.alignment.query).substr(0, mapped.map.front())));
+      else next.push_back(degap(std::string_view(mapped.alignment.query).substr(mapped.map.back() + 1)));
+    }
+    if (next == values) break;
+    values = std::move(next);
+  }
+  return consensus;
+}
+
+std::string refine_reference(std::string_view candidate, const std::vector<std::string>& reads) {
+  if (candidate.size() < 2) return std::string(candidate);
+  auto alignments = align_reads(candidate, reads);
+  std::vector<bool> good(candidate.size(), true);
+  for (std::size_t position = 0; position + 1 < candidate.size(); ++position) {
+    std::size_t equal = 0;
+    for (const auto& mapped : alignments) {
+      if (mapped.map.size() <= position + 1) continue;
+      const auto observed = degap(std::string_view(mapped.alignment.query).substr(
+          mapped.map[position], mapped.map[position + 1] - mapped.map[position] + 1));
+      if (observed == candidate.substr(position, 2)) ++equal;
+    }
+    if (static_cast<double>(equal) / reads.size() < 0.7) good[position] = good[position + 1] = false;
+  }
+  std::vector<std::string> fronts, ends;
+  for (const auto& mapped : alignments) {
+    fronts.push_back(mapped.map.empty() ? std::string{} : degap(std::string_view(mapped.alignment.query).substr(0, mapped.map.front())));
+    ends.push_back(mapped.map.empty() ? std::string{} : degap(std::string_view(mapped.alignment.query).substr(mapped.map.back() + 1)));
+  }
+  const auto front = extension_consensus(std::move(fronts), true);
+  const auto end = extension_consensus(std::move(ends), false);
+  if (std::all_of(good.begin(), good.end(), [](bool value) { return value; })) return front + std::string(candidate) + end;
+
+  std::string rebuilt = front;
+  std::size_t position = 0;
+  while (position < candidate.size()) {
+    if (good[position]) { rebuilt.push_back(candidate[position++]); continue; }
+    const std::size_t start = position;
+    while (position < candidate.size() && !good[position]) ++position;
+    const std::size_t stop = position - 1;
+    std::vector<std::string> alternatives; alternatives.reserve(alignments.size());
+    for (const auto& mapped : alignments) {
+      if (mapped.map.size() <= stop) alternatives.emplace_back();
+      else alternatives.push_back(degap(std::string_view(mapped.alignment.query).substr(
+          mapped.map[start], mapped.map[stop] - mapped.map[start] + 1)));
+    }
+    rebuilt += mode(alternatives);
+  }
+  rebuilt += end; return rebuilt;
+}
+
+void agreement_summary(std::string_view candidate, const std::vector<std::string>& reads,
+                       double& minimum_agreement, std::vector<LowAgreementSite>& low_sites) {
+  const auto alignments = align_reads(candidate, reads, false);
+  std::vector<double> agreements(candidate.size(), 0.0);
+  std::vector<char> modal(candidate.size(), '-');
+  for (std::size_t position = 0; position < candidate.size(); ++position) {
+    std::vector<std::string> observed; observed.reserve(reads.size()); std::size_t equal = 0;
+    for (const auto& mapped : alignments) {
+      std::string value;
+      if (mapped.map.size() > position && mapped.alignment.query[mapped.map[position]] != '-')
+        value.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(mapped.alignment.query[mapped.map[position]]))));
+      if (value.size() == 1 && value[0] == std::toupper(static_cast<unsigned char>(candidate[position]))) ++equal;
+      observed.push_back(std::move(value));
+    }
+    agreements[position] = static_cast<double>(equal) / reads.size();
+    const auto value = mode(observed); if (!value.empty()) modal[position] = value[0];
+  }
+  if (agreements.size() > 2) minimum_agreement = *std::min_element(agreements.begin() + 1, agreements.end() - 1);
+  minimum_agreement = std::round(minimum_agreement * 100.0) / 100.0;
+  std::vector<std::size_t> runs(modal.size(), 0);
+  for (std::size_t start = 0; start < modal.size();) {
+    std::size_t end = start + 1; while (end < modal.size() && modal[end] == modal[start]) ++end;
+    std::fill(runs.begin() + start, runs.begin() + end, end - start); start = end;
+  }
+  for (std::size_t position = 0; position < candidate.size(); ++position) {
+    const auto rounded_agreement = std::round(agreements[position] * 100.0) / 100.0;
+    if (rounded_agreement <= minimum_agreement && modal[position] != '-')
+      low_sites.push_back({static_cast<std::uint32_t>(candidate.size() - position),
+        static_cast<float>(rounded_agreement), complement(modal[position]),
+        static_cast<std::uint32_t>(runs[position])});
+  }
+}
+
+std::vector<std::uint64_t> cutoffs(std::span<const std::uint8_t> bytes, std::string& error) {
+  binary::Reader reader(bytes); std::uint32_t count = 0;
+  if (!reader.magic("WPT1") || !reader.number(count) || count > 65535) { error = "Invalid downsampling thresholds."; return {}; }
+  std::vector<std::uint64_t> output(count);
+  for (auto& value : output) if (!reader.number(value)) { error = "Truncated downsampling thresholds."; return {}; }
+  if (!reader.done()) { error = "Downsampling thresholds have trailing bytes."; return {}; }
+  return output;
+}
+
+bool selected(const SpoolRecord& record, const std::vector<std::uint64_t>& values) {
+  return record.sample >= values.size() || record.sampling_hash <= values[record.sample];
+}
+
+std::string fixed_two(double value) {
+  const auto hundredths = static_cast<unsigned>(std::lround(std::clamp(value, 0.0, 1.0) * 100.0));
+  std::string output = std::to_string(hundredths / 100);
+  output.push_back('.'); output.push_back(static_cast<char>('0' + (hundredths / 10) % 10));
+  output.push_back(static_cast<char>('0' + hundredths % 10)); return output;
+}
+
+double mean(std::span<const double> values) {
+  return values.empty() ? 0.0 : std::accumulate(values.begin(), values.end(), 0.0) / values.size();
+}
+
+double ln_gamma(double value) {
+  constexpr std::array<double, 9> coefficients{{0.9999999999998099, 676.5203681218851, -1259.1392167224028,
+    771.32342877767613, -176.61502916214059, 12.507343278686905, -0.13857109526572012,
+    9.9843695780195716e-6, 1.5056327351493116e-7}};
+  if (value < 0.5) return std::log(std::numbers::pi) - std::log(std::sin(std::numbers::pi * value)) - ln_gamma(1.0 - value);
+  const double z = value - 1.0; double x = coefficients[0];
+  for (std::size_t index = 1; index < coefficients.size(); ++index) x += coefficients[index] / (z + index);
+  const double t = z + 7.5;
+  return 0.5 * std::log(2.0 * std::numbers::pi) + (z + 0.5) * std::log(t) - t + std::log(x);
+}
+
+double beta_fraction(double x, double a, double b) {
+  double c = 1.0, d = 1.0 - (a + b) * x / (a + 1.0); if (std::abs(d) < 1e-30) d = 1e-30;
+  d = 1.0 / d; double h = d;
+  for (int m = 1; m <= 200; ++m) {
+    const double m2 = 2.0 * m;
+    double aa = m * (b - m) * x / ((a + m2 - 1.0) * (a + m2));
+    d = 1.0 + aa * d; if (std::abs(d) < 1e-30) d = 1e-30;
+    c = 1.0 + aa / c; if (std::abs(c) < 1e-30) c = 1e-30;
+    d = 1.0 / d; h *= d * c;
+    aa = -(a + m) * (a + b + m) * x / ((a + m2) * (a + m2 + 1.0));
+    d = 1.0 + aa * d; if (std::abs(d) < 1e-30) d = 1e-30;
+    c = 1.0 + aa / c; if (std::abs(c) < 1e-30) c = 1e-30;
+    d = 1.0 / d; const double delta = d * c; h *= delta;
+    if (std::abs(delta - 1.0) < 3e-12) break;
+  }
+  return h;
+}
+
+double regularized_beta(double x, double a, double b) {
+  if (x <= 0.0) return 0.0;
+  if (x >= 1.0) return 1.0;
+  const double front = std::exp(ln_gamma(a + b) - ln_gamma(a) - ln_gamma(b) + a * std::log(x) + b * std::log(1.0 - x));
+  return x < (a + 1.0) / (a + b + 2.0) ? front * beta_fraction(x, a, b) / a
+       : 1.0 - front * beta_fraction(1.0 - x, b, a) / b;
+}
+
+double t_test(std::span<const double> left, std::span<const double> right) {
+  if (left.size() < 2 || right.size() < 2) return 1.0;
+  const double lm = mean(left), rm = mean(right);
+  double lv = 0.0, rv = 0.0;
+  for (double value : left) lv += (value - lm) * (value - lm);
+  for (double value : right) rv += (value - rm) * (value - rm);
+  lv /= left.size() - 1; rv /= right.size() - 1;
+  const double df = left.size() + right.size() - 2;
+  const double pooled = std::sqrt(((left.size() - 1) * lv + (right.size() - 1) * rv) / df);
+  if (pooled == 0.0) return lm == rm ? 1.0 : 0.0;
+  const double t = std::abs(lm - rm) / (pooled * std::sqrt(1.0 / left.size() + 1.0 / right.size()));
+  return regularized_beta(df / (df + t * t), df / 2.0, 0.5);
+}
+
+std::size_t sample_id_length(std::string_view primer) {
+  std::size_t length = 0; bool started = false;
+  for (char value : primer) {
+    if (std::islower(static_cast<unsigned char>(value))) { started = true; ++length; }
+    else if (started) break;
+  }
+  return length;
+}
+
+std::size_t umi_length(std::string_view primer) {
+  const auto start = primer.find_first_of("Nn"); if (start == std::string_view::npos) return 0;
+  const auto end = primer.find_first_not_of("Nn", start); return (end == std::string_view::npos ? primer.size() : end) - start;
+}
+
+bool heteroduplex(const std::vector<SpoolRecord>& reads, const Sample& sample) {
+  if (reads.empty() || std::any_of(reads.begin(), reads.end(), [](const auto& read) { return read.quality.size() < 50; })) return false;
+  std::array<double, 50> averages{};
+  for (const auto& read : reads) for (std::size_t position = 0; position < 50; ++position)
+    averages[position] += static_cast<unsigned char>(read.quality[position]) >= 33
+      ? (static_cast<unsigned char>(read.quality[position]) - 33.0) / reads.size() : 0.0;
+  const std::size_t start = sample_id_length(sample.cdna_primer), stop = start + umi_length(sample.cdna_primer);
+  if (start >= stop || stop + 25 > 50) return false;
+  const auto barcode = std::span(averages).subspan(start, stop - start);
+  const auto downstream = std::span(averages).subspan(stop + 4, 21);
+  if (mean(barcode) >= mean(downstream)) return false;
+  return t_test(barcode, downstream) < 1.0 / (5.0 * reads.size() * reads.size())
+      && *std::min_element(barcode.begin(), barcode.end()) < mean(downstream) / 2.0;
+}
+
+std::uint64_t read_ordinal(std::string_view name) {
+  std::size_t position = name.starts_with("seq") ? 3 : 0;
+  std::uint64_t value = 0; bool found = false;
+  while (position < name.size() && std::isdigit(static_cast<unsigned char>(name[position]))) {
+    found = true; value = value * 10 + static_cast<unsigned char>(name[position]) - '0'; ++position;
+  }
+  return found ? value : std::numeric_limits<std::uint64_t>::max();
+}
+
+Alignment iupac_primer_alignment(std::string_view reference, std::string_view query) {
+  const auto mask = [](char value) {
+    switch (std::toupper(static_cast<unsigned char>(value))) {
+      case 'A': return 1; case 'C': return 2; case 'G': return 4; case 'T': return 8; case 'N': return 15;
+      default: return 15;
+    }
+  };
+  constexpr int gap = 100000, edge_gap = 50000, compatible_penalty = 1;
+  const std::size_t rows = reference.size() + 1, columns = query.size() + 1;
+  std::vector<int> previous(columns), current(columns); std::vector<std::uint8_t> trace(rows * columns);
+  for (std::size_t column = 1; column < columns; ++column) { previous[column] = previous[column - 1] - edge_gap; trace[column] = 2; }
+  for (std::size_t row = 1; row < rows; ++row) {
+    current[0] = previous[0] - edge_gap; trace[row * columns] = 3;
+    for (std::size_t column = 1; column < columns; ++column) {
+      const auto left_base = static_cast<char>(std::toupper(static_cast<unsigned char>(reference[row - 1])));
+      const auto right_base = static_cast<char>(std::toupper(static_cast<unsigned char>(query[column - 1])));
+      const int emission = left_base == right_base ? 0
+        : ((mask(left_base) & mask(right_base)) ? -compatible_penalty : -gap);
+      const int diagonal = previous[column - 1] + emission;
+      const int left = current[column - 1] - (row == rows - 1 ? edge_gap : gap);
+      const int up = previous[column] - (column == columns - 1 ? edge_gap : gap);
+      if (diagonal >= left && diagonal >= up) { current[column] = diagonal; trace[row * columns + column] = 1; }
+      else if (left >= up) { current[column] = left; trace[row * columns + column] = 2; }
+      else { current[column] = up; trace[row * columns + column] = 3; }
+    }
+    previous.swap(current);
+  }
+  Alignment output; std::size_t row = reference.size(), column = query.size();
+  while (row || column) {
+    if (row == 0) { output.reference.push_back('-'); output.query.push_back(query[--column]); continue; }
+    if (column == 0) { output.reference.push_back(reference[--row]); output.query.push_back('-'); continue; }
+    const auto op = trace[row * columns + column];
+    if (op == 1) { output.reference.push_back(reference[--row]); output.query.push_back(query[--column]); }
+    else if (op == 2) { output.reference.push_back('-'); output.query.push_back(query[--column]); }
+    else { output.reference.push_back(reference[--row]); output.query.push_back('-'); }
+  }
+  std::reverse(output.reference.begin(), output.reference.end()); std::reverse(output.query.begin(), output.query.end()); return output;
+}
+
+std::string primer_trim(std::string_view sequence, std::string_view primer) {
+  if (sequence.empty() || primer.empty()) return std::string(sequence);
+  if (sequence.size() >= primer.size()) {
+    bool compatible = true;
+    for (std::size_t index = 0; index < primer.size(); ++index) {
+      const char expected = static_cast<char>(std::toupper(static_cast<unsigned char>(primer[index])));
+      const char observed = static_cast<char>(std::toupper(static_cast<unsigned char>(sequence[index])));
+      if (expected != 'N' && expected != observed) { compatible = false; break; }
+    }
+    if (compatible) return std::string(sequence.substr(primer.size()));
+  }
+  const auto prefix = sequence.substr(0, std::min(sequence.size(), primer.size() + 3));
+  const auto alignment = iupac_primer_alignment(primer, prefix);
+  const auto last = alignment.reference.find_last_not_of('-');
+  if (last == std::string::npos) return std::string(sequence);
+  std::size_t consumed = 0; for (std::size_t index = 0; index <= last; ++index) if (alignment.query[index] != '-') ++consumed;
+  return std::string(sequence.substr(std::min(consumed, sequence.size())));
+}
+
+} // namespace
+
+std::string family_consensus(const std::vector<std::string>& reads, double& minimum_agreement,
+                             std::vector<LowAgreementSite>& low_sites) {
+  minimum_agreement = 0.0; low_sites.clear();
+  if (reads.empty()) return {};
+  if (reads.size() == 1) { minimum_agreement = 1.0; return reads.front(); }
+  if (std::all_of(reads.begin() + 1, reads.end(), [&](const auto& read) { return read == reads.front(); })) {
+    minimum_agreement = 1.0; return reads.front();
+  }
+  std::string candidate = centroid(reads);
+  for (int pass = 0; pass < 3; ++pass) candidate = refine_reference(candidate, reads);
+  agreement_summary(candidate, reads, minimum_agreement, low_sites);
+  return candidate;
+}
+
+std::vector<std::uint8_t> process_consensus_partition(std::span<const std::uint8_t> bytes,
+                                                      std::span<const std::uint8_t> cutoff_bytes,
+                                                      const std::vector<FamilyDecision>& model,
+                                                      const Config& config, std::string& error) {
+  const auto thresholds = cutoffs(cutoff_bytes, error); if (!error.empty()) return {};
+  const auto records = decode_spool(bytes, error); if (!error.empty()) return {};
+  const auto key = [](std::uint16_t sample, std::string_view umi) { return std::to_string(sample) + '\0' + std::string(umi); };
+  std::unordered_map<std::string, const FamilyDecision*> decisions;
+  for (const auto& decision : model) decisions.emplace(key(decision.sample, decision.umi), &decision);
+  std::map<std::pair<std::uint16_t, std::string>, std::vector<SpoolRecord>> grouped;
+  for (const auto& record : records) if (selected(record, thresholds) && decisions.contains(key(record.sample, record.umi)))
+    grouped[{record.sample, record.umi}].push_back(record);
+  std::vector<ConsensusRecord> consensuses;
+  std::vector<std::pair<std::uint16_t, std::string>> heteroduplexes;
+  for (auto& [family, family_reads] : grouped) {
+    const auto* decision = decisions[key(family.first, family.second)];
+    if (family.first >= config.samples.size()) continue;
+    std::stable_sort(family_reads.begin(), family_reads.end(), [](const auto& left, const auto& right) {
+      const auto left_ordinal = read_ordinal(left.name), right_ordinal = read_ordinal(right.name);
+      return left_ordinal != right_ordinal ? left_ordinal < right_ordinal : left.name < right.name;
+    });
+    if (decision->disposition == FamilyDisposition::bpb_reject) continue;
+    if (heteroduplex(family_reads, config.samples[family.first])) {
+      heteroduplexes.push_back(family); continue;
+    }
+    if (decision->disposition != FamilyDisposition::likely_real) continue;
+    std::vector<std::string> sequences; sequences.reserve(family_reads.size());
+    for (const auto& read : family_reads) sequences.push_back(read.sequence);
+    ConsensusRecord record; record.sample = family.first; record.umi = family.second;
+    record.family_size = family_reads.size();
+    auto raw = family_consensus(sequences, record.minimum_agreement, record.low_sites);
+    const auto& full_primer = config.samples[family.first].cdna_primer;
+    const auto start = std::find_if(full_primer.begin(), full_primer.end(), [](char value) { return std::islower(static_cast<unsigned char>(value)); });
+    std::string trim_primer(start, full_primer.end());
+    std::transform(trim_primer.begin(), trim_primer.end(), trim_primer.begin(), [](unsigned char value) { return std::toupper(value); });
+    record.sequence = reverse_complement(primer_trim(raw, trim_primer));
+    record.id = config.samples[family.first].name + family.second + " fs=" + std::to_string(record.family_size)
+      + " minag=" + fixed_two(record.minimum_agreement);
+    consensuses.push_back(std::move(record));
+  }
+  std::vector<std::uint8_t> output; binary::magic(output, "WPO1");
+  binary::number(output, static_cast<std::uint32_t>(consensuses.size()));
+  for (const auto& record : consensuses) {
+    binary::number(output, record.sample); binary::string(output, record.id); binary::string(output, record.umi);
+    binary::number(output, record.family_size); binary::number(output, record.minimum_agreement); binary::string(output, record.sequence);
+    binary::number(output, static_cast<std::uint32_t>(record.low_sites.size()));
+    for (const auto& site : record.low_sites) {
+      binary::number(output, site.position); binary::number(output, site.agreement);
+      binary::number(output, static_cast<std::uint8_t>(site.modal_base)); binary::number(output, site.run_length);
+    }
+  }
+  binary::number(output, static_cast<std::uint32_t>(heteroduplexes.size()));
+  for (const auto& [sample, umi] : heteroduplexes) { binary::number(output, sample); binary::string(output, umi); }
+  return output;
+}
+
+} // namespace webporpid

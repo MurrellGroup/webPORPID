@@ -1,0 +1,39 @@
+{
+  "name": "webporpid",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --noEmit",
+    "build:wasm": "bash scripts/build-wasm.sh && bash scripts/build-alivibe-wasm.sh",
+    "build": "npm run check && vite build",
+    "build:cli": "node scripts/build-cli.mjs",
+    "test:cpp": "bash scripts/test-cpp.sh",
+    "test:wasm": "node tests/wasm-core.test.mjs",
+    "test:ts": "node --test tests/ts-core.test.mjs",
+    "test:cli": "node scripts/build-cli.mjs && node --test tests/cli-smoke.test.mjs",
+    "test": "npm run test:cpp && npm run test:wasm && npm run test:ts && npm run test:cli && npm run check",
+    "parity": "bash scripts/parity-consensus.sh && bash scripts/parity-umi.sh && bash scripts/parity-panel.sh && bash scripts/parity-functional.sh && bash scripts/parity-demo.sh"
+  },
+  "dependencies": {
+    "@biowasm/aioli": "3.2.3",
+    "@bjorn3/browser_wasi_shim": "0.4.2",
+    "@msgpack/msgpack": "3.1.2",
+    "@noble/hashes": "2.0.0",
+    "fflate": "0.8.2",
+    "react": "19.2.0",
+    "react-dom": "19.2.0",
+    "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "24.3.0",
+    "@types/react": "19.1.12",
+    "@types/react-dom": "19.1.9",
+    "@vitejs/plugin-react": "5.0.2",
+    "binaryen": "122.0.0",
+    "rolldown": "1.0.1",
+    "typescript": "5.9.2",
+    "vite": "7.3.6"
+  }
+}
