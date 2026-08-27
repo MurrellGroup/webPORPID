@@ -38,7 +38,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   const configForHash = compiledConfig.slice().buffer as ArrayBuffer;
   const [module, configHashBytes] = await Promise.all([compileCore(), crypto.subtle.digest("SHA-256", configForHash)]);
   const pool = await CoreWorkerPool.create(workers, module, compiledConfig), store = await PartitionStore.create(request.config.parameters.spoolPartitions);
-  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.1.1 started`,
+  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.1.2 started`,
     `${now()} execution: ${workers} WASM workers; ${store.persistent ? "OPFS" : "bounded memory"} partition spool`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}`];
   try {
@@ -128,7 +128,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.1.1", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.1.2", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },

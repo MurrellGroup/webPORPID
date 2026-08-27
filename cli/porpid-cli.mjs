@@ -8,7 +8,6 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { createGunzip } from "node:zlib";
 import { Worker as Worker$1 } from "node:worker_threads";
-import { createRequire } from "node:module";
 //#region \0rolldown/runtime.js
 var __defProp = Object.defineProperty;
 var __exportAll = (all, no_symbols) => {
@@ -9684,13 +9683,17 @@ function completeNewick(output) {
 	throw new Error("FastTree did not return a complete Newick tree.");
 }
 function createFastTreeRunner(javascriptPath, wasmPath) {
-	const factory = createRequire(import.meta.url)(javascriptPath);
 	let output = [], errors = [], invocation = 0;
-	const modulePromise = readFile(wasmPath).then((wasmBinary) => factory({
-		wasmBinary,
-		print: (line) => output.push(String(line)),
-		printErr: (line) => errors.push(String(line))
-	}));
+	const modulePromise = Promise.all([readFile(javascriptPath, "utf8"), readFile(wasmPath)]).then(([source, wasmBinary]) => {
+		const commonJs = { exports: {} };
+		Function("module", "exports", source)(commonJs, commonJs.exports);
+		if (typeof commonJs.exports !== "function") throw new Error("FastTree JavaScript runtime did not export a module factory.");
+		return commonJs.exports({
+			wasmBinary,
+			print: (line) => output.push(String(line)),
+			printErr: (line) => errors.push(String(line))
+		});
+	});
 	return async (alignedFasta) => {
 		const records = parseFasta(alignedFasta);
 		const safeName = (name, index) => name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;
@@ -9754,7 +9757,7 @@ function createMsaRunner(wasmPath) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.1.1";
+const VERSION = "0.1.2";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

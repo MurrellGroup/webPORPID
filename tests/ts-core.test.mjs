@@ -61,7 +61,7 @@ function resultBundle() {
     functionalMatchThreshold: 0.7, spoolPartitions: 8, deterministicSeed: "1" };
   return {
     schema: "webporpid-results/1",
-    provenance: { webporpidVersion: "0.1.1", createdUtc: "2026-08-27T00:00:00.000Z", engine: "test", workers: 2,
+    provenance: { webporpidVersion: "0.1.2", createdUtc: "2026-08-27T00:00:00.000Z", engine: "test", workers: 2,
       inputName: "reads.fastq.gz", inputSha256: "a".repeat(64), configSha256: "b".repeat(64), deterministicSeed: "1",
       upstreamBranch: "nanopore", upstreamCommit: "c".repeat(40) },
     config: { dataset: "test", samples: [{ name: "sample_1", cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa" }],

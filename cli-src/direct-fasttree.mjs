@@ -1,4 +1,3 @@
-import { createRequire } from "node:module";
 import { readFile } from "node:fs/promises";
 import { parseFasta } from "../src/config.ts";
 
@@ -12,10 +11,14 @@ function completeNewick(output) {
 }
 
 export function createFastTreeRunner(javascriptPath, wasmPath) {
-  const require = createRequire(import.meta.url), factory = require(javascriptPath);
   let output = [], errors = [], invocation = 0;
-  const modulePromise = readFile(wasmPath).then((wasmBinary) => factory({ wasmBinary,
-    print: (line) => output.push(String(line)), printErr: (line) => errors.push(String(line)) }));
+  const modulePromise = Promise.all([readFile(javascriptPath, "utf8"), readFile(wasmPath)]).then(([source, wasmBinary]) => {
+    const commonJs = { exports: {} };
+    Function("module", "exports", source)(commonJs, commonJs.exports);
+    if (typeof commonJs.exports !== "function") throw new Error("FastTree JavaScript runtime did not export a module factory.");
+    return commonJs.exports({ wasmBinary,
+      print: (line) => output.push(String(line)), printErr: (line) => errors.push(String(line)) });
+  });
   return async (alignedFasta) => {
     const records = parseFasta(alignedFasta);
     const safeName = (name, index) => name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;

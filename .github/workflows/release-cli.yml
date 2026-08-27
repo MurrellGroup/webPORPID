@@ -27,7 +27,7 @@ jobs:
       - run: npm run build:wasm
         env:
           WASI_SDK: ${{ runner.temp }}/wasi-sdk-25.0-x86_64-linux
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-wasm-assets
           path: |
@@ -61,7 +61,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: release-wasm-assets
           path: public
@@ -78,13 +78,14 @@ jobs:
         run: |
           node -e "require('node:fs').mkdirSync('release', { recursive: true })"
           bun build cli-src/porpid-cli-standalone.mjs cli-src/porpid-worker.mjs \
-            --compile --minify --target=${{ matrix.target }} --outfile=release/${{ matrix.artifact }}
+            --compile --minify '--entry-naming=[name].mjs' \
+            --target=${{ matrix.target }} --outfile=release/${{ matrix.artifact }}
       - name: Smoke-test the actual executable
         if: matrix.target != 'bun-windows-x64-baseline'
         env:
           WEBPORPID_CLI_EXECUTABLE: ${{ github.workspace }}/release/${{ matrix.artifact }}
         run: node --test tests/cli-smoke.test.mjs
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: release/${{ matrix.artifact }}
@@ -94,7 +95,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: release
           merge-multiple: true
