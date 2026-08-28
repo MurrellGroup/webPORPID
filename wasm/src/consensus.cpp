@@ -15,10 +15,15 @@
 namespace webporpid {
 namespace {
 
-// Keep these 32 KiB vectors off the small WASI stack. Three simultaneous
-// std::array temporaries were enough to corrupt allocator metadata in release
-// builds even though native builds appeared healthy.
-using Kmers = std::vector<double>;
+// Keep the dense scratch vectors off the small WASI stack.  A family centroid
+// used to allocate and fill a 4,096-double vector twice per read.  The sparse
+// representation below counts every read once, retains only observed bins,
+// and evaluates exactly the same corrected squared distance from the dense
+// mean.
+struct SparseKmers {
+  std::vector<std::pair<std::uint16_t, std::uint32_t>> bins;
+  double total = 0.0;
+};
 
 int base_index(char value) {
   switch (std::toupper(static_cast<unsigned char>(value))) {
@@ -26,36 +31,26 @@ int base_index(char value) {
   }
 }
 
-Kmers kmer_counts(std::string_view sequence) {
-  Kmers counts(4096, 0.0); std::size_t code = 0, valid = 0;
+SparseKmers kmer_counts(std::string_view sequence, std::vector<std::uint32_t>& scratch,
+                        std::vector<std::uint16_t>& touched) {
+  SparseKmers output; std::size_t code = 0, valid = 0;
   for (char value : sequence) {
     const int base = base_index(value);
     if (base < 0) { code = 0; valid = 0; continue; }
     code = ((code << 2) | static_cast<std::size_t>(base)) & 4095; ++valid;
-    if (valid >= 6) counts[code] += 1.0;
+    if (valid >= 6) {
+      if (scratch[code]++ == 0) touched.push_back(static_cast<std::uint16_t>(code));
+      output.total += 1.0;
+    }
   }
-  return counts;
-}
-
-double corrected_distance(const Kmers& left, const Kmers& right) {
-  double squared = 0.0, total = 0.0;
-#ifdef __wasm_simd128__
-  v128_t squared2 = wasm_f64x2_splat(0.0), total2 = wasm_f64x2_splat(0.0);
-  for (std::size_t index = 0; index < 4096; index += 2) {
-    const auto a = wasm_v128_load(left.data() + index), b = wasm_v128_load(right.data() + index);
-    const auto delta = wasm_f64x2_sub(a, b);
-    squared2 = wasm_f64x2_add(squared2, wasm_f64x2_mul(delta, delta));
-    total2 = wasm_f64x2_add(total2, wasm_f64x2_add(a, b));
+  std::sort(touched.begin(), touched.end());
+  output.bins.reserve(touched.size());
+  for (const auto bin : touched) {
+    output.bins.emplace_back(bin, scratch[bin]);
+    scratch[bin] = 0;
   }
-  squared = wasm_f64x2_extract_lane(squared2, 0) + wasm_f64x2_extract_lane(squared2, 1);
-  total = wasm_f64x2_extract_lane(total2, 0) + wasm_f64x2_extract_lane(total2, 1);
-#else
-  for (std::size_t index = 0; index < 4096; ++index) {
-    const double difference = left[index] - right[index]; squared += difference * difference;
-    total += left[index] + right[index];
-  }
-#endif
-  return total == 0.0 ? 0.0 : squared / (6.0 * total);
+  touched.clear();
+  return output;
 }
 
 std::string mode(const std::vector<std::string>& values) {
@@ -83,16 +78,28 @@ std::vector<std::size_t> reference_map(const Alignment& alignment) {
 }
 
 std::string centroid(const std::vector<std::string>& reads) {
-  Kmers mean(4096, 0.0);
+  std::vector<double> mean(4096, 0.0);
+  std::vector<std::uint32_t> scratch(4096, 0);
+  std::vector<std::uint16_t> touched; touched.reserve(4096);
+  std::vector<SparseKmers> profiles; profiles.reserve(reads.size());
+  double mean_total = 0.0;
   for (const auto& read : reads) {
-    const auto counts = kmer_counts(read);
-    for (std::size_t index = 0; index < mean.size(); ++index) mean[index] += counts[index];
+    auto counts = kmer_counts(read, scratch, touched);
+    for (const auto& [bin, count] : counts.bins) mean[bin] += count;
+    mean_total += counts.total;
+    profiles.push_back(std::move(counts));
   }
   for (auto& value : mean) value /= reads.size();
+  mean_total /= reads.size();
+  double mean_squared = 0.0;
+  for (const auto value : mean) mean_squared += value * value;
   std::size_t best = 0; double distance = std::numeric_limits<double>::infinity();
-  for (std::size_t index = 0; index < reads.size(); ++index) {
-    const auto counts = kmer_counts(reads[index]);
-    const double candidate = corrected_distance(counts, mean);
+  for (std::size_t index = 0; index < profiles.size(); ++index) {
+    double squared = mean_squared;
+    for (const auto& [bin, count] : profiles[index].bins)
+      squared += static_cast<double>(count) * count - 2.0 * count * mean[bin];
+    const double total = profiles[index].total + mean_total;
+    const double candidate = total == 0.0 ? 0.0 : squared / (6.0 * total);
     if (candidate < distance) { distance = candidate; best = index; }
   }
   return reads[best];
@@ -135,7 +142,8 @@ std::string extension_consensus(std::vector<std::string> values, bool front) {
   return consensus;
 }
 
-std::string refine_reference(std::string_view candidate, const std::vector<std::string>& reads) {
+std::string refine_reference(std::string_view candidate, const std::vector<std::string>& reads,
+                             std::vector<MappedAlignment>* aligned_reads = nullptr) {
   if (candidate.size() < 2) return std::string(candidate);
   auto alignments = align_reads(candidate, reads);
   std::vector<bool> good(candidate.size(), true);
@@ -143,9 +151,12 @@ std::string refine_reference(std::string_view candidate, const std::vector<std::
     std::size_t equal = 0;
     for (const auto& mapped : alignments) {
       if (mapped.map.size() <= position + 1) continue;
-      const auto observed = degap(std::string_view(mapped.alignment.query).substr(
-          mapped.map[position], mapped.map[position + 1] - mapped.map[position] + 1));
-      if (observed == candidate.substr(position, 2)) ++equal;
+      char observed[2]{}; std::size_t observed_count = 0;
+      for (std::size_t column = mapped.map[position]; column <= mapped.map[position + 1]; ++column) if (mapped.alignment.query[column] != '-') {
+        if (observed_count < 2) observed[observed_count] = mapped.alignment.query[column];
+        observed_count++;
+      }
+      if (observed_count == 2 && observed[0] == candidate[position] && observed[1] == candidate[position + 1]) ++equal;
     }
     if (static_cast<double>(equal) / reads.size() < 0.7) good[position] = good[position + 1] = false;
   }
@@ -156,7 +167,11 @@ std::string refine_reference(std::string_view candidate, const std::vector<std::
   }
   const auto front = extension_consensus(std::move(fronts), true);
   const auto end = extension_consensus(std::move(ends), false);
-  if (std::all_of(good.begin(), good.end(), [](bool value) { return value; })) return front + std::string(candidate) + end;
+  if (std::all_of(good.begin(), good.end(), [](bool value) { return value; })) {
+    auto result = front + std::string(candidate) + end;
+    if (aligned_reads) *aligned_reads = std::move(alignments);
+    return result;
+  }
 
   std::string rebuilt = front;
   std::size_t position = 0;
@@ -173,25 +188,34 @@ std::string refine_reference(std::string_view candidate, const std::vector<std::
     }
     rebuilt += mode(alternatives);
   }
-  rebuilt += end; return rebuilt;
+  rebuilt += end;
+  if (aligned_reads) *aligned_reads = std::move(alignments);
+  return rebuilt;
 }
 
 void agreement_summary(std::string_view candidate, const std::vector<std::string>& reads,
-                       double& minimum_agreement, std::vector<LowAgreementSite>& low_sites) {
-  const auto alignments = align_reads(candidate, reads, false);
+                       double& minimum_agreement, std::vector<LowAgreementSite>& low_sites,
+                       const std::vector<MappedAlignment>* reusable = nullptr) {
+  // RobustAmpliconDenoising.get_matches uses kmer_seeded_align here.  The old
+  // port accidentally forced a full O(length^2) NW alignment for every read,
+  // after already doing three seeded refinement passes.
+  const auto owned_alignments = reusable ? std::vector<MappedAlignment>{} : align_reads(candidate, reads, true);
+  const auto& alignments = reusable ? *reusable : owned_alignments;
   std::vector<double> agreements(candidate.size(), 0.0);
   std::vector<char> modal(candidate.size(), '-');
   for (std::size_t position = 0; position < candidate.size(); ++position) {
-    std::vector<std::string> observed; observed.reserve(reads.size()); std::size_t equal = 0;
+    // Symbol 0 represents the empty/gap observation; byte values occupy 1..256.
+    std::array<std::uint32_t, 257> counts{}; std::size_t equal = 0;
+    std::uint16_t best_symbol = 0; std::uint32_t best_count = 0;
     for (const auto& mapped : alignments) {
-      std::string value;
+      std::uint16_t symbol = 0;
       if (mapped.map.size() > position && mapped.alignment.query[mapped.map[position]] != '-')
-        value.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(mapped.alignment.query[mapped.map[position]]))));
-      if (value.size() == 1 && value[0] == std::toupper(static_cast<unsigned char>(candidate[position]))) ++equal;
-      observed.push_back(std::move(value));
+        symbol = static_cast<std::uint16_t>(std::toupper(static_cast<unsigned char>(mapped.alignment.query[mapped.map[position]]))) + 1;
+      const auto count = ++counts[symbol]; if (count > best_count) { best_count = count; best_symbol = symbol; }
+      if (symbol && symbol - 1 == std::toupper(static_cast<unsigned char>(candidate[position]))) ++equal;
     }
     agreements[position] = static_cast<double>(equal) / reads.size();
-    const auto value = mode(observed); if (!value.empty()) modal[position] = value[0];
+    if (best_symbol) modal[position] = static_cast<char>(best_symbol - 1);
   }
   if (agreements.size() > 2) minimum_agreement = *std::min_element(agreements.begin() + 1, agreements.end() - 1);
   minimum_agreement = std::round(minimum_agreement * 100.0) / 100.0;
@@ -391,8 +415,17 @@ std::string family_consensus(const std::vector<std::string>& reads, double& mini
     minimum_agreement = 1.0; return reads.front();
   }
   std::string candidate = centroid(reads);
-  for (int pass = 0; pass < 3; ++pass) candidate = refine_reference(candidate, reads);
-  agreement_summary(candidate, reads, minimum_agreement, low_sites);
+  std::vector<MappedAlignment> reusable_alignments;
+  for (int pass = 0; pass < 3; ++pass) {
+    std::vector<MappedAlignment> pass_alignments;
+    auto refined = refine_reference(candidate, reads, &pass_alignments);
+    // Refinement is deterministic.  Once fixed, the remaining Julia-equivalent
+    // passes can no longer alter either sequence or agreement behavior.
+    if (refined == candidate) { reusable_alignments = std::move(pass_alignments); break; }
+    candidate = std::move(refined);
+  }
+  agreement_summary(candidate, reads, minimum_agreement, low_sites,
+    reusable_alignments.empty() ? nullptr : &reusable_alignments);
   return candidate;
 }
 

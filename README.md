@@ -12,7 +12,9 @@ The repository contains a neutral simulated demo only. Raw reads are processed l
 - Indel-tolerant family consensus, minimum-agreement calculation, and low-agreement-site logging.
 - Run-aware contamination clustering and filtering.
 - Artefact, agreement, panel-profile, and functional filters, plus APOBEC summaries.
-- Nucleotide/protein MSA, FastTree inference, and linked interactive alignment/tree exploration.
+- Nucleotide MSA, direct frame-selectable translation, FastTree inference, and Swig-derived linked tree/alignment exploration.
+- A bundled Alivibe pop-out editor with validated return, tree refresh, and edited alignment/frame/tree persistence inside the result file.
+- Julia-report-equivalent UMI, artefact, agreement, MDS/APOBEC, and dinucleotide figures rendered interactively.
 - A single compressed `.webporpid` result file and fourteen component export types.
 
 ## Browser application
@@ -81,12 +83,14 @@ PORPID_JULIA_PROJECT=/path/to/supplied/PORPIDpipeline-source \
 npm run parity
 ```
 
-The recorded parity outcomes and the small set of intentional differences are in [docs/PARITY.md](docs/PARITY.md) and [docs/METHODS.md](docs/METHODS.md).
+The recorded parity outcomes and the small set of intentional differences are in [docs/PARITY.md](docs/PARITY.md) and [docs/METHODS.md](docs/METHODS.md). The corrected simulated-data timing run, including every comparable Julia and webPORPID stage, is in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Documentation
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Methods and behavioral boundaries](docs/METHODS.md)
 - [Julia parity evidence](docs/PARITY.md)
+- [Corrected simulated-data benchmarks](docs/BENCHMARKS.md)
+- [Julia report-to-web figure mapping](docs/REPORT_VISUALS.md)
 - [Result format and exports](docs/RESULT_FORMAT.md)
 - [Possible behavior-changing speedups](improvements.md)

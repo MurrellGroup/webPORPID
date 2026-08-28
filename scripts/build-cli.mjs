@@ -7,6 +7,8 @@ await build({
   input: {
     "porpid-cli": new URL("../cli-src/porpid-cli-node.mjs", import.meta.url).pathname,
     "porpid-worker": new URL("../cli-src/porpid-worker.mjs", import.meta.url).pathname,
+    "porpid-msa-worker": new URL("../cli-src/porpid-msa-worker.mjs", import.meta.url).pathname,
+    "porpid-fasttree-worker": new URL("../cli-src/porpid-fasttree-worker.mjs", import.meta.url).pathname,
   },
   external: /^node:/,
   output: { dir: output.pathname, format: "es", entryFileNames: "[name].mjs", chunkFileNames: "chunks/[name]-[hash].mjs" },

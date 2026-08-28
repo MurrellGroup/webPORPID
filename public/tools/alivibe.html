@@ -1,0 +1,2592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FastAlign: Ultimate Editor</title>
+    <!-- Included the NW Alignment Library -->
+    <script src="./nw.js"></script>
+    <!-- Included the Phylogenetic Tools Library -->
+    <script src="./phylotools.js"></script>
+    <!-- Included the Frame Cleaning Library -->
+    <script src="./frameclean.js"></script>
+    <!-- MSA and FastTree runners are injected by the same-origin webPORPID bridge. -->
+    <style>
+        :root {
+            --bg-color: #f8f9fa;
+            --panel-bg: #ffffff;
+            --border-color: #d1d5db;
+            --primary: #2563eb;
+            --header-height: 90px;
+            --ruler-height: 60px;
+            --names-width: 200px;
+            --tree-width: 0px;
+        }
+
+        * { box-sizing: border-box; }
+
+        body, html {
+            margin: 0; padding: 0;
+            height: 100%; width: 100%;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            overflow: hidden;
+            user-select: none;
+            overscroll-behavior-x: none;
+        }
+
+        #app {
+            display: flex; flex-direction: column;
+            height: 100vh; width: 100vw;
+        }
+
+        #controls {
+            height: var(--header-height);
+            background: var(--panel-bg);
+            border-bottom: 1px solid var(--border-color);
+            display: flex; align-items: center;
+            padding: 0 20px; gap: 15px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+            flex-shrink: 0; z-index: 20;
+            overflow-x: auto;
+        }
+
+        .control-group { display: flex; flex-direction: column; gap: 4px; }
+        label { font-size: 11px; font-weight: 700; text-transform: uppercase; color: #6b7280; }
+        button, select, input[type="file"] {
+            padding: 6px 10px; border: 1px solid #d1d5db; border-radius: 4px;
+            background: white; font-size: 13px; cursor: pointer;
+            white-space: nowrap;
+        }
+        button:hover { background-color: #f3f4f6; }
+        button.active { background-color: var(--primary); color: white; border-color: var(--primary); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        .btn-icon { padding: 6px 8px; font-weight: bold; }
+
+        #viewer-grid {
+            flex: 1; display: grid;
+            grid-template-columns: var(--tree-width) 5px var(--names-width) minmax(0, 1fr);
+            grid-template-rows: var(--ruler-height) minmax(0, 1fr);
+            grid-template-areas:
+                "corner-tree resizer corner-names ruler"
+                "tree        resizer names        seq";
+            overflow: hidden; position: relative;
+            background: #fff;
+        }
+
+        #area-corner-tree { grid-area: corner-tree; background: #f3f4f6; border-bottom: 1px solid var(--border-color); }
+        #area-corner-names { grid-area: corner-names; background: #f3f4f6; border-right: 1px solid var(--border-color); border-bottom: 1px solid var(--border-color); }
+
+        #area-ruler {
+            grid-area: ruler; background: #f3f4f6;
+            border-bottom: 1px solid var(--border-color);
+            position: relative; overflow: hidden; cursor: s-resize;
+        }
+
+        #area-tree {
+            grid-area: tree; background: #fff;
+            position: relative; overflow: hidden;
+            border-right: 1px solid #e5e7eb;
+        }
+
+        #resizer-tree {
+            grid-area: resizer; background: #f3f4f6;
+            border-right: 1px solid var(--border-color);
+            cursor: col-resize; z-index: 15;
+            display: flex; align-items: center; justify-content: center;
+        }
+        #resizer-tree:hover { background: #d1d5db; }
+        #resizer-tree::after { content: ''; width: 1px; height: 20px; background: #9ca3af; }
+
+        #area-names {
+            grid-area: names; background: #fff;
+            border-right: 1px solid var(--border-color);
+            position: relative; overflow: hidden; z-index: 5;
+            box-shadow: 2px 0 5px rgba(0,0,0,0.05); cursor: e-resize;
+        }
+
+        #area-seq {
+            grid-area: seq; overflow: auto; position: relative;
+            background: #fff; outline: none; cursor: text;
+        }
+        #area-seq.grabbing { cursor: grabbing; }
+
+        canvas { display: block; }
+        #cvs-seq { position: sticky; top: 0; left: 0; }
+        #scroll-sizer { position: absolute; top: 0; left: 0; width: 1px; height: 1px; z-index: -1; }
+
+        #overlay, #help-overlay {
+            position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+            background: rgba(255,255,255,0.75);
+            display: flex; flex-direction: column;
+            align-items: center; justify-content: center;
+            z-index: 9999; opacity: 0; pointer-events: none; transition: opacity 0.2s;
+        }
+        #overlay.active, #help-overlay.active { opacity: 1; pointer-events: all; }
+
+        #help-overlay { background: rgba(0,0,0,0.5); }
+        .help-box {
+            background: white; width: 600px; max-width: 90%;
+            padding: 20px; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            display: flex; flex-direction: column; gap: 10px;
+        }
+        .help-box h2 { margin: 0 0 10px 0; font-size: 18px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .help-row { display: flex; justify-content: space-between; font-size: 13px; color: #374151; padding: 4px 0; border-bottom: 1px solid #f3f4f6; }
+        .help-key { font-weight: bold; color: #111; }
+        .close-help { align-self: flex-end; margin-top: 10px; }
+
+        .spinner {
+            width: 30px; height: 30px;
+            border: 3px solid #e5e7eb; border-top: 3px solid var(--primary);
+            border-radius: 50%; animation: spin 0.8s linear infinite;
+        }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+
+        .hint-text {
+            font-size: 11px; color: #4b5563; margin-left: auto; text-align: right;
+            line-height: 1.3; background: #f3f4f6; padding: 5px 10px; border-radius: 4px; border: 1px solid #e5e7eb;
+        }
+        .tag { display: inline-block; padding: 1px 4px; background: #e5e7eb; border-radius: 3px; font-weight: 600; font-size: 10px; }
+
+        #ctx-menu {
+            position: fixed;
+            background: white;
+            border: 1px solid #d1d5db;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            border-radius: 4px;
+            padding: 4px 0;
+            z-index: 10000;
+            display: none;
+            min-width: 150px;
+        }
+        #ctx-menu .item {
+            padding: 8px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            color: #374151;
+        }
+        #ctx-menu .item:hover { background-color: #f3f4f6; color: var(--primary); }
+    </style>
+</head>
+<body>
+
+<div id="app">
+    <div id="controls">
+        <div class="control-group">
+            <label>Sequences</label>
+            <input type="file" id="inp-file" accept=".fasta,.fa,.fastq,.fq,.txt">
+        </div>
+        <div class="control-group">
+            <label>Phylogeny</label>
+            <div style="display:flex; gap:5px; align-items:center;">
+                <button id="btn-infer-tree" title="Infer NJ tree from sequences">Infer</button>
+                <input type="file" id="inp-tree">
+                <button id="btn-export-tree" title="Export current tree as Newick">Export</button>
+                <button id="btn-ladderize-tree" title="Ladderize tree and reorder sequences">Ladderize</button>
+            </div>
+        </div>
+        <div class="control-group">
+            <label>Reset</label>
+            <div style="display:flex; gap:5px;">
+                <button id="btn-clear-aln" title="Remove all sequences">Clear Alignment</button>
+                <button id="btn-clear-tree" title="Remove current tree">Clear Tree</button>
+            </div>
+        </div>
+        <div style="width:1px; height:30px; background:#e5e7eb; margin:0 10px;"></div>
+        <div class="control-group">
+            <label>History</label>
+            <button id="btn-undo" title="Ctrl+Z">⟲ Undo</button>
+        </div>
+
+        <!-- Export Controls -->
+        <div style="width:1px; height:30px; background:#e5e7eb; margin:0 10px;"></div>
+        <div class="control-group">
+            <label>Export</label>
+            <div style="display:flex; gap:5px;">
+                <button id="btn-download" title="Download Current View">Download</button>
+                <button id="btn-copy" title="Copy to Clipboard">Copy</button>
+            </div>
+        </div>
+
+        <div style="width:1px; height:30px; background:#e5e7eb; margin:0 10px;"></div>
+        <div class="control-group">
+            <label>View Mode</label>
+            <div style="display:flex;">
+                <button id="btn-nt" class="active" style="border-top-right-radius:0; border-bottom-right-radius:0;">NT</button>
+                <button id="btn-aa" style="border-top-left-radius:0; border-bottom-left-radius:0; border-left:none;">AA</button>
+            </div>
+        </div>
+
+        <div class="control-group">
+            <label>Highlighter</label>
+            <button id="btn-highlight">Highlighter</button>
+        </div>
+
+        <div class="control-group">
+            <label>Alignment</label>
+            <div style="display:flex; gap:5px;">
+                <button id="btn-align">Align</button>
+                <select id="sel-align-mode">
+                    <option value="msa">MSA</option>
+                    <option value="polish">Polish</option>
+                    <option value="left">Left Pile</option>
+                    <option value="discard">Discard Ins</option>
+                </select>
+                <button id="btn-realign-sel" title="Realign within selection">Align Sel</button>
+                <button id="btn-strip" title="Strip all gaps from alignment">Strip Gaps</button>
+                <button id="btn-clean-frame" title="Clean out-of-frame insertions">Clean Frame</button>
+            </div>
+        </div>
+
+        <div style="width:1px; height:30px; background:#e5e7eb; margin:0 10px;"></div>
+
+        <div class="control-group" id="grp-frame" style="opacity:0.4; pointer-events:none;">
+            <label>Frame</label>
+            <select id="sel-frame">
+                <option value="1">1</option>
+                <option value="2">2</option>
+                <option value="3">3</option>
+            </select>
+        </div>
+
+        <div class="control-group">
+            <label>Info</label>
+            <button id="btn-help" class="btn-icon">?</button>
+        </div>
+    </div>
+
+    <div id="viewer-grid">
+        <div id="area-corner-tree"></div>
+        <div id="resizer-tree"></div>
+        <div id="area-corner-names"></div>
+
+        <div id="area-tree"><canvas id="cvs-tree"></canvas></div>
+        <div id="area-ruler"><canvas id="cvs-ruler"></canvas></div>
+        <div id="area-names"><canvas id="cvs-names"></canvas></div>
+        <div id="area-seq" tabindex="0"><div id="scroll-sizer"></div><canvas id="cvs-seq"></canvas></div>
+    </div>
+</div>
+
+<div id="overlay">
+    <div class="spinner"></div>
+    <div id="overlay-msg" style="margin-top:10px; font-weight:500;">Processing...</div>
+    <div id="overlay-sub" style="margin-top:5px; font-size:12px; color:#666;"></div>
+    <button id="btn-cancel-task" type="button" style="display:none; margin-top:14px;">Cancel</button>
+</div>
+
+<div id="clean-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 10000;">
+    <div class="help-box" style="width: 450px;">
+        <h2>Clean Reading Frame</h2>
+        <div class="help-row" style="flex-direction: column; align-items: flex-start; gap: 5px;">
+            <label style="text-transform: none; font-size: 13px; color: #374151;">Reference Mode</label>
+            <select id="sel-clean-ref-mode" style="width: 100%;">
+                <option value="no">No reference (occupancy only)</option>
+                <option value="hard" selected>Trusted Reference (Hard: mod 3)</option>
+                <option value="soft">Trusted Reference (Soft: penalized)</option>
+            </select>
+        </div>
+        <div class="help-row">
+            <span style="font-size: 13px; color: #374151;">Using current reference:</span>
+            <span id="txt-clean-ref-name" style="font-style: italic; font-size: 13px; color: #2563eb;">None</span>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+            <div class="control-group">
+                <label>pBackbone</label>
+                <input type="number" id="inp-clean-pback" value="0.9" step="0.05" min="0" max="1">
+            </div>
+            <div class="control-group">
+                <label>pInsertion</label>
+                <input type="number" id="inp-clean-pins" value="0.05" step="0.01" min="0" max="1">
+            </div>
+        </div>
+
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
+            <div class="control-group">
+                <label>Start Penalty</label>
+                <input type="number" id="inp-clean-start" value="-2.0" step="0.1">
+            </div>
+            <div class="control-group">
+                <label>Extend Penalty</label>
+                <input type="number" id="inp-clean-extend" value="-0.2" step="0.1">
+            </div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+            <button onclick="document.getElementById('clean-overlay').style.display='none'">Cancel</button>
+            <button id="btn-run-clean" class="active">Clean Alignment</button>
+        </div>
+    </div>
+</div>
+
+<div id="infer-overlay" style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); display: none; align-items: center; justify-content: center; z-index: 10000;">
+    <div class="help-box" style="width: 450px;">
+        <h2>Infer Phylogeny</h2>
+        <div class="help-row" style="flex-direction: column; align-items: flex-start; gap: 5px;">
+            <label style="text-transform: none; font-size: 13px; color: #374151;">Method</label>
+            <select id="sel-infer-method" style="width: 100%;">
+                <option value="nj">Neighbor-Joining (Internal)</option>
+                <option value="fasttree">FastTree (bioWASM)</option>
+            </select>
+        </div>
+
+        <div id="fasttree-options" style="display: none; flex-direction: column; gap: 10px; margin-top: 10px; border-top: 1px solid #eee; padding-top: 10px;">
+            <div class="help-row">
+                <span style="font-size: 13px; color: #374151;">Model (NT):</span>
+                <select id="sel-ft-nt-model">
+                    <option value="-gtr">-gtr (GTR+CAT)</option>
+                    <option value="">Default (Jukes-Cantor)</option>
+                </select>
+            </div>
+            <div class="help-row">
+                <span style="font-size: 13px; color: #374151;">Model (AA):</span>
+                <select id="sel-ft-aa-model">
+                    <option value="-lg">-lg (Le-Gascuel)</option>
+                    <option value="-wag">-wag (Whelan-And-Goldman)</option>
+                    <option value="">Default (JTT)</option>
+                </select>
+            </div>
+            <div class="help-row">
+                <span style="font-size: 13px; color: #374151;">Speed:</span>
+                <select id="sel-ft-speed">
+                    <option value="">Default</option>
+                    <option value="-fastest">-fastest</option>
+                </select>
+            </div>
+        </div>
+
+        <div style="display: flex; justify-content: flex-end; gap: 10px; margin-top: 20px;">
+            <button onclick="document.getElementById('infer-overlay').style.display='none'">Cancel</button>
+            <button id="btn-run-infer" class="active">Run Inference</button>
+        </div>
+    </div>
+</div>
+
+<div id="help-overlay">
+    <div class="help-box">
+        <h2>FastAlign Help</h2>
+        <div class="help-row"><span class="help-key">Selection</span> <span>Click to select. Shift+Click to extend selection.</span></div>
+        <div class="help-row"><span class="help-key">Editing</span> <span>Type [A-Z] to overwrite. Space to insert gap. Backspace to delete.</span></div>
+        <div class="help-row"><span class="help-key">Align Selection</span> <span>Aligns rows inside selection box. Uses Ref if selected, else longest seq.</span></div>
+        <div class="help-row"><span class="help-key">Set Reference</span> <span>Right-click a sequence name.</span></div>
+        <div class="help-row"><span class="help-key">Move Block</span> <span>Drag selection horizontally to shift sequences.</span></div>
+        <div class="help-row"><span class="help-key">Align</span> <span>Aligns all sequences. Supports Left, Polish, or Discard insertions modes.</span></div>
+        <div class="help-row"><span class="help-key">IUPAC</span> <span>Full IUPAC ambiguity codes supported in Nucleotide view.</span></div>
+        <div class="help-row"><span class="help-key">Export</span> <span>Download or Copy current view (NT or AA) as FASTA.</span></div>
+        <button class="close-help" onclick="document.getElementById('help-overlay').classList.remove('active')">Close</button>
+    </div>
+</div>
+
+<div id="ctx-menu">
+    <div class="item" id="ctx-btn-ref">Set as Reference</div>
+</div>
+
+<script>
+// --- ALIGNMENT ALGORITHM ---
+// Now imported from external library via script tag
+
+// --- Config ---
+const CONFIG = {
+    font: "14px 'Courier New', monospace",
+    labelFont: "12px system-ui, sans-serif",
+    charWidth: 12,
+    rowHeight: 24,
+    highlightMatchColor: '#ffffff',
+    highlightGapColor: '#d1d5db',
+    rulerTickStep: 10,
+    maxHistory: 30,
+    colors: {
+        // Includes IUPAC colors
+        NT: {
+            'A': '#81d4fa', 'G': '#fff176', 'C': '#a5d6a7', 'T': '#ff8a80', 'U': '#ff8a80',
+            'R': '#e6ee9c', 'Y': '#80cbc4', 'M': '#a5d6a7', 'K': '#ef9a9a', 'S': '#c5e1a5',
+            'W': '#ce93d8', 'H': '#81d4fa', 'B': '#ef9a9a', 'V': '#fff59d', 'D': '#ffcc80',
+            'N': '#eeeeee',
+            '-': '#ffffff', 'default': '#f5f5f5'
+        },
+        AA: { 'A': '#80a0f0', 'R': '#f01505', 'N': '#00ff00', 'D': '#c048c0', 'C': '#f08080', 'Q': '#00ff00', 'E': '#c048c0', 'G': '#f09048', 'H': '#15a4a4', 'I': '#80a0f0', 'L': '#80a0f0', 'K': '#f01505', 'M': '#80a0f0', 'F': '#80a0f0', 'P': '#ffff00', 'S': '#00ff00', 'T': '#00ff00', 'W': '#80a0f0', 'Y': '#15a4a4', 'V': '#80a0f0', '*': '#999999', '-': '#ffffff', 'default': '#ffffff' }
+    }
+};
+
+const CODON_TABLE = {
+    'ATA':'I', 'ATC':'I', 'ATT':'I', 'ATG':'M', 'ACA':'T', 'ACC':'T', 'ACG':'T', 'ACT':'T',
+    'AAC':'N', 'AAT':'N', 'AAA':'K', 'AAG':'K', 'AGC':'S', 'AGT':'S', 'AGA':'R', 'AGG':'R',
+    'CTA':'L', 'CTC':'L', 'CTG':'L', 'CTT':'L', 'CCA':'P', 'CCC':'P', 'CCG':'P', 'CCT':'P',
+    'CAC':'H', 'CAT':'H', 'CAA':'Q', 'CAG':'Q', 'CGA':'R', 'CGC':'R', 'CGG':'R', 'CGT':'R',
+    'GTA':'V', 'GTC':'V', 'GTG':'V', 'GTT':'V', 'GCA':'A', 'GCC':'A', 'GCG':'A', 'GCT':'A',
+    'GAC':'D', 'GAT':'D', 'GAA':'E', 'GAG':'E', 'GGA':'G', 'GGC':'G', 'GGG':'G', 'GGT':'G',
+    'TCA':'S', 'TCC':'S', 'TCG':'S', 'TCT':'S', 'TTC':'F', 'TTT':'F', 'TTA':'L', 'TTG':'L',
+    'TAC':'Y', 'TAT':'Y', 'TAA':'*', 'TAG':'*', 'TGC':'C', 'TGT':'C', 'TGA':'*', 'TGG':'W',
+};
+
+// --- State ---
+const state = {
+    rawSequences: [],
+    viewSequences: [],
+    history: [],
+    dragSaved: false,
+    mode: 'NT',
+    highlightMatches: false,
+    frame: 1,
+    maxLength: 0,
+    selection: null,
+    selectionAnchor: null,
+    tree: null,
+    treeWidth: 0,
+    refIndex: 0,
+    refMap: [],
+    mouse: { isDown: false, target: null, startR: 0, startC: 0, lastHoverC: 0 },
+    ctxTargetRow: null,
+    pastedNameCounter: 1,
+    aioliCLI: null
+};
+
+// --- DOM ---
+const dom = {
+    file: document.getElementById('inp-file'),
+    fileTree: document.getElementById('inp-tree'),
+    btnInferTree: document.getElementById('btn-infer-tree'),
+    btnExportTree: document.getElementById('btn-export-tree'),
+    btnLadderizeTree: document.getElementById('btn-ladderize-tree'),
+    btnClearAlignment: document.getElementById('btn-clear-aln'),
+    btnClearTree: document.getElementById('btn-clear-tree'),
+    btnUndo: document.getElementById('btn-undo'),
+    btnNt: document.getElementById('btn-nt'),
+    btnAa: document.getElementById('btn-aa'),
+    btnHighlight: document.getElementById('btn-highlight'),
+    btnAlign: document.getElementById('btn-align'),
+    btnRealignSel: document.getElementById('btn-realign-sel'),
+    btnStrip: document.getElementById('btn-strip'),
+    btnCleanFrame: document.getElementById('btn-clean-frame'),
+    btnDownload: document.getElementById('btn-download'),
+    btnCopy: document.getElementById('btn-copy'),
+    btnHelp: document.getElementById('btn-help'),
+    selAlignMode: document.getElementById('sel-align-mode'),
+    selFrame: document.getElementById('sel-frame'),
+    grpFrame: document.getElementById('grp-frame'),
+    overlay: document.getElementById('overlay'),
+    overlayMsg: document.getElementById('overlay-msg'),
+    overlaySub: document.getElementById('overlay-sub'),
+    btnCancelTask: document.getElementById('btn-cancel-task'),
+    helpOverlay: document.getElementById('help-overlay'),
+    ctxMenu: document.getElementById('ctx-menu'),
+    ctxBtnRef: document.getElementById('ctx-btn-ref'),
+
+    areaSeq: document.getElementById('area-seq'),
+    areaNames: document.getElementById('area-names'),
+    areaRuler: document.getElementById('area-ruler'),
+    areaTree: document.getElementById('area-tree'),
+    resizerTree: document.getElementById('resizer-tree'),
+
+    cvsSeq: document.getElementById('cvs-seq'),
+    cvsNames: document.getElementById('cvs-names'),
+    cvsRuler: document.getElementById('cvs-ruler'),
+    cvsTree: document.getElementById('cvs-tree'),
+    sizer: document.getElementById('scroll-sizer')
+};
+
+const ctxSeq = dom.cvsSeq.getContext('2d', { alpha: false });
+const ctxNames = dom.cvsNames.getContext('2d');
+const ctxRuler = dom.cvsRuler.getContext('2d');
+const ctxTree = dom.cvsTree.getContext('2d');
+
+// --- Init ---
+function init() {
+    // Attach the editor controls synchronously. Aioli is optional for ordinary
+    // editing and initializes independently, so a slow CDN cannot leave the NT
+    // mode or reading-frame controls present but inert.
+    dom.file.addEventListener('change', e => loadFile(e.target.files[0]));
+    dom.fileTree.addEventListener('change', e => loadTreeFile(e.target.files[0]));
+    dom.btnInferTree.addEventListener('click', showInferModal);
+    dom.btnExportTree.addEventListener('click', exportTree);
+    dom.btnLadderizeTree.addEventListener('click', ladderizeTree);
+    dom.btnClearAlignment.addEventListener('click', clearAlignment);
+    dom.btnClearTree.addEventListener('click', clearTreeOnly);
+    dom.btnUndo.addEventListener('click', undo);
+    dom.btnNt.addEventListener('click', () => setMode('NT'));
+    dom.btnAa.addEventListener('click', () => setMode('AA'));
+    dom.btnHighlight.addEventListener('click', () => {
+        state.highlightMatches = !state.highlightMatches;
+        dom.btnHighlight.classList.toggle('active', state.highlightMatches);
+        render();
+    });
+    dom.selFrame.addEventListener('change', () => { state.frame = +dom.selFrame.value; recalc(); });
+
+    dom.btnAlign.addEventListener('click', runAlignmentTask);
+    dom.btnRealignSel.addEventListener('click', realignSelection);
+    dom.btnStrip.addEventListener('click', stripGapsGlobal);
+    dom.btnCleanFrame.addEventListener('click', showCleanModal);
+    dom.btnCancelTask.addEventListener('click', () => {
+        if(!activeMsaJob) return;
+        dom.btnCancelTask.disabled = true;
+        dom.overlayMsg.textContent = "Cancelling MSA alignment...";
+        activeMsaJob.cancel();
+    });
+    document.getElementById('btn-run-clean').addEventListener('click', runFrameCleanTask);
+
+    document.getElementById('sel-infer-method').addEventListener('change', (e) => {
+        document.getElementById('fasttree-options').style.display = (e.target.value === 'fasttree') ? 'flex' : 'none';
+    });
+    document.getElementById('btn-run-infer').addEventListener('click', runInferTask);
+
+    dom.btnDownload.addEventListener('click', () => exportAlignment('download'));
+    dom.btnCopy.addEventListener('click', handleCopyButton);
+    dom.btnHelp.addEventListener('click', () => dom.helpOverlay.classList.add('active'));
+
+    dom.areaSeq.addEventListener('scroll', () => requestAnimationFrame(render));
+    window.addEventListener('resize', onResize);
+
+    dom.areaSeq.addEventListener('mousedown', (e) => onMouseDown(e, 'SEQ'));
+    dom.areaNames.addEventListener('mousedown', (e) => {
+        if(e.button === 2) return;
+        e.preventDefault(); onMouseDown(e, 'NAMES');
+    });
+    dom.areaRuler.addEventListener('mousedown', (e) => { e.preventDefault(); onMouseDown(e, 'RULER'); });
+
+    dom.areaNames.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        const { r } = getCoords(e, 'NAMES');
+        if(r >= 0 && r < state.viewSequences.length) {
+            state.ctxTargetRow = r;
+            dom.ctxMenu.style.display = 'block';
+            dom.ctxMenu.style.left = e.clientX + 'px';
+            dom.ctxMenu.style.top = e.clientY + 'px';
+        }
+    });
+
+    dom.ctxBtnRef.addEventListener('click', () => {
+        if(state.ctxTargetRow !== null) {
+            state.refIndex = state.ctxTargetRow;
+            recalc();
+        }
+        dom.ctxMenu.style.display = 'none';
+    });
+
+    window.addEventListener('mousedown', (e) => {
+        if(!dom.ctxMenu.contains(e.target)) dom.ctxMenu.style.display = 'none';
+    });
+
+    dom.resizerTree.addEventListener('mousedown', (e) => {
+        e.preventDefault();
+        state.mouse.isDown = true;
+        state.mouse.target = 'RESIZE_TREE';
+    });
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+
+    dom.areaSeq.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keydown', (e) => {
+        if((e.ctrlKey || e.metaKey) && e.key === 'z') {
+            e.preventDefault();
+            undo();
+        }
+    });
+    window.addEventListener('copy', onCopyEvent);
+    window.addEventListener('paste', onPasteEvent);
+
+    onResize();
+
+    // Check for URL parameters and load if present
+    loadFromURLParams();
+
+    // A directly opened copy retains the internal JS/NJ fallbacks. When opened
+    // by webPORPID, local worker-backed MSA and FastTree runners are installed
+    // through swigAlivibeBridge below; no CDN initialization is required.
+}
+
+// --- Export Logic ---
+function exportAlignment(target) {
+    if (!state.viewSequences.length) return;
+
+    const rows = state.viewSequences.map((_, idx) => idx);
+    const content = buildFastaContent(rows, 0, null);
+    if(!content) return;
+
+    if (target === 'clipboard') {
+        if(navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(content).catch(err => {
+                console.error("Copy failed:", err);
+                alert("Copy failed: " + err.message);
+            });
+        } else {
+            alert("Clipboard API not available.");
+        }
+    } else {
+        const blob = new Blob([content], {type: "text/plain"});
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `alignment_${state.mode}.fasta`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+    }
+}
+
+function getSelectionBounds() {
+    if(!state.selection || !state.viewSequences.length) return null;
+    const totalRows = state.viewSequences.length;
+    const rowStart = Math.max(0, Math.min(state.selection.r1, totalRows - 1));
+    const rowEnd = Math.max(0, Math.min(state.selection.r2, totalRows - 1));
+    if(rowEnd < rowStart) return null;
+    const rows = [];
+    for(let r=rowStart; r<=rowEnd; r++) rows.push(r);
+    if(!rows.length) return null;
+    const isFullRow = state.selection.c2 >= 99999999;
+    const colStart = isFullRow ? 0 : Math.max(0, state.selection.c1);
+    const colEnd = isFullRow ? null : Math.max(colStart, state.selection.c2);
+    return { rows, colStart, colEnd };
+}
+
+function buildFastaContent(rows, colStart = 0, colEnd = null) {
+    if(!rows || !rows.length) return "";
+    const lines = [];
+    rows.forEach(r => {
+        const entry = state.viewSequences[r];
+        if(!entry) return;
+        const seq = entry.seq;
+        const start = Math.min(colStart, seq.length);
+        const end = (colEnd === null || colEnd === undefined) ? seq.length : Math.min(seq.length, colEnd + 1);
+        const fragment = seq.slice(start, end).join('');
+        lines.push(`>${entry.name}`);
+        lines.push(fragment);
+    });
+    return lines.join('\n') + (lines.length ? '\n' : '');
+}
+
+function getClipboardContent(preferSelection = true) {
+    if(!state.viewSequences.length) return "";
+    let bounds = preferSelection ? getSelectionBounds() : null;
+    if(!bounds) {
+        const rows = state.viewSequences.map((_, idx) => idx);
+        bounds = { rows, colStart: 0, colEnd: null };
+    }
+    return buildFastaContent(bounds.rows, bounds.colStart, bounds.colEnd);
+}
+
+function shouldHandleClipboardEvent() {
+    return document.activeElement === dom.areaSeq;
+}
+
+function handleCopyButton() {
+    const content = getClipboardContent(true);
+    if(!content) return;
+    if(!navigator.clipboard || !navigator.clipboard.writeText) {
+        alert("Clipboard API not available.");
+        return;
+    }
+    const originalText = dom.btnCopy.textContent;
+    navigator.clipboard.writeText(content).then(() => {
+        dom.btnCopy.textContent = "Copied!";
+        setTimeout(() => dom.btnCopy.textContent = originalText, 1500);
+    }).catch(err => {
+        console.error("Copy failed:", err);
+        dom.btnCopy.textContent = originalText;
+        alert("Copy failed: " + err.message);
+    });
+}
+
+function onCopyEvent(e) {
+    if(!shouldHandleClipboardEvent()) return;
+    const content = getClipboardContent(true);
+    if(!content) return;
+    if(e.clipboardData) {
+        e.clipboardData.setData('text/plain', content);
+        e.preventDefault();
+    }
+}
+
+function onPasteEvent(e) {
+    if(!shouldHandleClipboardEvent()) return;
+    const data = e.clipboardData || window.clipboardData;
+    if(!data) return;
+    const text = data.getData('text/plain');
+    if(!text) return;
+    e.preventDefault();
+    handleClipboardPaste(text);
+}
+
+function handleClipboardPaste(text) {
+    if(!text) return;
+    const trimmed = text.trim();
+    if(!trimmed) return;
+
+    const fastaEntries = parseClipboardFasta(trimmed);
+    if(fastaEntries.length) {
+        appendSequencesFromClipboard(fastaEntries);
+        return;
+    }
+
+    const lines = trimmed.split(/\r?\n/).filter(line => line.trim().length > 0);
+    if(lines.length === 1) {
+        const seqStr = lines[0].replace(/\s+/g, '').toUpperCase().replace(/[^A-Z-]/g, '');
+        if(seqStr.length) {
+            appendSequencesFromClipboard([{ name: null, seq: seqStr.split('') }]);
+            return;
+        }
+    }
+
+    alert("Could not parse pasted content. Provide FASTA or a single sequence line.");
+}
+
+function parseClipboardFasta(text) {
+    const lines = text.split(/\r?\n/);
+    const seqs = [];
+    let currentName = null;
+    let buffer = [];
+    let sawHeader = false;
+
+    for(let rawLine of lines) {
+        const line = rawLine.trim();
+        if(!line) continue;
+        if(line.startsWith('>')) {
+            sawHeader = true;
+            if(currentName !== null) {
+                const seqStr = buffer.join('');
+                if(seqStr.length) seqs.push({ name: currentName, seq: seqStr.split('') });
+            }
+            currentName = line.substring(1).trim() || null;
+            buffer = [];
+        } else if(currentName !== null) {
+            buffer.push(line.toUpperCase().replace(/[^A-Z-]/g, ''));
+        }
+    }
+
+    if(currentName !== null) {
+        const seqStr = buffer.join('');
+        if(seqStr.length) seqs.push({ name: currentName, seq: seqStr.split('') });
+    }
+
+    if(!sawHeader) return [];
+    return seqs;
+}
+
+function appendSequencesFromClipboard(entries) {
+    const payload = entries.filter(e => e.seq && e.seq.length);
+    if(!payload.length) return;
+    saveState();
+    const existingNames = new Set(state.rawSequences.map(s => s.name));
+    payload.forEach(entry => {
+        let name = entry.name && entry.name.trim().length ? entry.name.trim() : '';
+        if(!name) name = generatePastedName();
+        while(existingNames.has(name)) {
+            name = generatePastedName();
+        }
+        existingNames.add(name);
+        state.rawSequences.push({ name, seq: entry.seq.slice() });
+    });
+    state.selection = null;
+    recalc();
+}
+
+function generatePastedName() {
+    return `Pasted_${state.pastedNameCounter++}`;
+}
+
+// --- Strip Gaps ---
+function stripGapsGlobal() {
+    saveState();
+    state.rawSequences.forEach(s => {
+        s.seq = s.seq.filter(c => c !== '-');
+    });
+    state.selection = null;
+    recalc();
+}
+
+// --- FrameClean Integration ---
+function showCleanModal() {
+    if (!state.rawSequences.length) return;
+    const refName = state.rawSequences[state.refIndex] ? state.rawSequences[state.refIndex].name : "None";
+    document.getElementById('txt-clean-ref-name').textContent = refName;
+    document.getElementById('clean-overlay').style.display = 'flex';
+}
+
+function runFrameCleanTask() {
+    if (!state.rawSequences.length) return;
+    document.getElementById('clean-overlay').style.display = 'none';
+    saveState();
+    showOverlay(true);
+    dom.overlayMsg.textContent = "Cleaning reading frame...";
+    dom.overlaySub.textContent = "Inferring frame with FrameClean.js";
+
+    setTimeout(() => {
+        try {
+            const aln = state.rawSequences.map((s, i) => ({
+                id: i.toString(),
+                seq: s.seq.join('')
+            }));
+
+            const refMode = document.getElementById('sel-clean-ref-mode').value;
+            const options = {
+                columnModelOptions: {
+                    pBackbone: parseFloat(document.getElementById('inp-clean-pback').value),
+                    pInsertion: parseFloat(document.getElementById('inp-clean-pins').value)
+                },
+                priorModelOptions: {
+                    insertionStartPenalty: parseFloat(document.getElementById('inp-clean-start').value),
+                    insertionExtendPenalty: parseFloat(document.getElementById('inp-clean-extend').value),
+                    insertionEndResidPenalty: [0, -6, -6]
+                }
+            };
+
+            if (refMode !== 'no') {
+                options.reference = {
+                    index: state.refIndex,
+                    mode: refMode,
+                    frameOffset: (state.frame - 1)
+                };
+            }
+
+            const inferred = FrameClean.inferFrame(aln, options);
+            const cleanedObj = FrameClean.cleanInFrame(aln, inferred);
+
+            // Apply cleaned sequences back
+            cleanedObj.alignment.forEach((s) => {
+                const originalIdx = parseInt(s.id);
+                state.rawSequences[originalIdx].seq = s.seq.split('');
+            });
+
+            state.selection = null;
+            recalc();
+            showOverlay(false);
+        } catch (err) {
+            console.error("FrameClean error:", err);
+            alert("FrameClean failed: " + err.message);
+            showOverlay(false);
+        }
+    }, 50);
+}
+
+function clearAlignment() {
+    if(!state.rawSequences.length) return;
+    if(!confirm("Clear all sequences and the current tree?")) return;
+    saveState();
+    state.rawSequences = [];
+    state.viewSequences = [];
+    state.selection = null;
+    state.tree = null;
+    state.refIndex = 0;
+    state.maxLength = 0;
+    state.refMap = [];
+    state.pastedNameCounter = 1;
+    dom.sizer.style.width = '1px';
+    dom.sizer.style.height = '1px';
+    setTreeWidth(0);
+    recalc();
+    render();
+}
+
+function clearTreeOnly() {
+    state.tree = null;
+    setTreeWidth(0);
+    render();
+}
+
+// --- Async Alignment Logic (Global) ---
+let activeMsaJob = null;
+let msaRollback = null;
+
+function runAlignmentTask() {
+    if(state.rawSequences.length < 2) return;
+    const alignMode = dom.selAlignMode.value;
+    const previousHistory = alignMode === 'msa' ? state.history.slice() : null;
+    const rollbackSnapshot = saveState();
+    if(alignMode === 'msa') msaRollback = { snapshot: rollbackSnapshot, history: previousHistory };
+    showOverlay(true);
+    dom.overlayMsg.textContent = "Initializing...";
+    dom.overlaySub.textContent = "";
+
+    if (alignMode === 'msa') {
+        setTimeout(runMSAAlignment, 50);
+    } else if (alignMode === 'kalign') {
+        setTimeout(runKalignAlignment, 50);
+    } else {
+        setTimeout(startAsyncAlignment, 50);
+    }
+}
+
+// --- Kalign Alignment using bioWASM ---
+async function runKalignAlignment() {
+    if (!state.aioliCLI) {
+        alert("Kalign (bioWASM) is not yet initialized. Please wait or refresh.");
+        showOverlay(false);
+        return;
+    }
+
+    const isAA = (state.mode === 'AA');
+    dom.overlayMsg.textContent = "Running Kalign alignment...";
+    dom.overlaySub.textContent = "via bioWASM";
+
+    try {
+        // Use indices as temporary names to avoid truncation/special character issues in Kalign
+        const fastaInput = state.rawSequences.map((s, idx) => {
+            const seqArr = isAA ? state.viewSequences[idx].seq : s.seq;
+            const seqStr = seqArr.join('').replace(/-/g, '');
+            return `>${idx}\n${seqStr}`;
+        }).join('\n');
+
+        if (!fastaInput.trim()) {
+            throw new Error("No sequences to align.");
+        }
+
+        await state.aioliCLI.mount({
+            name: "input.fa",
+            data: fastaInput
+        });
+
+        const command = `kalign input.fa -f fasta`;
+        const resultFasta = await state.aioliCLI.exec(command);
+
+        if (!resultFasta || !resultFasta.includes('>')) {
+            throw new Error("Kalign failed to return a valid FASTA alignment.");
+        }
+
+        // Parse result fasta
+        const lines = resultFasta.split(/\r?\n/);
+        const indexToSeq = new Map();
+        let currentIndex = null;
+        let buf = [];
+        for (let line of lines) {
+            line = line.trim();
+            if (!line) continue;
+            if (line.startsWith('>')) {
+                if (currentIndex !== null) indexToSeq.set(currentIndex, buf.join(''));
+                currentIndex = line.substring(1).trim();
+                buf = [];
+            } else if (currentIndex !== null) {
+                buf.push(line.toUpperCase().replace(/[^A-Z-]/g, ''));
+            }
+        }
+        if (currentIndex !== null) indexToSeq.set(currentIndex, buf.join(''));
+
+        if (isAA) {
+            // Map AA alignment back to DNA
+            for (let i = 0; i < state.rawSequences.length; i++) {
+                const s = state.rawSequences[i];
+                const alignedAA = indexToSeq.get(i.toString());
+                if (!alignedAA) continue;
+
+                const cleanDNA = s.seq.join('').replace(/-/g, '');
+                const offset = state.frame - 1;
+                const finalSeq = [];
+
+                // 5' Padding
+                for (let p = 0; p < offset; p++) finalSeq.push(cleanDNA[p] || '-');
+
+                let dnaIdx = offset;
+                for (const char of alignedAA) {
+                    if (char === '-') {
+                        finalSeq.push('-', '-', '-');
+                    } else {
+                        if (dnaIdx + 3 <= cleanDNA.length) {
+                            finalSeq.push(cleanDNA[dnaIdx], cleanDNA[dnaIdx + 1], cleanDNA[dnaIdx + 2]);
+                            dnaIdx += 3;
+                        } else {
+                            finalSeq.push('-', '-', '-');
+                        }
+                    }
+                }
+                // Trailing DNA
+                while (dnaIdx < cleanDNA.length) finalSeq.push(cleanDNA[dnaIdx++]);
+                s.seq = finalSeq;
+            }
+        } else {
+            // NT mode - directly use aligned sequences
+            state.rawSequences.forEach((s, idx) => {
+                const alignedNT = indexToSeq.get(idx.toString());
+                if (alignedNT) {
+                    s.seq = alignedNT.split('');
+                }
+            });
+        }
+
+        recalc();
+        showOverlay(false);
+    } catch (err) {
+        console.error("Kalign error:", err);
+        alert("Kalign alignment failed: " + err.message);
+        showOverlay(false);
+    }
+}
+
+// --- MSA Alignment using multiSequenceAlign ---
+async function runMSAAlignment() {
+    const isAA = (state.mode === 'AA');
+
+    dom.overlayMsg.textContent = "Running multiple sequence alignment...";
+    dom.overlaySub.textContent = "";
+
+    // Strip gaps from all sequences
+    const cleanSeqs = state.rawSequences.map(s => s.seq.join('').replace(/-/g, ''));
+
+    let seqsToAlign;
+    if (isAA) {
+        // Translate to AA for alignment
+        const offset = state.frame - 1;
+        seqsToAlign = cleanSeqs.map(seq => {
+            const aa = [];
+            for (let i = offset; i < seq.length; i += 3) {
+                if (i + 2 >= seq.length) break;
+                const codon = seq.substring(i, i + 3);
+                if (/[^ACGT]/i.test(codon)) aa.push('X');
+                else aa.push(CODON_TABLE[codon] || 'X');
+            }
+            return aa.join('');
+        });
+    } else {
+        seqsToAlign = cleanSeqs;
+    }
+
+    try {
+        // Swig injects a worker-backed WASM port of this refinedMSA path. Its
+        // nucleotide and amino-acid modes treat N and X, respectively, as an
+        // unknown-residue wildcard substitution.
+        // A directly opened standalone Alivibe retains the original JavaScript
+        // implementation as a compatibility fallback.
+        const job = window.swigAlivibeBridge?.createMsaJob?.(seqsToAlign) || null;
+        let alignedSeqs;
+        if(job) {
+            activeMsaJob = job;
+            dom.btnCancelTask.disabled = false;
+            dom.btnCancelTask.style.display = '';
+            dom.overlaySub.textContent = "Alivibe-compatible WebAssembly worker";
+            alignedSeqs = await job.result;
+        } else {
+            dom.overlaySub.textContent = "JavaScript compatibility fallback";
+            alignedSeqs = refinedMSA(seqsToAlign);
+        }
+
+        // Apply the aligned sequences back
+        if (isAA) {
+            // Map AA alignment back to DNA
+            for (let i = 0; i < state.rawSequences.length; i++) {
+                const alignedAA = alignedSeqs[i];
+                const cleanDNA = cleanSeqs[i];
+                const offset = state.frame - 1;
+
+                const finalSeq = [];
+
+                // 5' Padding
+                for (let p = 0; p < offset; p++) finalSeq.push(cleanDNA[p] || '-');
+
+                let dnaIdx = offset;
+                for (const char of alignedAA) {
+                    if (char === '-') {
+                        finalSeq.push('-', '-', '-');
+                    } else {
+                        if (dnaIdx + 3 <= cleanDNA.length) {
+                            finalSeq.push(cleanDNA[dnaIdx], cleanDNA[dnaIdx + 1], cleanDNA[dnaIdx + 2]);
+                            dnaIdx += 3;
+                        } else {
+                            finalSeq.push('-', '-', '-');
+                        }
+                    }
+                }
+
+                // Trailing DNA
+                while (dnaIdx < cleanDNA.length) finalSeq.push(cleanDNA[dnaIdx++]);
+
+                state.rawSequences[i].seq = finalSeq;
+            }
+        } else {
+            // NT mode - directly use aligned sequences
+            for (let i = 0; i < state.rawSequences.length; i++) {
+                state.rawSequences[i].seq = alignedSeqs[i].split('');
+            }
+        }
+
+        recalc();
+    } catch (err) {
+        console.error("MSA error:", err);
+        if(msaRollback) {
+            state.rawSequences = msaRollback.snapshot.seqs;
+            state.selection = msaRollback.snapshot.sel;
+            state.refIndex = msaRollback.snapshot.refIdx < state.rawSequences.length ? msaRollback.snapshot.refIdx : 0;
+            state.history = msaRollback.history;
+            recalc();
+        }
+        if(err?.name !== "AbortError") alert("MSA alignment failed: " + err.message);
+    } finally {
+        activeMsaJob = null;
+        msaRollback = null;
+        dom.btnCancelTask.disabled = false;
+        dom.btnCancelTask.style.display = 'none';
+        showOverlay(false);
+    }
+}
+
+function startAsyncAlignment() {
+    const alignMode = dom.selAlignMode.value;
+    const isAA = (state.mode === 'AA');
+
+    // Always strip gaps first!
+    const seqsToAlign = state.rawSequences.map(s => {
+        const cleanSeq = s.seq.join('').replace(/-/g, '');
+        if (isAA) {
+            const aa = [];
+            const offset = state.frame - 1;
+            for(let i=offset; i<cleanSeq.length; i+=3) {
+                if(i+2 >= cleanSeq.length) break;
+                const codon = cleanSeq.substring(i, i+3);
+                // IUPAC Handling: If not strict ACGT, it's X
+                if (/[^ACGT]/i.test(codon)) aa.push('X');
+                else aa.push(CODON_TABLE[codon] || 'X');
+            }
+            return { name: s.name, str: aa.join(''), original: cleanSeq };
+        } else {
+            return { name: s.name, str: cleanSeq, original: cleanSeq };
+        }
+    });
+
+    const refStr = seqsToAlign[state.refIndex].str;
+    const results = new Array(seqsToAlign.length);
+    results[state.refIndex] = { alignedRef: refStr, alignedQuery: refStr };
+
+    let currentIndex = 0;
+    const total = seqsToAlign.length;
+
+    function tick() {
+        const startT = performance.now();
+        while(currentIndex < total && (performance.now() - startT < 30)) {
+            if(currentIndex !== state.refIndex) {
+                const query = seqsToAlign[currentIndex];
+                const [alnRef, alnQuery] = doubleDP_nwalign(refStr, query.str);
+                results[currentIndex] = { alignedRef: alnRef, alignedQuery: alnQuery };
+            }
+            currentIndex++;
+        }
+
+        const pct = Math.round((currentIndex / total) * 100);
+        dom.overlayMsg.textContent = `Aligning... ${currentIndex}/${total} (${pct}%)`;
+
+        if(currentIndex < total) {
+            setTimeout(tick, 0);
+        } else {
+            dom.overlayMsg.textContent = "Reconstructing...";
+            setTimeout(() => {
+                reconstructAlignment(results, seqsToAlign, alignMode, isAA);
+                showOverlay(false);
+            }, 10);
+        }
+    }
+    tick();
+}
+
+function reconstructAlignment(results, seqsToAlign, alignMode, isAA) {
+    const refStr = seqsToAlign[state.refIndex].str;
+    const refLen = refStr.length;
+
+    // insertionsMap: index i corresponds to "after ref character i-1" (i=0 is start)
+    const insertionsMap = Array(refLen + 1).fill().map(() => []);
+
+    // 1. Harvest Insertions relative to Ref
+    for(let i=0; i<results.length; i++) {
+        if(!results[i]) continue;
+        const res = results[i];
+        let rIdx = 0;
+        let currentIns = "";
+
+        for(let k=0; k<res.alignedRef.length; k++) {
+            if(res.alignedRef[k] === '-') {
+                currentIns += res.alignedQuery[k];
+            } else {
+                if(currentIns.length > 0) {
+                    insertionsMap[rIdx].push({ seqIdx: i, str: currentIns });
+                    currentIns = "";
+                }
+                rIdx++;
+            }
+        }
+        if(currentIns.length > 0) insertionsMap[rLen = refLen].push({ seqIdx: i, str: currentIns });
+    }
+
+    // 2. Determine Widths / Polish Insertions
+    const insertionWidths = new Int32Array(refLen + 1);
+    const polishedCache = new Map();
+
+    for(let i=0; i<=refLen; i++) {
+        const bucket = insertionsMap[i];
+        if(bucket.length === 0) continue;
+
+        if (alignMode === 'discard') {
+            insertionWidths[i] = 0;
+        } else if (alignMode === 'left') {
+            let max = 0;
+            for(let item of bucket) if(item.str.length > max) max = item.str.length;
+            insertionWidths[i] = max;
+        } else if (alignMode === 'polish') {
+            let leader = "";
+            for(let item of bucket) if(item.str.length > leader.length) leader = item.str;
+
+            if(leader.length === 0) { insertionWidths[i] = 0; continue; }
+
+            let maxPolishedLen = leader.length;
+
+            for(let item of bucket) {
+                if(item.str === leader) {
+                    if(!polishedCache.has(item.seqIdx)) polishedCache.set(item.seqIdx, new Map());
+                    polishedCache.get(item.seqIdx).set(i, leader);
+                } else {
+                    const [ _, polishedQuery ] = doubleDP_nwalign(leader, item.str);
+                    if(!polishedCache.has(item.seqIdx)) polishedCache.set(item.seqIdx, new Map());
+                    polishedCache.get(item.seqIdx).set(i, polishedQuery);
+                    if(polishedQuery.length > maxPolishedLen) maxPolishedLen = polishedQuery.length;
+                }
+            }
+            insertionWidths[i] = maxPolishedLen;
+        }
+    }
+
+    // 3. Build Final Strings
+    for(let i=0; i<seqsToAlign.length; i++) {
+        const res = results[i];
+        let alnPos = 0;
+
+        // If not AA (NT), we can rely on standard string building.
+        // If AA, we MUST synchronize back to DNA codons, even if we discard the AA.
+
+        if (!isAA) {
+            let finalStr = "";
+
+            // Helper to handle insertion blocks
+            const handleInsertion = (mapIdx) => {
+                let myIns = "";
+                while(alnPos < res.alignedRef.length && res.alignedRef[alnPos] === '-') {
+                    myIns += res.alignedQuery[alnPos];
+                    alnPos++;
+                }
+
+                if(alignMode !== 'discard') {
+                    let content = myIns;
+                    if(alignMode === 'polish' && myIns.length > 0 && polishedCache.has(i) && polishedCache.get(i).has(mapIdx)) {
+                        content = polishedCache.get(i).get(mapIdx);
+                    }
+                    while(content.length < insertionWidths[mapIdx]) content += '-';
+                    finalStr += content;
+                }
+            };
+
+            // Start Insertions
+            handleInsertion(0);
+
+            // Matches + Following Insertions
+            for(let r=0; r<refLen; r++) {
+                if(alnPos < res.alignedRef.length) {
+                    finalStr += res.alignedQuery[alnPos];
+                    alnPos++;
+                }
+                handleInsertion(r + 1);
+            }
+            state.rawSequences[i].seq = finalStr.split('');
+        } else {
+            // AA Mode: Need to build DNA sequence directly
+            let finalSeq = [];
+            let dnaIdx = state.frame - 1;
+            const cleanDNA = seqsToAlign[i].original;
+
+            // 5' Padding
+            for(let p=0; p<state.frame-1; p++) finalSeq.push(cleanDNA[p] || '-');
+
+            const getCodon = () => {
+                if(dnaIdx + 3 <= cleanDNA.length) {
+                    const c = cleanDNA.slice(dnaIdx, dnaIdx+3);
+                    dnaIdx += 3;
+                    return c.split('');
+                }
+                dnaIdx += 3; // Advance anyway
+                return ['-', '-', '-'];
+            };
+
+            const skipCodon = () => { dnaIdx += 3; };
+
+            const handleAAInsertion = (mapIdx) => {
+                let myIns = ""; // The raw characters from the aligned query (AA)
+                while(alnPos < res.alignedRef.length && res.alignedRef[alnPos] === '-') {
+                    myIns += res.alignedQuery[alnPos];
+                    alnPos++;
+                }
+
+                if(alignMode === 'discard') {
+                    // Consume codons for characters we are discarding
+                    for(let char of myIns) {
+                        if(char !== '-') skipCodon();
+                    }
+                } else {
+                    // Decide what content to output
+                    let content = myIns;
+                    let isPolished = false;
+
+                    if(alignMode === 'polish' && myIns.length > 0 && polishedCache.has(i) && polishedCache.get(i).has(mapIdx)) {
+                        content = polishedCache.get(i).get(mapIdx);
+                        isPolished = true;
+                    }
+
+                    // Iterate the content to map back to DNA
+                    // If content is polished, it maps 1-to-1 to myIns (with gaps added)
+                    for(let char of content) {
+                        if(char === '-') {
+                            finalSeq.push('-', '-', '-');
+                        } else {
+                            // If it's a character, it corresponds to the next character in myIns
+                            // which corresponds to the next codon in cleanDNA
+                            finalSeq.push(...getCodon());
+                        }
+                    }
+
+                    // Pad
+                    const currentLen = content.length;
+                    const targetLen = insertionWidths[mapIdx];
+                    for(let k=currentLen; k<targetLen; k++) finalSeq.push('-', '-', '-');
+                }
+            };
+
+            handleAAInsertion(0);
+
+            for(let r=0; r<refLen; r++) {
+                if(alnPos < res.alignedRef.length) {
+                    const char = res.alignedQuery[alnPos];
+                    if(char === '-') finalSeq.push('-', '-', '-');
+                    else finalSeq.push(...getCodon());
+                    alnPos++;
+                }
+                handleAAInsertion(r + 1);
+            }
+
+            // Trailing DNA
+            while(dnaIdx < cleanDNA.length) finalSeq.push(cleanDNA[dnaIdx++]);
+
+            state.rawSequences[i].seq = finalSeq;
+        }
+    }
+    recalc();
+}
+
+
+// --- Realign Selection Logic ---
+function realignSelection() {
+    if(!state.selection) { alert("Select an area to realign."); return; }
+    saveState();
+
+    const { r1, r2, c1, c2 } = state.selection;
+    const isAA = (state.mode === 'AA');
+
+    // 1. Identify Template
+    let templateStr = "";
+    let templateRow = -1;
+
+    // Extract raw strings for the selection block - STRIPPING GAPS
+    const blockSeqs = [];
+
+    for(let r=r1; r<=r2; r++) {
+        if(r >= state.viewSequences.length) continue;
+        const seqObj = state.viewSequences[r];
+        const slice = seqObj.seq.slice(c1, c2 + 1).join('');
+        const stripped = slice.replace(/-/g, '');
+        blockSeqs.push({ index: r, str: stripped });
+    }
+
+    if(state.refIndex >= r1 && state.refIndex <= r2) {
+        templateRow = state.refIndex;
+        templateStr = blockSeqs.find(b => b.index === templateRow).str;
+    } else {
+        // Find longest
+        let maxLen = -1;
+        blockSeqs.forEach(b => {
+            if(b.str.length > maxLen) { maxLen = b.str.length; templateStr = b.str; templateRow = b.index; }
+        });
+    }
+
+    if(!templateStr) return;
+
+    // 2. Align everyone to template pairwise
+    const results = blockSeqs.map(b => {
+        if(b.str === templateStr) return { alignedRef: templateStr, alignedQuery: templateStr };
+        const [aRef, aQuery] = doubleDP_nwalign(templateStr, b.str);
+        return { alignedRef: aRef, alignedQuery: aQuery };
+    });
+
+    // 3. Merge gaps (Star Alignment logic on the fly)
+    const tLen = templateStr.length;
+    const gapMap = new Int32Array(tLen + 1);
+
+    results.forEach(res => {
+        let tIdx = 0;
+        let currentGap = 0;
+        for(let i=0; i<res.alignedRef.length; i++) {
+            if(res.alignedRef[i] === '-') {
+                currentGap++;
+            } else {
+                if(currentGap > gapMap[tIdx]) gapMap[tIdx] = currentGap;
+                currentGap = 0;
+                tIdx++;
+            }
+        }
+        if(currentGap > gapMap[tLen]) gapMap[tLen] = currentGap;
+    });
+
+    // 4. Construct new block strings
+    const newBlockStrings = results.map(res => {
+        let s = "";
+        let pos = 0;
+
+        let ins = "";
+        while(pos < res.alignedRef.length && res.alignedRef[pos] === '-') {
+            ins += res.alignedQuery[pos++];
+        }
+        s += ins.padEnd(gapMap[0], '-');
+
+        for(let i=0; i<tLen; i++) {
+            if(pos < res.alignedRef.length) s += res.alignedQuery[pos++];
+            ins = "";
+            while(pos < res.alignedRef.length && res.alignedRef[pos] === '-') {
+                ins += res.alignedQuery[pos++];
+            }
+            s += ins.padEnd(gapMap[i+1], '-');
+        }
+        return s;
+    });
+
+    // 5. Inject back
+    const newWidth = newBlockStrings[0].length;
+    const diff = newWidth - (c2 - c1 + 1);
+
+    if(diff > 0) {
+        state.rawSequences.forEach(s => {
+            const dna = s.seq;
+            if(isAA) {
+                 const insIdx = (c2 + 1) * 3 + (state.frame - 1);
+                 for(let k=0; k<diff*3; k++) dna.splice(insIdx, 0, '-');
+            } else {
+                 for(let k=0; k<diff; k++) dna.splice(c2+1, 0, '-');
+            }
+        });
+        state.selection.c2 += diff;
+    }
+
+    // Overwrite
+    newBlockStrings.forEach((str, idx) => {
+        const rowIdx = blockSeqs[idx].index;
+        const dna = state.rawSequences[rowIdx].seq;
+
+        if(isAA) {
+            // Rough heuristic reconstruction for AA->DNA
+            const off = state.frame - 1;
+            const rawSlice = state.rawSequences[rowIdx].seq.slice(c1*3+off, (c1*3+off) + ((c2-c1+1-diff)*3)); // approx old slice
+            const codingDNA = [];
+            for(let i=0; i<rawSlice.length; i+=3) {
+                if(rawSlice[i] !== '-') codingDNA.push(rawSlice.slice(i, i+3));
+            }
+
+            let codIdx = 0;
+            let dPos = c1*3+off;
+
+            for(let char of str) {
+                if(char === '-') {
+                    dna[dPos] = '-'; dna[dPos+1] = '-'; dna[dPos+2] = '-';
+                } else {
+                    if(codIdx < codingDNA.length) {
+                        const cod = codingDNA[codIdx++];
+                        dna[dPos] = cod[0]; dna[dPos+1] = cod[1]; dna[dPos+2] = cod[2];
+                    } else {
+                         dna[dPos] = 'N'; dna[dPos+1] = 'N'; dna[dPos+2] = 'N';
+                    }
+                }
+                dPos += 3;
+            }
+        } else {
+            for(let k=0; k<str.length; k++) {
+                dna[c1 + k] = str[k];
+            }
+            for(let k=str.length; k < (c2-c1+1); k++) {
+                dna[c1 + k] = '-';
+            }
+        }
+    });
+
+    recalc();
+}
+
+// --- History ---
+function saveState() {
+    const snapshot = {
+        seqs: JSON.parse(JSON.stringify(state.rawSequences)),
+        sel: state.selection ? { ...state.selection } : null,
+        refIdx: state.refIndex
+    };
+    state.history.push(snapshot);
+    if(state.history.length > CONFIG.maxHistory) state.history.shift();
+    return snapshot;
+}
+
+function undo() {
+    if(state.history.length === 0) return;
+    const prev = state.history.pop();
+    state.rawSequences = prev.seqs;
+    state.selection = prev.sel;
+    if(prev.refIdx < state.rawSequences.length) state.refIndex = prev.refIdx;
+    else state.refIndex = 0;
+
+    recalc();
+}
+
+// --- Loading ---
+function loadFile(file) {
+    if(!file) return;
+    showOverlay(true);
+    const reader = new FileReader();
+    const name = file.name.toLowerCase();
+    const isFastq = name.endsWith('.fastq') || name.endsWith('.fq');
+
+    reader.onload = e => {
+        if(isFastq) parseFastq(e.target.result);
+        else parseFasta(e.target.result);
+    };
+    reader.readAsText(file);
+}
+
+function loadTreeFile(file) {
+    if(!file) return;
+    showOverlay(true);
+    const reader = new FileReader();
+    reader.onload = e => parseTree(e.target.result);
+    reader.readAsText(file);
+}
+
+// --- URL Parameter Loading ---
+function loadFromURLParams() {
+    const params = new URLSearchParams(window.location.search);
+    const alignmentURL = params.get('alignment');
+    const treeURL = params.get('tree');
+
+    if (alignmentURL) {
+        showOverlay(true);
+        dom.overlayMsg.textContent = "Loading alignment...";
+
+        fetch(alignmentURL)
+            .then(response => {
+                if (!response.ok) throw new Error(`Failed to fetch alignment: ${response.status}`);
+                return response.text();
+            })
+            .then(text => {
+                const name = alignmentURL.toLowerCase();
+                const isFastq = name.endsWith('.fastq') || name.endsWith('.fq');
+                if (isFastq) parseFastq(text);
+                else parseFasta(text);
+
+                // After alignment loads, try to load tree if specified
+                if (treeURL) {
+                    loadTreeFromURL(treeURL);
+                }
+            })
+            .catch(err => {
+                console.error("Error loading alignment:", err);
+                alert("Failed to load alignment from URL: " + err.message);
+                showOverlay(false);
+            });
+    }
+}
+
+function loadTreeFromURL(url) {
+    dom.overlayMsg.textContent = "Loading tree...";
+
+    fetch(url)
+        .then(response => {
+            if (!response.ok) throw new Error(`Failed to fetch tree: ${response.status}`);
+            return response.text();
+        })
+        .then(text => {
+            parseTree(text);
+        })
+        .catch(err => {
+            console.error("Error loading tree:", err);
+            alert("Failed to load tree from URL: " + err.message);
+            showOverlay(false);
+        });
+}
+
+// --- Infer Tree Logic ---
+function showInferModal() {
+    if (!state.rawSequences || state.rawSequences.length < 2) {
+        alert("Need at least 2 sequences to infer a tree.");
+        return;
+    }
+    document.getElementById('infer-overlay').style.display = 'flex';
+}
+
+function runInferTask() {
+    const method = document.getElementById('sel-infer-method').value;
+    document.getElementById('infer-overlay').style.display = 'none';
+
+    if (method === 'nj') {
+        inferTreeNJ();
+    } else {
+        runFastTreeTask();
+    }
+}
+
+function inferTreeNJ() {
+    showOverlay(true);
+    dom.overlayMsg.textContent = "Inferring phylogeny...";
+    dom.overlaySub.textContent = "Calculating distances and building NJ tree";
+
+    setTimeout(() => {
+        try {
+            // Extract sequences (strip gaps for distance calculation)
+            const labels = state.rawSequences.map(s => s.name);
+            const seqs = state.rawSequences.map(s => s.seq.join(''));
+
+            // Use PhyloTools to generate the Newick tree
+            const newick = PhyloTools.generatePhylogeny(seqs, labels);
+
+            // Parse the generated tree
+            parseTree(newick);
+        } catch (err) {
+            console.error("Error inferring tree:", err);
+            alert("Failed to infer tree: " + err.message);
+            showOverlay(false);
+        }
+    }, 50);
+}
+
+async function runFastTreeTask() {
+    const bridgeRunner = window.swigAlivibeBridge?.runFastTree;
+    if (!bridgeRunner && !state.aioliCLI) {
+        alert("FastTree is available when Alivibe is opened from webPORPID.");
+        return;
+    }
+
+    showOverlay(true);
+    dom.overlayMsg.textContent = "Inferring phylogeny with FastTree...";
+    dom.overlaySub.textContent = "via bioWASM";
+
+    try {
+        // Use indices as temporary names to avoid truncation/special character issues
+        const fastaInput = state.rawSequences.map((s, idx) => {
+            return `>${idx}\n${s.seq.join('')}`;
+        }).join('\n');
+
+        let newick;
+        if (bridgeRunner) {
+            dom.overlaySub.textContent = "bundled webPORPID FastTree worker";
+            newick = await bridgeRunner(fastaInput);
+        } else {
+            await state.aioliCLI.mount({ name: "input_tree.fa", data: fastaInput });
+            const isAA = (state.mode === 'AA');
+            let flags = isAA ? "" : "-nt";
+            if (isAA) flags += " " + document.getElementById('sel-ft-aa-model').value;
+            else flags += " " + document.getElementById('sel-ft-nt-model').value;
+            flags += " " + document.getElementById('sel-ft-speed').value;
+            newick = await state.aioliCLI.exec(`fasttree ${flags.trim()} input_tree.fa`);
+        }
+
+        if (newick && newick.includes('(')) {
+            state.tempNameMap = state.rawSequences.map(s => s.name);
+            parseTree(newick, true);
+        } else {
+            throw new Error("Invalid Newick output from FastTree.");
+        }
+    } catch (err) {
+        console.error("FastTree error:", err);
+        alert("FastTree failed: " + err.message);
+        showOverlay(false);
+    }
+}
+
+// --- Export Tree as Newick ---
+function exportTree() {
+    if (!state.tree || !state.tree.root) {
+        alert("No tree to export. Load or infer a tree first.");
+        return;
+    }
+
+    const newick = treeToNewick(state.tree.root) + ';';
+
+    // Download as file
+    const blob = new Blob([newick], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "tree.nwk";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// --- Convert tree structure back to Newick format ---
+function treeToNewick(node) {
+    if (!node.children || node.children.length === 0) {
+        // Leaf node
+        const name = node.name || '';
+        const len = (node.len !== undefined && node.len !== 0) ? `:${node.len.toFixed(5)}` : '';
+        return name + len;
+    } else {
+        // Internal node
+        const childStrs = node.children.map(c => treeToNewick(c));
+        const name = node.name || '';
+        const len = (node.len !== undefined && node.len !== 0) ? `:${node.len.toFixed(5)}` : '';
+        return `(${childStrs.join(',')})${name}${len}`;
+    }
+}
+
+function parseFastq(text) {
+    const lines = text.split(/\r?\n/);
+    const seqs = [];
+    for(let i=0; i<lines.length; i++) {
+        const line = lines[i].trim();
+        if(!line) continue;
+        if(line.startsWith('@')) {
+            const name = line.substring(1);
+            if(i + 1 < lines.length) {
+                const seqStr = lines[i+1].trim().toUpperCase().replace(/[^A-Z-]/g, '');
+                seqs.push({ name: name, seq: seqStr.split('') });
+                i += 3;
+            }
+        }
+    }
+    finalizeLoad(seqs);
+}
+
+function parseFasta(text) {
+    const lines = text.split(/\r?\n/);
+    const seqs = [];
+    let name = null, buf = [];
+    for(let line of lines) {
+        line = line.trim();
+        if(!line) continue;
+        if(line.startsWith('>')) {
+            if(name) seqs.push({name, seq: buf.join('').split('')});
+            name = line.substring(1).trim();
+            buf = [];
+        } else {
+            buf.push(line.toUpperCase().replace(/[^A-Z-]/g, ''));
+        }
+    }
+    if(name) seqs.push({name, seq: buf.join('').split('')});
+    finalizeLoad(seqs);
+}
+
+function finalizeLoad(seqs) {
+    state.rawSequences = seqs;
+    state.selection = null;
+    state.history = [];
+    state.tree = null;
+    state.refIndex = 0;
+    state.pastedNameCounter = state.rawSequences.length + 1;
+    setTreeWidth(0);
+    recalc();
+    showOverlay(false);
+}
+
+// --- Newick Parser ---
+function parseTree(newick, isIndexed = false) {
+    if(!state.rawSequences.length) {
+        alert("Please load sequences first.");
+        showOverlay(false);
+        return;
+    }
+
+    saveState();
+
+    // FastTree output might contain multiple lines; the tree is usually the last line
+    let lines = newick.trim().split(/\r?\n/);
+    let s = lines[lines.length - 1].trim();
+    if(s.endsWith(';')) s = s.slice(0, -1);
+
+    // Remove Newick comments like [ ... ]
+    s = s.replace(/\[[^\]]*\]/g, '');
+
+    const tokens = s.split(/([(),:;])/).map(t => t.trim()).filter(t => t !== '');
+
+    let stack = [];
+    let root = { children: [], name: null, len: 0 };
+    let current = root;
+
+    for(let i=0; i<tokens.length; i++) {
+        let t = tokens[i];
+        if(t === '(') {
+            let node = { children: [], name: null, len: 0, parent: current };
+            current.children.push(node);
+            stack.push(current);
+            current = node;
+        } else if (t === ',') {
+            if (stack.length > 0) {
+                current = stack[stack.length - 1];
+            } else {
+                current = root;
+            }
+            let node = { children: [], name: null, len: 0, parent: current };
+            current.children.push(node);
+            current = node;
+        } else if (t === ')') {
+            if (stack.length > 0) {
+                current = stack.pop();
+            } else {
+                current = root;
+            }
+        } else if (t === ':') {
+            i++;
+            let lenStr = tokens[i];
+            let val = parseFloat(lenStr);
+            if(current && !isNaN(val)) current.len = val;
+        } else {
+            if (!current) continue;
+            let name = t.replace(/^['"]|['"]$/g, '');
+            if (isIndexed && state.tempNameMap) {
+                const idx = parseInt(name);
+                if (!isNaN(idx) && idx >= 0 && idx < state.tempNameMap.length) {
+                    name = state.tempNameMap[idx];
+                }
+            }
+            current.name = name;
+        }
+    }
+    delete state.tempNameMap;
+
+    // If root has only one child and no name/length, that child is likely the real root
+    if (root.children.length === 1 && !root.name) {
+        root = root.children[0];
+        delete root.parent;
+    }
+
+    applyTreeOrder(root);
+
+    let totalLen = 0;
+    function checkLen(n) { totalLen += (n.len || 0); n.children.forEach(checkLen); }
+    checkLen(root);
+
+    const useCladogram = (totalLen === 0);
+    let maxDepth = 0;
+
+    function layoutX(node, currentDepth) {
+        let dist = useCladogram ? (node === root ? 0 : 1) : (node.len || 0);
+        node.xDepth = currentDepth + dist;
+        if(node.xDepth > maxDepth) maxDepth = node.xDepth;
+        node.children.forEach(c => layoutX(c, node.xDepth));
+    }
+
+    root.len = 0;
+    layoutX(root, 0);
+
+    state.tree = { root, maxDepth };
+    setTreeWidth(200);
+    recalc();
+    showOverlay(false);
+}
+
+function applyTreeOrder(root) {
+    const leafOrder = [];
+    function traverse(node) {
+        if(!node.children || node.children.length === 0) {
+            if(node.name) leafOrder.push(node.name);
+        } else {
+            node.children.forEach(traverse);
+        }
+    }
+    traverse(root);
+
+    const seqMap = new Map();
+    state.rawSequences.forEach(s => seqMap.set(s.name, s));
+
+    const oldRefName = state.rawSequences[state.refIndex]?.name;
+    const newSeqList = [];
+    leafOrder.forEach(name => {
+        if(seqMap.has(name)) {
+            newSeqList.push(seqMap.get(name));
+            seqMap.delete(name);
+        }
+    });
+    for(let s of seqMap.values()) newSeqList.push(s);
+    state.rawSequences = newSeqList;
+
+    if (oldRefName) {
+        const newIdx = state.rawSequences.findIndex(s => s.name === oldRefName);
+        state.refIndex = (newIdx !== -1) ? newIdx : 0;
+    } else {
+        state.refIndex = 0;
+    }
+}
+
+function ladderizeTree() {
+    if (!state.tree || !state.tree.root) {
+        alert("Please load or infer a tree first.");
+        return;
+    }
+
+    saveState();
+
+    function countLeaves(node) {
+        if (!node.children || node.children.length === 0) {
+            node.leafCount = 1;
+            return 1;
+        }
+        let count = 0;
+        for (const child of node.children) {
+            count += countLeaves(child);
+        }
+        node.leafCount = count;
+        return count;
+    }
+
+    function sortChildren(node) {
+        if (!node.children || node.children.length <= 1) return;
+        node.children.sort((a, b) => a.leafCount - b.leafCount);
+        for (const child of node.children) {
+            sortChildren(child);
+        }
+    }
+
+    countLeaves(state.tree.root);
+    sortChildren(state.tree.root);
+
+    applyTreeOrder(state.tree.root);
+    recalc();
+}
+
+function setTreeWidth(w) {
+    state.treeWidth = Math.max(0, w);
+    document.documentElement.style.setProperty('--tree-width', state.treeWidth + 'px');
+    onResize();
+}
+
+function setMode(m) {
+    state.mode = m;
+    if(m === 'NT') {
+        dom.btnNt.classList.add('active'); dom.btnAa.classList.remove('active');
+    } else {
+        dom.btnAa.classList.add('active'); dom.btnNt.classList.remove('active');
+    }
+    // Frame is metadata for translating this nucleotide alignment. It must be
+    // correctable while inspecting NTs as well as while viewing amino acids.
+    dom.grpFrame.style.opacity = '1';
+    dom.grpFrame.style.pointerEvents = 'auto';
+    dom.grpFrame.title = m === 'NT'
+        ? 'Amino-acid reading frame; applies when AA view is selected and is returned to Swig.'
+        : 'Amino-acid reading frame returned to Swig.';
+    state.selection = null;
+    recalc();
+}
+
+function recalc() {
+    dom.btnUndo.disabled = (state.history.length === 0);
+    dom.btnUndo.style.opacity = (state.history.length === 0) ? "0.5" : "1";
+
+    if(!state.rawSequences.length) return;
+
+    if(state.mode === 'NT') {
+        state.viewSequences = state.rawSequences.map(s => ({ name: s.name, seq: s.seq }));
+    } else {
+        const offset = state.frame - 1;
+        state.viewSequences = state.rawSequences.map(s => {
+            const dna = s.seq;
+            const aa = [];
+            for(let i=offset; i<dna.length; i+=3) {
+                if(i+2 >= dna.length) break;
+                const codon = dna.slice(i, i+3).join('');
+                if(codon.includes('-')) aa.push('-');
+                else if (/[^ACGT]/i.test(codon)) aa.push('X');
+                else aa.push(CODON_TABLE[codon] || 'X');
+            }
+            return { name: s.name, seq: aa };
+        });
+    }
+
+    if(state.refIndex >= state.viewSequences.length) state.refIndex = 0;
+
+    let max = 0;
+    state.viewSequences.forEach(s => max = Math.max(max, s.seq.length));
+    state.maxLength = max;
+
+    state.refMap = new Int32Array(max + 1);
+    if(state.viewSequences[state.refIndex]) {
+        const refSeq = state.viewSequences[state.refIndex].seq;
+        let count = 0;
+        for(let i=0; i<max; i++) {
+            const char = (i < refSeq.length) ? refSeq[i] : '-';
+            if(char !== '-') count++;
+            state.refMap[i] = count;
+        }
+    }
+
+    dom.sizer.style.width = (max * CONFIG.charWidth + 200) + 'px';
+    dom.sizer.style.height = (state.viewSequences.length * CONFIG.rowHeight) + 'px';
+
+    if(state.tree) {
+        const nameToRow = new Map();
+        state.viewSequences.forEach((s, i) => nameToRow.set(s.name, i));
+
+        let matchedCount = 0;
+
+        function computeY(node) {
+            if(!node.children || node.children.length === 0) {
+                if(node.name && nameToRow.has(node.name)) {
+                    node.yRow = nameToRow.get(node.name);
+                    node.hidden = false;
+                    matchedCount++;
+                } else {
+                    node.yRow = 0;
+                    node.hidden = true;
+                }
+            } else {
+                let sumY = 0, count = 0;
+                let minC = Infinity, maxC = -Infinity;
+                let allHidden = true;
+
+                node.children.forEach(c => {
+                    computeY(c);
+                    if(!c.hidden) {
+                        sumY += c.yRow;
+                        if(c.yRow < minC) minC = c.yRow;
+                        if(c.yRow > maxC) maxC = c.yRow;
+                        count++;
+                        allHidden = false;
+                    }
+                });
+                node.hidden = allHidden;
+                node.yRow = count ? (minC + maxC) / 2 : 0;
+            }
+        }
+        computeY(state.tree.root);
+    }
+
+    render();
+}
+
+// --- Interactions ---
+function getCoords(e, type) {
+    let r = 0, c = 0;
+    const rect = (type==='SEQ'?dom.areaSeq:(type==='NAMES'?dom.areaNames:dom.areaRuler)).getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+
+    if(type === 'SEQ') {
+        c = Math.floor((x + dom.areaSeq.scrollLeft) / CONFIG.charWidth);
+        r = Math.floor((y + dom.areaSeq.scrollTop) / CONFIG.rowHeight);
+    } else if (type === 'NAMES') {
+        r = Math.floor((y + dom.areaSeq.scrollTop) / CONFIG.rowHeight);
+    } else if (type === 'RULER') {
+        c = Math.floor((x + dom.areaSeq.scrollLeft) / CONFIG.charWidth);
+    }
+    return { r, c };
+}
+
+function onMouseDown(e, type) {
+    dom.areaSeq.focus();
+
+    const { r, c } = getCoords(e, type);
+    const maxR = Math.max(0, state.viewSequences.length - 1);
+    const safeR = Math.min(r, maxR);
+    const safeC = Math.max(0, c);
+
+    state.mouse.isDown = true;
+    state.mouse.startR = safeR;
+    state.mouse.startC = safeC;
+    state.mouse.lastHoverC = safeC;
+
+    // Shift Click Logic
+    if(e.shiftKey && state.selectionAnchor) {
+        state.mouse.target = type;
+        const anchor = state.selectionAnchor;
+
+        let newR1 = Math.min(anchor.r, safeR);
+        let newR2 = Math.max(anchor.r, safeR);
+        let newC1 = Math.min(anchor.c, safeC);
+        let newC2 = Math.max(anchor.c, safeC);
+
+        if(type === 'NAMES') {
+            state.selection = { r1: newR1, r2: newR2, c1: 0, c2: 99999999 };
+        } else if (type === 'RULER') {
+            state.selection = { r1: 0, r2: maxR, c1: newC1, c2: newC2 };
+        } else if (type === 'SEQ') {
+            state.selection = { r1: newR1, r2: newR2, c1: newC1, c2: newC2 };
+        }
+        render();
+        return;
+    }
+
+    if(type === 'SEQ' && isInsideSelection(r, c) && !e.shiftKey) {
+        state.mouse.target = 'MOVE';
+        dom.areaSeq.classList.add('grabbing');
+    } else if (state.mouse.target === 'RESIZE_TREE') {
+        // handled
+    } else {
+        state.mouse.target = type;
+
+        // Set Anchor
+        state.selectionAnchor = { r: safeR, c: safeC };
+
+        if(type === 'SEQ') {
+            state.selection = { r1: safeR, c1: safeC, r2: safeR, c2: safeC };
+        } else if (type === 'NAMES') {
+            state.selection = { r1: safeR, r2: safeR, c1: 0, c2: 99999999 };
+        } else if (type === 'RULER') {
+            state.selection = { r1: 0, r2: maxR, c1: safeC, c2: safeC };
+        }
+    }
+    render();
+}
+
+function onMouseMove(e) {
+    if(!state.mouse.isDown) return;
+
+    if(state.mouse.target === 'RESIZE_TREE') {
+        const x = e.clientX;
+        const newW = Math.max(20, Math.min(600, x));
+        setTreeWidth(newW);
+        return;
+    }
+
+    const { r, c } = getCoords(e, 'SEQ');
+    const safeR = Math.max(0, Math.min(state.viewSequences.length-1, r));
+    const safeC = Math.max(0, c);
+
+    if(state.mouse.target === 'SEQ') {
+        state.selection.r1 = Math.min(state.mouse.startR, safeR);
+        state.selection.r2 = Math.max(state.mouse.startR, safeR);
+        state.selection.c1 = Math.min(state.mouse.startC, safeC);
+        state.selection.c2 = Math.max(state.mouse.startC, safeC);
+        render();
+    } else if(state.mouse.target === 'NAMES') {
+        state.selection.r1 = Math.min(state.mouse.startR, safeR);
+        state.selection.r2 = Math.max(state.mouse.startR, safeR);
+        state.selection.c1 = 0; state.selection.c2 = 99999999;
+        render();
+    } else if(state.mouse.target === 'RULER') {
+        state.selection.c1 = Math.min(state.mouse.startC, safeC);
+        state.selection.c2 = Math.max(state.mouse.startC, safeC);
+        state.selection.r1 = 0; state.selection.r2 = state.viewSequences.length - 1;
+        render();
+    } else if(state.mouse.target === 'MOVE') {
+        const delta = safeC - state.mouse.lastHoverC;
+        if(delta !== 0) {
+            if(!state.dragSaved) { saveState(); state.dragSaved = true; }
+            attemptMoveSelection(delta);
+            state.mouse.lastHoverC = safeC;
+        }
+    }
+}
+
+function onMouseUp() {
+    state.mouse.isDown = false;
+    state.mouse.target = null;
+    state.dragSaved = false;
+    dom.areaSeq.classList.remove('grabbing');
+}
+
+function isInsideSelection(r, c) {
+    const s = state.selection;
+    if(!s) return false;
+    return r >= s.r1 && r <= s.r2 && c >= s.c1 && c <= s.c2;
+}
+
+// --- Editing Logic ---
+function onKeyDown(e) {
+    if(!state.selection) return;
+    if(e.ctrlKey || e.metaKey) return;
+
+    if(e.key === ' ') { e.preventDefault(); saveState(); insertGap(); }
+    else if (e.key === 'Backspace' || e.key === 'Delete') { e.preventDefault(); saveState(); handleDeletion(); }
+    else if (state.mode === 'NT') {
+        const char = e.key.toUpperCase();
+        // Allow IUPAC ambigs
+        if(/^[ACGTURYMKSWHBVDN-]$/.test(char)) { e.preventDefault(); saveState(); overwriteBlock(char); }
+    }
+}
+
+function handleDeletion() {
+    const { r1, r2, c1, c2 } = state.selection;
+    const allRows = state.viewSequences.length;
+
+    if(c1 === 0 && c2 >= 99999) {
+        state.rawSequences.splice(r1, r2 - r1 + 1);
+        state.selection = null;
+        recalc(); return;
+    }
+    if(r1 === 0 && r2 >= allRows - 1) {
+        const count = c2 - c1 + 1;
+        state.rawSequences.forEach(s => {
+            const dna = s.seq;
+            if(state.mode === 'NT') { if(c1 < dna.length) dna.splice(c1, count); }
+            else { const off = state.frame - 1; const idx = (c1 * 3) + off; if(idx < dna.length) dna.splice(idx, count * 3); }
+        });
+        state.selection = null; recalc(); return;
+    }
+    deleteBlock();
+}
+
+function deleteBlock() {
+    const { r1, r2, c1, c2 } = state.selection;
+    const count = c2 - c1 + 1;
+    const safeC2 = (c2 > 99999) ? state.maxLength + 10 : c2;
+    const safeCount = safeC2 - c1 + 1;
+
+    for(let r=r1; r<=r2; r++) {
+        if(!state.rawSequences[r]) continue;
+        const dna = state.rawSequences[r].seq;
+        if(state.mode === 'NT') dna.splice(c1, safeCount);
+        else {
+            const off = state.frame - 1;
+            const idx = (c1 * 3) + off;
+            if(idx < dna.length) dna.splice(idx, safeCount * 3);
+        }
+    }
+    state.selection = { r1, r2, c1, c2: c1 }; recalc();
+}
+
+function insertGap() {
+    const { r1, r2, c1 } = state.selection;
+    for(let r=r1; r<=r2; r++) {
+        if(!state.rawSequences[r]) continue;
+        const dna = state.rawSequences[r].seq;
+        if(state.mode === 'NT') dna.splice(c1, 0, '-');
+        else { const idx = (c1 * 3) + (state.frame - 1); dna.splice(idx, 0, '-', '-', '-'); }
+    }
+    recalc();
+}
+
+function overwriteBlock(char) {
+    const { r1, r2, c1, c2 } = state.selection;
+    for(let r=r1; r<=r2; r++) {
+        if(!state.rawSequences[r]) continue;
+        const dna = state.rawSequences[r].seq;
+        const effectiveC2 = Math.min(c2, dna.length + 50);
+        for(let c=c1; c<=effectiveC2; c++) {
+            if(c < dna.length) dna[c] = char; else dna.push(char);
+        }
+    }
+    recalc();
+}
+
+function attemptMoveSelection(dir) {
+    if(dir === 0) return;
+    const { r1, r2, c1, c2 } = state.selection;
+    let canMove = true;
+    for(let r=r1; r<=r2; r++) {
+        if(!state.rawSequences[r]) continue;
+        const dna = state.rawSequences[r].seq;
+        let start, end, step;
+        if(state.mode === 'NT') { start = c1; end = c2; step = 1; }
+        else { const off = state.frame - 1; start = c1*3+off; end = c2*3+off+2; step = 3; }
+        const checkEnd = Math.min(end, dna.length - 1);
+
+        if(dir > 0) {
+            for(let k=1; k<=step; k++) if(checkEnd + k < dna.length && dna[checkEnd + k] !== '-') { canMove = false; break; }
+        } else {
+            if(start - step < 0) { canMove = false; break; }
+            for(let k=1; k<=step; k++) if(dna[start - k] !== '-') { canMove = false; break; }
+        }
+        if(!canMove) break;
+    }
+    if(!canMove) return;
+
+    for(let r=r1; r<=r2; r++) {
+        if(!state.rawSequences[r]) continue;
+        const dna = state.rawSequences[r].seq;
+        let start, end, step;
+        if(state.mode === 'NT') { start = c1; end = c2; step = 1; }
+        else { const off = state.frame - 1; start = c1*3+off; end = c2*3+off+2; step = 3; }
+        const effectiveEnd = Math.min(end, dna.length - 1);
+
+        if(dir > 0) {
+            while(dna.length <= effectiveEnd + step) dna.push('-');
+            for(let i = effectiveEnd; i >= start; i--) { dna[i+step] = dna[i]; dna[i] = '-'; }
+        } else {
+            for(let i = start; i <= effectiveEnd; i++) { dna[i-step] = dna[i]; dna[i] = '-'; }
+        }
+    }
+    state.selection.c1 += (dir>0?1:-1); state.selection.c2 += (dir>0?1:-1); recalc();
+}
+
+// --- Render ---
+function showOverlay(b) {
+    dom.overlay.classList.toggle('active', b);
+    if(b && !activeMsaJob) dom.btnCancelTask.style.display = 'none';
+    if(!b) {
+        dom.btnCancelTask.disabled = false;
+        dom.btnCancelTask.style.display = 'none';
+    }
+}
+
+function onResize() {
+    dom.cvsNames.width = dom.areaNames.clientWidth;
+    dom.cvsNames.height = dom.areaNames.clientHeight;
+    dom.cvsRuler.width = dom.areaRuler.clientWidth;
+    dom.cvsRuler.height = dom.areaRuler.clientHeight;
+    dom.cvsSeq.width = dom.areaSeq.clientWidth;
+    dom.cvsSeq.height = dom.areaSeq.clientHeight;
+    if(state.treeWidth > 0) {
+        dom.cvsTree.width = dom.areaTree.clientWidth;
+        dom.cvsTree.height = dom.areaTree.clientHeight;
+    }
+    render();
+}
+
+function render() {
+    if(!state.viewSequences.length && state.rawSequences.length === 0) {
+        ctxSeq.clearRect(0,0,dom.cvsSeq.width, dom.cvsSeq.height);
+        return;
+    }
+
+    const vW = dom.cvsSeq.width, vH = dom.cvsSeq.height;
+    const scrollLeft = dom.areaSeq.scrollLeft, scrollTop = dom.areaSeq.scrollTop;
+
+    const startRow = Math.floor(scrollTop / CONFIG.rowHeight);
+    const endRow = Math.min(state.viewSequences.length, Math.ceil((scrollTop + vH) / CONFIG.rowHeight));
+    const startCol = Math.floor(scrollLeft / CONFIG.charWidth);
+    const endCol = Math.ceil((scrollLeft + vW) / CONFIG.charWidth);
+
+    // Sequence
+    ctxSeq.fillStyle = '#ffffff'; ctxSeq.fillRect(0,0,vW,vH);
+    ctxSeq.font = CONFIG.font; ctxSeq.textBaseline = 'middle'; ctxSeq.textAlign = 'center';
+    const colors = state.mode === 'NT' ? CONFIG.colors.NT : CONFIG.colors.AA;
+    const refSeq = state.viewSequences[state.refIndex] ? state.viewSequences[state.refIndex].seq : null;
+
+    for(let r=startRow; r<endRow; r++) {
+        const seq = state.viewSequences[r].seq;
+        const y = (r * CONFIG.rowHeight) - scrollTop;
+        for(let c=startCol; c<endCol; c++) {
+            if(c >= seq.length) break;
+            const char = seq[c];
+            const x = (c * CONFIG.charWidth) - scrollLeft;
+            let fillColor = colors[char] || colors['default'];
+
+            if(state.highlightMatches && refSeq) {
+                const refChar = (c < refSeq.length) ? refSeq[c] : '-';
+                if(refChar !== '-') {
+                    if(char === refChar) {
+                        fillColor = CONFIG.highlightMatchColor;
+                    } else if (char === '-') {
+                        fillColor = CONFIG.highlightGapColor;
+                    }
+                }
+            }
+
+            ctxSeq.fillStyle = fillColor;
+            ctxSeq.fillRect(x, y, CONFIG.charWidth, CONFIG.rowHeight);
+            if(char !== '-') {
+                ctxSeq.fillStyle = '#000';
+                ctxSeq.fillText(char, x + CONFIG.charWidth/2, y + CONFIG.rowHeight/2);
+            }
+        }
+    }
+
+    // Selection
+    if(state.selection) {
+        const { r1, r2, c1, c2 } = state.selection;
+        const visC2 = Math.min(c2, state.maxLength + 20);
+        const sx = (c1 * CONFIG.charWidth) - scrollLeft;
+        const sy = (r1 * CONFIG.rowHeight) - scrollTop;
+        const w = Math.max(4, (visC2 - c1 + 1) * CONFIG.charWidth);
+        const h = (r2 - r1 + 1) * CONFIG.rowHeight;
+
+        ctxSeq.fillStyle = 'rgba(37, 99, 235, 0.2)'; ctxSeq.fillRect(sx, sy, w, h);
+        ctxSeq.strokeStyle = 'rgba(37, 99, 235, 0.8)'; ctxSeq.lineWidth = 1; ctxSeq.strokeRect(sx, sy, w, h);
+    }
+
+    // Names
+    ctxNames.fillStyle = '#fff'; ctxNames.fillRect(0,0,dom.cvsNames.width, dom.cvsNames.height);
+    ctxNames.font = CONFIG.labelFont; ctxNames.textBaseline = 'middle'; ctxNames.textAlign = 'left';
+    for(let r=startRow; r<endRow; r++) {
+        const y = (r * CONFIG.rowHeight) - scrollTop;
+        let isSel = state.selection && (r >= state.selection.r1 && r <= state.selection.r2);
+
+        if(r === state.refIndex) ctxNames.fillStyle = '#eff6ff';
+        else ctxNames.fillStyle = isSel ? '#eff6ff' : (r%2===0 ? '#f9fafb' : '#fff');
+
+        ctxNames.fillRect(0, y, dom.cvsNames.width, CONFIG.rowHeight);
+
+        if(r === state.refIndex) {
+            ctxNames.fillStyle = '#2563eb';
+            ctxNames.font = "bold " + CONFIG.labelFont;
+        } else {
+            ctxNames.fillStyle = isSel ? '#1e40af' : '#374151';
+            ctxNames.font = CONFIG.labelFont;
+        }
+
+        let label = state.viewSequences[r].name;
+        if(r === state.refIndex) label += " [Ref]";
+        ctxNames.fillText(label, 10, y + CONFIG.rowHeight/2);
+    }
+
+    // Ruler
+    ctxRuler.fillStyle = '#f3f4f6'; ctxRuler.fillRect(0,0,dom.cvsRuler.width, dom.cvsRuler.height);
+    ctxRuler.font = "10px sans-serif"; ctxRuler.textAlign = "center";
+
+    const h = dom.cvsRuler.height;
+    const mid = h / 2;
+
+    ctxRuler.strokeStyle = '#e5e7eb';
+    ctxRuler.beginPath(); ctxRuler.moveTo(0, mid); ctxRuler.lineTo(dom.cvsRuler.width, mid); ctxRuler.stroke();
+
+    ctxRuler.strokeStyle = "#9ca3af";
+
+    for(let c=startCol; c<endCol; c++) {
+        const x = (c * CONFIG.charWidth) - scrollLeft + (CONFIG.charWidth/2);
+        let isSel = state.selection && (c >= state.selection.c1 && c <= state.selection.c2);
+
+        if(isSel) {
+            ctxRuler.fillStyle = "rgba(37, 99, 235, 0.2)";
+            ctxRuler.fillRect((c*CONFIG.charWidth)-scrollLeft, 0, CONFIG.charWidth, h);
+        }
+
+        const alnIdx = c + 1;
+        ctxRuler.fillStyle = "#6b7280";
+        if(alnIdx===1 || alnIdx % CONFIG.rulerTickStep === 0) {
+            ctxRuler.moveTo(x, mid + 15); ctxRuler.lineTo(x, h);
+            ctxRuler.fillText(alnIdx, x, mid + 12);
+        } else if(alnIdx % (CONFIG.rulerTickStep/2)===0) {
+            ctxRuler.moveTo(x, mid + 22); ctxRuler.lineTo(x, h);
+        }
+
+        const refIdx = state.refMap[c];
+        const prevRefIdx = (c > 0) ? state.refMap[c-1] : 0;
+
+        if(refIdx !== prevRefIdx) {
+            ctxRuler.fillStyle = "#2563eb";
+            if(refIdx===1 || refIdx % CONFIG.rulerTickStep === 0) {
+                ctxRuler.moveTo(x, 0); ctxRuler.lineTo(x, 15);
+                ctxRuler.fillText(refIdx, x, 25);
+            } else if(refIdx % (CONFIG.rulerTickStep/2)===0) {
+                ctxRuler.moveTo(x, 0); ctxRuler.lineTo(x, 8);
+            }
+        }
+    }
+    ctxRuler.stroke();
+
+    ctxRuler.fillStyle = "#2563eb"; ctxRuler.font = "9px sans-serif"; ctxRuler.textAlign = "left";
+    ctxRuler.fillText("Ref", 2, 12);
+    ctxRuler.fillStyle = "#6b7280";
+    ctxRuler.fillText("Aln", 2, mid + 12);
+
+    // Tree
+    if(state.treeWidth > 0 && state.tree) {
+        ctxTree.clearRect(0, 0, dom.cvsTree.width, dom.cvsTree.height);
+        ctxTree.save();
+        ctxTree.translate(0, -scrollTop);
+        ctxTree.strokeStyle = '#374151';
+        ctxTree.lineWidth = 1;
+
+        const padding = 15;
+        const availableW = dom.cvsTree.width - padding;
+        const xScale = state.tree.maxDepth > 0 ? (availableW / state.tree.maxDepth) : 1;
+
+        const drawNode = (node) => {
+            if(node.hidden) return;
+            const x = (node.xDepth * xScale) + 5;
+            const y = (node.yRow * CONFIG.rowHeight) + (CONFIG.rowHeight/2);
+
+            if(node.children && node.children.length > 0) {
+                let minY = Infinity, maxY = -Infinity;
+                node.children.forEach(c => {
+                    if(c.hidden) return;
+                    drawNode(c);
+                    const cx = (c.xDepth * xScale) + 5;
+                    const cy = (c.yRow * CONFIG.rowHeight) + (CONFIG.rowHeight/2);
+
+                    ctxTree.beginPath();
+                    ctxTree.moveTo(x, cy);
+                    ctxTree.lineTo(cx, cy);
+                    ctxTree.stroke();
+
+                    if(cy < minY) minY = cy;
+                    if(cy > maxY) maxY = cy;
+                });
+
+                if(minY !== Infinity) {
+                    ctxTree.beginPath();
+                    ctxTree.moveTo(x, minY);
+                    ctxTree.lineTo(x, maxY);
+                    ctxTree.stroke();
+                }
+            } else {
+                ctxTree.save();
+                ctxTree.setLineDash([2, 4]);
+                ctxTree.strokeStyle = '#d1d5db';
+                ctxTree.beginPath();
+                ctxTree.moveTo(x, y);
+                ctxTree.lineTo(dom.cvsTree.width, y);
+                ctxTree.stroke();
+                ctxTree.restore();
+            }
+        };
+
+        drawNode(state.tree.root);
+        ctxTree.restore();
+    }
+}
+
+// Stable same-origin interface used by Swig. The nucleotide snapshot is built
+// from the same state.viewSequences array used by the NT canvas and Alivibe's
+// own full-view FASTA export. It deliberately ignores the current selection.
+let swigMsaRunner = null;
+let swigFastTreeRunner = null;
+window.swigAlivibeBridge = Object.freeze({
+    version: 4,
+    sourceRevision: "cbcd02719dd0a5f1f05d3127666f00e8579f2423",
+    installMsaRunner(runner) {
+        if(typeof runner !== 'function') throw new Error("Swig supplied an invalid Alivibe MSA runner.");
+        swigMsaRunner = runner;
+    },
+    createMsaJob(sequences) {
+        if(!swigMsaRunner) return null;
+        if(!Array.isArray(sequences)) throw new Error("Alivibe supplied an invalid MSA input.");
+        return swigMsaRunner(sequences.map(sequence => String(sequence)), state.mode === 'NT' ? 'nucleotide' : 'amino-acid');
+    },
+    installFastTreeRunner(runner) {
+        if(typeof runner !== 'function') throw new Error("Swig supplied an invalid Alivibe FastTree runner.");
+        swigFastTreeRunner = runner;
+    },
+    runFastTree(fasta) {
+        if(!swigFastTreeRunner) return null;
+        return swigFastTreeRunner(String(fasta || ""), state.mode === 'NT' ? 'nt' : 'aa');
+    },
+    loadNucleotideFasta(text, frameOffset = 0) {
+        const offset = Number(frameOffset);
+        if(!Number.isInteger(offset) || offset < 0 || offset > 2) {
+            throw new Error("Swig supplied an invalid Alivibe reading-frame offset.");
+        }
+        parseFasta(String(text || ""));
+        state.frame = offset + 1;
+        dom.selFrame.value = String(state.frame);
+        setMode('NT');
+        return this.snapshotNucleotide();
+    },
+    snapshotNucleotide() {
+        // Alivibe permits deletion from only some rows. Its NT canvas renders
+        // the resulting missing row tails as empty white cells. Materialize
+        // those implicit cells as terminal alignment gaps before returning so
+        // the visible rectangular NT alignment has an exact FASTA encoding.
+        const width = state.rawSequences.reduce((maximum, entry) => Math.max(maximum, entry.seq.length), 0);
+        let terminalGapPadding = 0;
+        state.rawSequences.forEach(entry => {
+            while(entry.seq.length < width) {
+                entry.seq.push('-');
+                terminalGapPadding++;
+            }
+        });
+        setMode('NT');
+        const records = state.viewSequences.map(entry => ({
+            name: entry.name,
+            sequence: entry.seq.join('')
+        }));
+        const rows = records.map((_, index) => index);
+        return {
+            version: 3,
+            sourceRevision: this.sourceRevision,
+            alphabet: "NT",
+            mode: state.mode,
+            frameOffset: state.frame - 1,
+            terminalGapPadding,
+            records,
+            fasta: buildFastaContent(rows, 0, null)
+        };
+    }
+});
+
+init();
+</script>
+</body>
+</html>

@@ -136,7 +136,7 @@ export default function App() {
         </section>
         <section className="method-strip" id="about"><article><span>01</span><h3>Stream &amp; demultiplex</h3><p>Gzip chunks are decoded incrementally. Read-quality, primer, orientation, sample-ID and BPB logic follows the nanopore branch.</p></article><article><span>02</span><h3>Group &amp; call consensus</h3><p>Sparse two-error offspring likelihoods, LDA decisions, heteroduplex QC, seeded alignment and minimum-agreement counting.</p></article><article><span>03</span><h3>Filter &amp; explore</h3><p>Run-aware contamination, panel and functional filters, APOBEC model, aligned variants, phylogeny and component exports.</p></article></section>
       </main>
-    </> : <ResultsExplorer bundle={result} onSaveResults={saveResults} />}
+    </> : <ResultsExplorer bundle={result} onSaveResults={saveResults} onBundleChange={setResult} />}
     {result && <button className="new-analysis" type="button" onClick={() => { setResult(undefined); setProgress(undefined); }}>← New or load another analysis</button>}
     <footer className="site-footer"><span>webPORPID · standalone local analysis</span><span>PORPID nanopore parity target · deterministic audit trail</span></footer>
   </div>;

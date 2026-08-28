@@ -29,11 +29,13 @@ Preprocessing batches can finish out of order because spool order is not semanti
 
 ## Consensus performance
 
-The consensus core uses compact 2-bit six-mer codes, contiguous buffers, sparse UMI likelihood rows, seeded long-read alignment, and WASM SIMD (`simd128`) for six-mer distance accumulation. Six-mer work arrays live on the heap to avoid the small WASI stack. Identical families bypass alignment without changing their consensus or minimum agreement. Non-identical and high-indel families retain the unbanded alignment/refinement behavior needed for parity.
+The consensus hot path uses sparse exact six-mer profiles, collision-free rolling 60-bit encodings for canonical 30-base seeds, contiguous buffers, and seeded long-read alignment. A seedless region uses an adaptive band whose width includes the complete length difference plus a square-root noise allowance; seeded intervals retain the original full dynamic program. Ambiguous/lower-case seed input keeps the byte-exact fallback path. The core is compiled at `-O3 -msimd128` and the optimized binary contains SIMD vector operations.
+
+Centroid profiles are counted once per read rather than allocating and rescanning a dense 4,096-bin vector. Refinement stops at its deterministic fixed point, and the final fixed-point alignments are reused for agreement counting. Agreement symbols use fixed counters instead of per-position strings. Identical families still bypass alignment without changing their sequence or agreement. The substitution, mixed-indel, high-indel, terminal-overhang, and identical-family Julia parity cases remain exact.
 
 ## Downstream scale
 
-Alivibe-compatible MSA and FastTree WASM assets are packaged locally; there is no runtime dependency on Swig.
+Alivibe-compatible MSA and FastTree WASM assets are packaged locally; there is no runtime dependency on Swig. Independent per-sample MSA and FastTree jobs use bounded worker pools, capped by both the configured worker count and the number of samples, so a machine with many logical CPUs does not instantiate idle runtimes.
 
 MSA is monolithic up to 8,000 sequences and 128 MiB of input residues. Beyond either threshold, webPORPID aligns deterministic batches of 2,000 rows against a shared anchor, decomposes every batch into anchor insertion slots, merges slot widths, and reconstructs a rectangular alignment in original order. This bounds each aligner's dynamic-programming workspace while retaining the final alignment required for export and visualization.
 
@@ -41,6 +43,6 @@ FastTree consumes the final nucleotide alignment. The browser uses the packaged 
 
 ## Result lifecycle
 
-The post-consensus state is validated, MessagePack encoded, gzip compressed, and prefixed with a versioned `.webporpid` magic header. Loading performs size, framing, schema, type, uniqueness, sample-reference, consensus/postproc-consistency, and alignment/tree-reference checks before the UI receives the bundle. Raw reads and spool records are never serialized.
+The post-consensus state is validated, MessagePack encoded, gzip compressed, and prefixed with a versioned `.webporpid` magic header. Loading performs size, framing, schema, type, uniqueness, sample-reference, consensus/postproc-consistency, edit-fingerprint, and alignment/tree-reference checks before the UI receives the bundle. Raw reads and spool records are never serialized. A returned Alivibe/manual edit stores its exact nucleotide FASTA, translation frame, baseline and edited fingerprints, source/time, and refreshed Newick tree in the same project file.
 
 The same result object backs the browser explorer, CLI `inspect`, and all component exports, so exports do not rerun an algorithm or depend on hidden temporary files.

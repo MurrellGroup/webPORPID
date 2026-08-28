@@ -2,8 +2,9 @@
 
 These ideas may change behavior enough that they were not folded into the initial port.
 
-- Replace the current pairwise consensus refinement with a banded partial-order graph consensus. This could greatly improve long, repetitive, high-indel families, but it would change tie paths and some local indel placement.
-- Add adaptive consensus band sizing based on observed family indel density. This should be faster on clean families and safer on noisy families, but would need a new parity study.
+- Replace pairwise reference refinement with a partial-order graph or wavefront consensus. This could further improve long, repetitive, very-high-indel families, but it would change tie paths and some local indel placement.
+- Learn the seedless alignment band from each family's observed indel distribution, or use sparse wavefront expansion. The implemented conservative length-delta-plus-square-root band is deterministic; a tighter family-specific boundary would be faster but needs a much larger parity study around repetitive and structurally variant reads.
+- Use minimizer/syncmer chaining instead of exact unique 30-mer anchors. This should find anchors in noisier families and shorten more dynamic-programming intervals, but changes the anchor chain and therefore can change equal-score indel placement.
 - Replace the UMI posterior scan with a BK-tree or trie-indexed candidate search for very large UMI spaces. It should be faster when there are many observed UMIs, but the candidate boundary must be checked carefully.
 - Add exact lower-bound pruning or a validated approximate-nearest-neighbor index to the contamination database search. The current sparse vectors reduce allocation and arithmetic, but nearest-cluster comparison is still quadratic in the number of sequences/clusters. Approximate indexing could be dramatically faster for very large runs and could also change a call near `dist_thresh`; even exact pruning must preserve Julia's first-argmin tie order.
 - Replace shared-anchor large-MSA batching with a streaming profile or partial-order alignment that incrementally updates a run-wide graph. This could improve repetitive or highly divergent alignments and remove reliance on the first sequence as anchor, but equal-score indel placement and therefore downstream tree columns would change.

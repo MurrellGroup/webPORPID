@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { Worker as NodeWorker } from "node:worker_threads";
 import { parseFasta } from "../src/config.ts";
 
 function completeNewick(output) {
@@ -10,7 +11,7 @@ function completeNewick(output) {
   throw new Error("FastTree did not return a complete Newick tree.");
 }
 
-export function createFastTreeRunner(javascriptPath, wasmPath) {
+export function createDirectFastTreeRunner(javascriptPath, wasmPath) {
   let output = [], errors = [], invocation = 0;
   const modulePromise = Promise.all([readFile(javascriptPath, "utf8"), readFile(wasmPath)]).then(([source, wasmBinary]) => {
     const commonJs = { exports: {} };
@@ -39,4 +40,30 @@ export function createFastTreeRunner(javascriptPath, wasmPath) {
     });
     return tree;
   };
+}
+
+class FastTreeWorkerClient {
+  constructor(worker) {
+    this.worker = worker; this.pending = new Map(); this.nextId = 1; this.tail = Promise.resolve();
+    worker.on("message", (message) => { const pending = this.pending.get(message.id); if (!pending) return; this.pending.delete(message.id); message.error ? pending.reject(new Error(message.error)) : pending.resolve(message.result); });
+    worker.on("error", (cause) => { for (const pending of this.pending.values()) pending.reject(cause); this.pending.clear(); });
+  }
+  call(message) {
+    const task = () => new Promise((resolve, reject) => { const id = this.nextId++; this.pending.set(id, { resolve, reject }); this.worker.postMessage({ id, ...message }); });
+    const result = this.tail.then(task, task); this.tail = result.catch(() => {}); return result;
+  }
+  close() { return this.worker.terminate(); }
+}
+
+export function createFastTreeRunner(javascriptPath, wasmPath, size = 1,
+  workerPath = new URL("../porpid-fasttree-worker.mjs", import.meta.url)) {
+  const count = Math.max(1, Math.floor(size));
+  if (count === 1) {
+    const direct = createDirectFastTreeRunner(javascriptPath, wasmPath); direct.close = async () => {}; return direct;
+  }
+  const clients = Array.from({ length: count }, () => new FastTreeWorkerClient(new NodeWorker(workerPath)));
+  let cursor = 0;
+  const run = (alignment) => clients[cursor++ % clients.length].call({ javascriptPath, wasmPath, alignment });
+  run.close = async () => { await Promise.all(clients.map((client) => client.close())); };
+  return run;
 }

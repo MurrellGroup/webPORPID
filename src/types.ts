@@ -165,6 +165,22 @@ export interface ResultConfig {
   parameters: Omit<PipelineParameters, "deterministicSeed"> & { deterministicSeed: string };
 }
 
+export interface PipelineTiming {
+  stage: "setup" | "preprocessing" | "umi" | "consensus" | "contamination" | "postprocessing" | "tree" | "analysis-total";
+  seconds: number;
+  workItems?: number;
+}
+
+export interface AlignmentEdit {
+  fasta: string;
+  frameOffset: 0 | 1 | 2;
+  baselineFingerprint: string;
+  editedFingerprint: string;
+  source: string;
+  savedUtc: string;
+  treeNewick?: string;
+}
+
 export interface ResultBundle {
   schema: "webporpid-results/1";
   provenance: Provenance;
@@ -177,6 +193,10 @@ export interface ResultBundle {
   records: PostprocRecord[];
   alignments: Record<string, string>;
   trees: Record<string, string>;
+  /** Manual Alivibe/import corrections, keyed like `sample/nucleotide`. */
+  alignmentEdits?: Record<string, AlignmentEdit>;
+  /** Optional so results written by webPORPID 0.1.x remain loadable. */
+  timings?: PipelineTiming[];
   log: string[];
 }
 

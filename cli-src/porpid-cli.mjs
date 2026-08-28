@@ -19,14 +19,16 @@ import {
 import { createFastTreeRunner } from "./direct-fasttree.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 
-const VERSION = "0.1.2";
+const VERSION = "0.2.0";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
 export function defaultCliAssets() {
   const directory = join(CLI_DIRECTORY, "assets");
   return { wasmPath: join(directory, "webporpid.wasm"), msaPath: join(directory, "alivibe-msa.wasm"),
-    fastTreeJavascriptPath: join(directory, "fasttree.cjs"), fastTreeWasmPath: join(directory, "fasttree.wasm") };
+    fastTreeJavascriptPath: join(directory, "fasttree.cjs"), fastTreeWasmPath: join(directory, "fasttree.wasm"),
+    msaWorkerPath: join(CLI_DIRECTORY, "porpid-msa-worker.mjs"),
+    fastTreeWorkerPath: join(CLI_DIRECTORY, "porpid-fasttree-worker.mjs") };
 }
 
 function usage() {
@@ -176,6 +178,7 @@ async function loadConfiguration(path) {
 }
 
 async function runPipeline({ inputPath, configPath, outputPath, workers, assets }) {
+  const runStarted = performance.now(), timings = [];
   const input = resolve(inputPath), configuration = resolve(configPath); await stat(input);
   const config = await loadConfiguration(configuration), compiledConfig = compileConfig(config);
   const configHash = createHash("sha256").update(compiledConfig).digest("hex"), inputHash = createHash("sha256");
@@ -183,7 +186,15 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
   const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
   const log = [`${now()} webPORPID ${VERSION} started`, `${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
     `${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}`];
+  const recordTiming = (stage, started, workItems) => {
+    const entry = { stage, seconds: (performance.now() - started) / 1000 };
+    if (workItems != null) entry.workItems = workItems;
+    timings.push(entry); log.push(`${now()} timing ${stage}: ${entry.seconds.toFixed(6)} s${workItems == null ? "" : `; ${workItems} work items`}`);
+    return performance.now();
+  };
+  recordTiming("setup", runStarted);
   try {
+    let stageStarted = performance.now();
     const pending = new Set(); let batches = 0, streamed = 0;
     for await (const batch of fastqBatches(input, inputHash)) {
       const task = pool.any({ type: "preprocess", text: batch.text, firstOrdinal: batch.firstOrdinal })
@@ -196,6 +207,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
     const quality = mergeStats(await Promise.all(pool.clients.map((_, index) => pool.at(index, { type: "stats" }))), config.samples.length);
     log.push(`${now()} preprocessing: ${quality.totalReads} raw; ${quality.qualityReads} quality; ${quality.demultiplexedReads} demultiplexed; ${batches} bounded batches`);
     status(`preprocessing complete: ${quality.demultiplexedReads.toLocaleString()} demultiplexed reads`);
+    stageStarted = recordTiming("preprocessing", stageStarted, quality.totalReads);
 
     const sampleCounts = quality.perSample.map(BigInt), cutoffValues = makeCutoffValues(sampleCounts, config.parameters.maxReadsPerSample);
     const cutoffs = makeCutoffs(sampleCounts, config.parameters.maxReadsPerSample), countParts = Array(config.parameters.spoolPartitions);
@@ -214,6 +226,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
     await Promise.all(pool.clients.map((_, index) => { const copy = familyModel.slice().buffer; return pool.at(index, { type: "initModel", bytes: copy }, [copy]); }));
     log.push(`${now()} UMI model: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length} observed families; ${quality.bpbRejects} BPB rejects; ${umiFamilies.filter((row) => row.disposition === "likely_real").length} initially likely real`);
     status(`UMI model complete: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length.toLocaleString()} observed families`);
+    stageStarted = recordTiming("umi", stageStarted, quality.demultiplexedReads - quality.downsampledReads);
 
     const consensusParts = Array(countParts.length);
     await Promise.all(pool.clients.map(async (_, worker) => {
@@ -234,25 +247,43 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
     }
     log.push(`${now()} consensus: ${consensuses.length} sequences; ${heteroduplexes.size} heteroduplex families`);
     status(`consensus complete: ${consensuses.length.toLocaleString()} sequences`); await store.close();
+    stageStarted = recordTiming("consensus", stageStarted, consensuses.length);
 
     const contamination = classifyContamination(consensuses, config);
     log.push(`${now()} contamination: ${contamination.filter((call) => call.discarded).length} discarded; ${contamination.filter((call) => call.suspectOnly).length} suspect calls`);
-    const downstream = await postprocess(consensuses, contamination, config, undefined, createMsaRunner(assets.msaPath));
+    stageStarted = recordTiming("contamination", stageStarted, consensuses.length);
+    // There is at most one independent alignment job per sample.  Keeping a
+    // larger pool only instantiates idle WASM runtimes (and can be surprisingly
+    // expensive on machines reporting dozens of logical CPUs).
+    const msaRunner = createMsaRunner(assets.msaPath, Math.min(workers, config.samples.length), assets.msaWorkerPath);
+    let downstream;
+    try { downstream = await postprocess(consensuses, contamination, config, undefined, msaRunner, workers); }
+    finally { await msaRunner.close?.(); }
     downstream.summaries.forEach((summary, index) => {
       summary.demultiplexedReads = quality.perSample[index] ?? 0;
       summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
       summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
     });
-    const trees = {}, fastTree = createFastTreeRunner(assets.fastTreeJavascriptPath, assets.fastTreeWasmPath);
-    for (const [name, alignment] of Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"))) {
-      status(`FastTree: ${name.split("/")[0]}`); trees[name] = await fastTree(alignment);
-    }
+    stageStarted = recordTiming("postprocessing", stageStarted, downstream.records.length);
+    const treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
+    const fastTree = createFastTreeRunner(
+      assets.fastTreeJavascriptPath,
+      assets.fastTreeWasmPath,
+      Math.min(workers, Math.max(1, treeInputs.length)),
+      assets.fastTreeWorkerPath,
+    );
+    let treeEntries;
+    try { treeEntries = await Promise.all(treeInputs.map(async ([name, alignment]) => { status(`FastTree: ${name.split("/")[0]}`); return [name, await fastTree(alignment)]; })); }
+    finally { await fastTree.close?.(); }
+    const trees = Object.fromEntries(treeEntries);
+    recordTiming("tree", stageStarted, Object.keys(trees).length);
+    timings.push({ stage: "analysis-total", seconds: (performance.now() - runStarted) / 1000 });
     log.push(`${now()} postprocessing: ${downstream.records.filter((record) => record.artefactPass && record.agreementPass && record.contaminationPass && record.panelPass).length} sequences passed all non-functional filters`);
     const result = { schema: "webporpid-results/1", provenance: { webporpidVersion: VERSION, createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
       workers, inputName: basename(input), inputSha256: inputHash.digest("hex"), configSha256: configHash,
       deterministicSeed: config.parameters.deterministicSeed.toString(), upstreamBranch: "nanopore", upstreamCommit: UPSTREAM_COMMIT },
       config: resultConfig(config), quality, summaries: downstream.summaries, umiFamilies, consensuses, contamination,
-      records: downstream.records, alignments: downstream.alignments, trees, log };
+      records: downstream.records, alignments: downstream.alignments, trees, timings, log };
     await mkdir(dirname(resolve(outputPath)), { recursive: true }); await writeFile(outputPath, encodeResult(result));
     status(`wrote ${outputPath}`); return result;
   } finally { await pool.close(); await store.close(); }
@@ -261,6 +292,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
 async function inspect(path) {
   const result = decodeResult(new Uint8Array(await readFile(path)));
   process.stdout.write(JSON.stringify({ schema: result.schema, provenance: result.provenance, quality: result.quality, summaries: result.summaries,
+    timings: result.timings ?? [],
     components: { consensuses: result.consensuses.length, families: result.umiFamilies.length, contaminationCalls: result.contamination.length,
       records: result.records.length, alignments: Object.keys(result.alignments), trees: Object.keys(result.trees) } }, null, 2) + "\n");
 }

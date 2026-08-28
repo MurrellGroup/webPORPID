@@ -25,14 +25,14 @@ The decision sequence is LDA posterior, eight-base UMI length, then configured f
 The consensus path does not assume low indel rates.
 
 1. A six-mer count centroid selects a real family read as the initial reference.
-2. Exact 30-base seed anchors divide long alignments where they are unique and collinear; intervening and unseeded regions use the same unbanded global scoring and edge-gap behavior as the supplied Julia functions.
+2. Exact 30-base seed anchors divide long alignments where they are unique and collinear. Seeded intervals use the supplied global scoring and edge-gap behavior. If no consistent seed exists, an adaptive band covers the full terminal length difference plus a square-root noise allowance; it falls back to the complete matrix if the endpoint cannot be reached.
 3. Three reference-refinement passes identify poorly supported adjacent positions, replace uncertain blocks with modal aligned substrings, and extend both ends by majority-supported iterative alignment.
-4. An unseeded final alignment calculates per-position agreement. `minimumAgreement` is the rounded minimum over interior positions, and every tied low-agreement position records its 3′-relative coordinate, rounded agreement, complemented modal base, and modal homopolymer run length.
+4. A seeded final alignment, matching `RobustAmpliconDenoising.get_matches`, calculates per-position agreement. If refinement has reached a fixed point, its exact alignments are reused. `minimumAgreement` is the rounded minimum over interior positions, and every tied low-agreement position records its 3′-relative coordinate, rounded agreement, complemented modal base, and modal homopolymer run length.
 5. The cDNA/UMI-side primer remainder is aligned and removed, then the consensus is reverse-complemented into output orientation.
 
-Six-mer work arrays are heap-backed, distance accumulation is SIMD-enabled in WASM, and byte-identical families take a direct path. The shortcut returns the same sequence and agreement of one and avoids the former consensus bottleneck for the common no-disagreement case. No edit-distance shortcut, band limit, or low-indel approximation is used for non-identical families.
+Sparse six-mer profiles retain exactly the observed bins, canonical 30-mers use collision-free rolling integers, and byte-identical families take a direct path. The shortcut returns the same sequence and agreement of one. Fixed-point detection skips refinement passes that cannot change the result and reuses their alignments for agreement. These changes remove repeated dense allocations and redundant dynamic programs without introducing an edit-distance consensus shortcut.
 
-Five parity families covering substitutions, mixed indels, high indel load, terminal overhangs, and identical reads have zero consensus edit distance and zero minimum-agreement delta against Julia.
+Five parity families covering substitutions, mixed indels, high indel load, terminal overhangs, and identical reads have zero consensus edit distance and zero minimum-agreement delta against Julia. On the corrected opaque simulated run, 3,040 of 3,043 consensus sequences are byte-exact; 3,040 minimum-agreement values are within `0.01` and 2,993 are exact.
 
 ## Contamination filtering
 
@@ -47,9 +47,9 @@ One intentional reproducibility difference remains: Julia resolves ambiguous IUP
 - The artefact cutoff is `ceil(quantile(non-contaminant family sizes, q) * artefactFraction)` with per-sample overrides.
 - Agreement and contamination decisions are retained separately for audit and export.
 - Candidate sequences are aligned, converted to a sample profile, and affine-profile-aligned to the supplied reference panel. Profile column cost, gap-open/extend behavior, traceback priority, extracted coordinates, indel-ignoring probability, and maximum-subarray panel score are ported from Julia. All six rows in the three-case panel parity suite match exactly in sequence and score.
-- The functional filter locates an ORF, performs the supplied global match scoring, detects internal non-triplet gaps, start/stop failures, ambiguous symbols, and threshold failure, then stores trimmed nucleotide and amino-acid sequences. All ten parity cases have the same accept/reject classification; all accepted trims match. Four rejected cases report the correct failure under a different diagnostic stage label, as listed in `PARITY.md`.
+- The functional filter finds candidate coding regions, translates them, performs one joint amino-acid MSA with the reference, and projects alignment gaps back as complete codon triplets. It then applies start/stop, ambiguity, and reference-match gates and stores trimmed nucleotide/amino-acid outputs. This avoids arbitrary one-base gaps from independent nucleotide alignments. All ten focused parity cases classify identically; on the corrected long-read run the aggregate passing count is 1,185 versus Julia's 1,180 among 1,455 evaluated (`0.34%` count difference).
 - APOBEC summaries use the local four-state mutation grid and posterior integration; they are reporting fields rather than a filtering gate.
-- Accepted nucleotide and amino-acid sequences are aligned with the packaged MSA and nucleotide trees use packaged FastTree.
+- Accepted nucleotide sequences are aligned with the packaged MSA and nucleotide trees use packaged FastTree. Protein exploration does not depend on the optional functional filter: it directly translates every active aligned nucleotide row, with `--- → -` and mixed-gap/ambiguous/incomplete codons → `X`, using a persisted frame offset of 0, 1, or 2.
 
 ## Large-alignment batching difference
 
@@ -59,6 +59,7 @@ Below the 8,000-row/128 MiB threshold, downstream MSA uses the monolithic packag
 
 - Deterministic hash-based Bernoulli downsampling replaces Julia's global random draws.
 - Ambiguous-base contamination resolution is deterministic.
+- The seedless consensus fallback uses an adaptive band; this can choose a different equal-score path from a full matrix in an unusually repetitive region, although all focused high-indel parity families are exact.
 - Worker scheduling cannot change family or read order at consensus time.
 - Large MSA uses shared-anchor batching above its documented threshold.
 - Four rejected functional cases can use a different failure-stage label although classification and accepted outputs match.

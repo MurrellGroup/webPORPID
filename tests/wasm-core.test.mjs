@@ -30,12 +30,15 @@ const reverseComplement = (text) => [...text].reverse().map((base) => complement
 const bytes = await readFile(new URL("../public/webporpid.wasm", import.meta.url));
 const module = await WebAssembly.compile(bytes);
 const exported = new Set(WebAssembly.Module.exports(module).map((entry) => entry.name));
-for (const name of ["memory", "wpp_alloc", "wpp_free", "wpp_init_config", "wpp_preprocess", "wpp_consensus_partition"]) assert(exported.has(name), `missing WASM export ${name}`);
+for (const name of ["memory", "wpp_alloc", "wpp_free", "wpp_version", "wpp_init_config", "wpp_preprocess", "wpp_consensus_partition"]) assert(exported.has(name), `missing WASM export ${name}`);
 
 const wasi = new WASI({ version: "preview1" });
 const instance = await WebAssembly.instantiate(module, { wasi_snapshot_preview1: wasi.wasiImport });
 wasi.initialize(instance);
 const core = instance.exports;
+const versionPointer = core.wpp_version(), versionMemory = new Uint8Array(core.memory.buffer);
+let versionEnd = versionPointer; while (versionMemory[versionEnd]) versionEnd++;
+assert.equal(new TextDecoder().decode(versionMemory.subarray(versionPointer, versionEnd)), "0.2.0");
 const put = (input) => { const pointer = core.wpp_alloc(input.length); new Uint8Array(core.memory.buffer, pointer, input.length).set(input); return pointer; };
 const takeResult = () => new Uint8Array(core.memory.buffer, core.wpp_result_ptr(), core.wpp_result_len()).slice();
 const one = (input, call) => { const pointer = put(input); try { assert(call(pointer, input.length) >= 0); return takeResult(); } finally { core.wpp_free(pointer); } };

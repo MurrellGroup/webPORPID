@@ -1,4 +1,5 @@
 import { runAlivibeMsa } from "./alivibe-msa-runtime";
+import { translateAlignedNucleotides } from "./alignment-utils";
 import { extractAndScorePanel } from "./panel-profile";
 import { runScalableMsa } from "./scalable-msa";
 import type { ApobecResult, ConsensusRecord, ContaminationCall, PipelineConfig, PostprocRecord, SampleSummary } from "./types";
@@ -144,13 +145,66 @@ export function functionalFilter(reference: string, sequence: string, threshold:
   return { passed: !reasons.length, reasons, nt: trimmed, aa };
 }
 
+interface FunctionalOutcome { passed: boolean; reasons: string[]; nt?: string; aa?: string }
+
+function backtranslate(alignedAminoAcids: string, codingNucleotides: string): string {
+  let output = "", offset = 0;
+  for (const residue of alignedAminoAcids) {
+    if (residue === "-") output += "---";
+    else { output += codingNucleotides.slice(offset, offset + 3); offset += 3; }
+  }
+  if (offset !== codingNucleotides.length) throw new Error("The amino-acid alignment did not preserve its nucleotide coding sequence.");
+  return output;
+}
+
+/**
+ * SeededAlignment's functional filter is codon-aware and evaluates every
+ * sequence against one joint reference-anchored alignment.  Doing independent
+ * nucleotide NW alignments introduced arbitrary one-base gaps and incorrectly
+ * labeled almost every long-read sequence as a frameshift.  Translate first,
+ * align the complete batch, and project gaps back as codon triplets instead.
+ */
+async function functionalFilterBatch(
+  reference: string, sequences: string[], threshold: number, runMsa: MsaRunner, signal?: AbortSignal,
+): Promise<FunctionalOutcome[]> {
+  const outcomes: FunctionalOutcome[] = Array(sequences.length), coding: Array<{ index: number; sequence: string }> = [];
+  sequences.forEach((raw, index) => {
+    const sequence = degap(raw);
+    if (/[^ACGT]/.test(sequence)) outcomes[index] = { passed: false, reasons: ["ambiguousSymbols-reject"] };
+    else coding.push({ index, sequence: longestOrf(sequence) });
+  });
+  if (!coding.length) return outcomes;
+  const referenceCoding = degap(reference).slice(0, Math.floor(degap(reference).length / 3) * 3);
+  const aminoInputs = [translate(referenceCoding), ...coding.map((row) => translate(row.sequence))];
+  const aminoAlignment = await runScalableMsa(aminoInputs, runMsa, signal, 3, "amino-acid");
+  const nucleotideAlignment = aminoAlignment.map((row, index) => backtranslate(row, index ? coding[index - 1].sequence : referenceCoding));
+  const alignedReference = nucleotideAlignment[0], first = alignedReference.search(/[^-]/);
+  let last = alignedReference.length - 1; while (last >= first && alignedReference[last] === "-") last--;
+  const referenceRegion = alignedReference.slice(first, last + 1);
+  coding.forEach((entry, position) => {
+    const queryRegion = nucleotideAlignment[position + 1].slice(first, last + 1), reasons: string[] = [];
+    const trimmed = degap(queryRegion), aa = translate(trimmed);
+    if (queryRegion.slice(0, 3) !== "ATG") reasons.push("lateStart-reject");
+    if (queryRegion.slice(-3) === "---") reasons.push("earlyStop-reject");
+    let matches = 0; for (let column = 0; column < referenceRegion.length; column += 1) if (referenceRegion[column] === queryRegion[column]) matches++;
+    const rawRatio = matches / Math.max(1, referenceRegion.length), digits = rawRatio === 0 ? 3 : 3 - Math.floor(Math.log10(Math.abs(rawRatio))) - 1;
+    const ratio = Number(rawRatio.toFixed(Math.max(0, digits)));
+    if (ratio < threshold) reasons.push(`badMatch-reject (match=${ratio})`);
+    outcomes[entry.index] = { passed: !reasons.length, reasons, nt: trimmed, aa };
+  });
+  return outcomes;
+}
+
 export async function postprocess(
   consensuses: ConsensusRecord[], contamination: ContaminationCall[], config: PipelineConfig, signal?: AbortSignal,
-  runMsa: MsaRunner = runAlivibeMsa,
+  runMsa: MsaRunner = runAlivibeMsa, sampleConcurrency = 1,
 ): Promise<PostprocessOutput> {
   const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
-  const records: PostprocRecord[] = [], summaries: SampleSummary[] = [], alignments: Record<string, string> = {};
-  for (const sample of config.samples) {
+  const outputs: PostprocessOutput[] = Array(config.samples.length); let cursor = 0;
+  await Promise.all(Array.from({ length: Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
+    while (true) {
+      const sampleIndex = cursor++; if (sampleIndex >= config.samples.length) return;
+      const sample = config.samples[sampleIndex], records: PostprocRecord[] = [], summaries: SampleSummary[] = [], alignments: Record<string, string> = {};
     if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
     const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
     const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile)
@@ -178,7 +232,13 @@ export async function postprocess(
       ? await runScalableMsa(accepted.map(({ index }) => extracted.get(index)!), runMsa, signal, 3, "nucleotide")
       : accepted.map(({ index }) => extracted.get(index)!);
     const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
-    const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows: Array<{ name: string; sequence: string }> = [], proteinRows: Array<{ name: string; sequence: string }> = [];
+    const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows: Array<{ name: string; sequence: string }> = [];
+    const functionalByIndex = new Map<number, FunctionalOutcome>();
+    if (sample.functionalReferenceSequence && accepted.length) {
+      const outcomes = await functionalFilterBatch(sample.functionalReferenceSequence.sequence,
+        accepted.map(({ index }) => extracted.get(index)!), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+      accepted.forEach(({ index }, position) => functionalByIndex.set(index, outcomes[position]));
+    }
     let functionalPassed = 0;
     source.forEach((record, index) => {
       const artefactPass = record.familySize >= artefactCutoff, agreementPass = record.minimumAgreement >= agreementThreshold;
@@ -189,10 +249,9 @@ export async function postprocess(
       let trimmedNt: string | undefined, trimmedAa: string | undefined, functionalPass: boolean | undefined;
       if (sample.functionalReferenceSequence) {
         if (acceptedRow) {
-          const outcome = functionalFilter(sample.functionalReferenceSequence.sequence, extracted.get(index)!,
-            sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold);
+          const outcome = functionalByIndex.get(index)!;
           functionalPass = outcome.passed; trimmedNt = outcome.nt; trimmedAa = outcome.aa; rejectionReasons.push(...outcome.reasons);
-          if (outcome.passed) { functionalPassed++; proteinRows.push({ name: record.id, sequence: outcome.aa! }); }
+          if (outcome.passed) functionalPassed++;
         } else functionalPass = false;
       }
       if (acceptedRow) nucleotideRows.push({ name: record.id, sequence: acceptedRow });
@@ -201,16 +260,21 @@ export async function postprocess(
         panelScore: scores[index], artefactPass, agreementPass, contaminationPass, panelPass: panelPass[index], functionalPass,
         rejectionReasons, apobec: acceptedRow ? apobec(consensus, acceptedRow) : undefined });
     });
-    if (nucleotideRows.length) alignments[`${sample.name}/nucleotide`] = fasta(nucleotideRows);
-    if (proteinRows.length) {
-      const proteinAlignment = proteinRows.length > 1
-        ? await runScalableMsa(proteinRows.map((row) => row.sequence), runMsa, signal, 3, "amino-acid")
-        : proteinRows.map((row) => row.sequence);
-      alignments[`${sample.name}/protein`] = fasta(proteinRows.map((row, index) => ({ ...row, sequence: proteinAlignment[index] })));
+    if (nucleotideRows.length) {
+      alignments[`${sample.name}/nucleotide`] = fasta(nucleotideRows);
+      // Protein exploration is a direct view of every retained nucleotide row,
+      // independent of the optional functional filter.  A complete gap codon
+      // becomes '-', while mixed/ambiguous/incomplete codons become 'X'.
+      alignments[`${sample.name}/protein`] = fasta(nucleotideRows.map((row) => ({
+        ...row, sequence: translateAlignedNucleotides(row.sequence, 0),
+      })));
     }
     summaries.push({ sample: sample.name, demultiplexedReads: 0, observedUmis: 0, likelyRealUmis: 0,
       consensusSequences: source.length, contaminationPassed: source.filter((record) => !discarded.has(record.id)).length,
       postprocPassed: accepted.length, functionalPassed: sample.functionalReferenceSequence ? functionalPassed : undefined, artefactCutoff });
-  }
-  return { records, summaries, alignments };
+      outputs[sampleIndex] = { records, summaries, alignments };
+    }
+  }));
+  return { records: outputs.flatMap((output) => output.records), summaries: outputs.flatMap((output) => output.summaries),
+    alignments: Object.assign({}, ...outputs.map((output) => output.alignments)) };
 }

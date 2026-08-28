@@ -2,7 +2,7 @@
 
 This project vendors or packages the following third-party components:
 
-- Alivibe-compatible MSA WebAssembly source from MurrellGroup/swig, used as standalone C++/WASM code in `wasm/vendor/alivibe_msa.cpp`.
+- Alivibe-compatible MSA WebAssembly source, the pinned Alivibe editor/round-trip bridge, and Newick layout/rendering code from the MIT-licensed MurrellGroup/swig repository, vendored as standalone code under `wasm/vendor/`, `public/tools/`, and `src/`.
 - FastTree WebAssembly assets from the BioWASM/Aioli ecosystem, packaged under `public/biowasm/fasttree/` and `cli/assets/`.
 - React, Vite, TypeScript, fflate, MessagePack, and other npm dependencies listed in `package.json`.
 

@@ -21,7 +21,7 @@ function completeNewick(output: string) {
   throw new Error("FastTree did not return a complete Newick tree.");
 }
 
-export async function runFastTree(alignedFasta: string): Promise<string> {
+export async function runFastTree(alignedFasta: string, alphabet: "nt" | "aa" = "nt"): Promise<string> {
   const records = parseFasta(alignedFasta);
   const safeName = (name: string, index: number) => name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;
   if (records.length < 3) return records.length === 2
@@ -32,10 +32,23 @@ export async function runFastTree(alignedFasta: string): Promise<string> {
   const numeric = records.map((record, index) => `>${index}\n${record.sequence}`).join("\n") + "\n";
   const cli = await tools(), path = "/shared/data/webporpid-fasttree.fa";
   await cli.write({ path, buffer: new TextEncoder().encode(numeric) });
-  let tree = completeNewick(await cli.exec(`fasttree -nosupport -nt -gtr ${path}`));
+  let tree = completeNewick(await cli.exec(alphabet === "nt" ? `fasttree -nosupport -nt -gtr ${path}` : `fasttree -nosupport ${path}`));
   records.forEach((record, index) => {
     const safe = safeName(record.name, index);
     tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safe}`);
   });
   return tree;
+}
+
+/** Isolate FastTree so independent samples can use separate CPU cores safely. */
+export function runFastTreeIsolated(alignedFasta: string): Promise<string> {
+  const worker = new Worker(new URL("./fasttree-worker.ts", import.meta.url), { type: "module" });
+  return new Promise((resolve, reject) => {
+    const finish = () => worker.terminate();
+    worker.onmessage = (event: MessageEvent<{ result?: string; error?: string }>) => {
+      finish(); event.data.error ? reject(new Error(event.data.error)) : resolve(event.data.result ?? "");
+    };
+    worker.onerror = (event) => { finish(); reject(new Error(event.message || "FastTree worker failed.")); };
+    worker.postMessage({ fasta: alignedFasta });
+  });
 }

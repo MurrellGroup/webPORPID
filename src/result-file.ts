@@ -1,5 +1,6 @@
 import { decode, encode } from "@msgpack/msgpack";
 import { gzipSync, gunzipSync } from "fflate";
+import { inspectAlignment, translateAlignmentFasta, validateCorrectedAlignment } from "./alignment-utils.ts";
 import type { ResultBundle } from "./types";
 
 const MAGIC = Uint8Array.of(0x57, 0x50, 0x52, 0x00, 0x01, 0x0d, 0x0a, 0x1a);
@@ -125,6 +126,30 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       text(name, `${label} name`); text(contents, `${label}.${name}`);
       const sample = name.split("/", 1)[0]; knownSample(sample, `${label}.${name}`);
     }
+  if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
+    const sample = name.split("/", 1)[0]; knownSample(sample, `alignmentEdits.${name}`);
+    if (name !== `${sample}/nucleotide`) throw new Error("Edited alignment keys must end in /nucleotide.");
+    const edit = object(rawEdit, `alignmentEdits.${name}`), fasta = text(edit.fasta, `alignmentEdits.${name}.fasta`);
+    const frameOffset = count(edit.frameOffset, `alignmentEdits.${name}.frameOffset`);
+    if (frameOffset > 2) throw new Error("Edited alignment frame offsets must be 0, 1, or 2.");
+    const baselineFingerprint = text(edit.baselineFingerprint, `alignmentEdits.${name}.baselineFingerprint`);
+    const editedFingerprint = text(edit.editedFingerprint, `alignmentEdits.${name}.editedFingerprint`);
+    text(edit.source, `alignmentEdits.${name}.source`); text(edit.savedUtc, `alignmentEdits.${name}.savedUtc`);
+    optionalText(edit.treeNewick, `alignmentEdits.${name}.treeNewick`);
+    const original = text(object(bundle.alignments, "alignments")[name], `alignments.${name}`);
+    if (inspectAlignment(original, 1).fingerprint !== baselineFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent baseline fingerprint.`);
+    if (inspectAlignment(fasta, 1).fingerprint !== editedFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent fingerprint.`);
+    validateCorrectedAlignment(original, fasta);
+  }
+  if (bundle.timings != null) array(bundle.timings, "timings").forEach((entry, index) => {
+    const timing = object(entry, `timings[${index}]`);
+    const stage = text(timing.stage, `timings[${index}].stage`);
+    if (!["setup", "preprocessing", "umi", "consensus", "contamination", "postprocessing", "tree", "analysis-total"].includes(stage))
+      throw new Error(`timings[${index}] has an unknown stage.`);
+    const seconds = numeric(timing.seconds, `timings[${index}].seconds`);
+    if (seconds < 0) throw new Error(`timings[${index}].seconds must be non-negative.`);
+    if (timing.workItems != null) count(timing.workItems, `timings[${index}].workItems`);
+  });
   array(bundle.log, "log").forEach((entry, index) => text(entry, `log[${index}]`));
 }
 
@@ -194,9 +219,16 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
       ["sample", "id", "posterior_mean_GA_multiplier", "posterior_probability_GA_inflated", "posterior_mean_mutation_rate", "GA_mutations", "total_mutations"],
       records.filter((row) => row.apobec).map((row) => [row.sample, row.id, row.apobec!.posteriorMeanGaMultiplier, row.apobec!.posteriorGaInflated, row.apobec!.posteriorMeanMutationRate, row.apobec!.gaMutations, row.apobec!.totalMutations]),
     ) };
-    case "nucleotide-alignment": { const selected = alignmentSample(bundle, sample); return { extension: "nucleotide-alignment.fasta", mime: "text/x-fasta", text: bundle.alignments[`${selected}/nucleotide`] ?? "" }; }
-    case "protein-alignment": { const selected = alignmentSample(bundle, sample); return { extension: "protein-alignment.fasta", mime: "text/x-fasta", text: bundle.alignments[`${selected}/protein`] ?? "" }; }
-    case "newick": { const selected = alignmentSample(bundle, sample); return { extension: "tree.newick", mime: "text/plain", text: bundle.trees[`${selected}/nucleotide`] ?? "" }; }
+    case "nucleotide-alignment": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/nucleotide`;
+      return { extension: "nucleotide-alignment.fasta", mime: "text/x-fasta", text: bundle.alignmentEdits?.[key]?.fasta ?? bundle.alignments[key] ?? "" };
+    }
+    case "protein-alignment": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/nucleotide`, edit = bundle.alignmentEdits?.[key];
+      const nucleotide = edit?.fasta ?? bundle.alignments[key];
+      return { extension: "protein-alignment.fasta", mime: "text/x-fasta", text: nucleotide ? translateAlignmentFasta(nucleotide, edit?.frameOffset ?? 0) : "" };
+    }
+    case "newick": { const selected = alignmentSample(bundle, sample), key = `${selected}/nucleotide`, edit = bundle.alignmentEdits?.[key]; return { extension: "tree.newick", mime: "text/plain", text: edit ? edit.treeNewick ?? "" : bundle.trees[key] ?? "" }; }
     case "log": return { extension: "log.txt", mime: "text/plain", text: bundle.log.join("\n") + "\n" };
   }
 }

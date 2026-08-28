@@ -23,8 +23,9 @@ The browser and CLI share the same encoder/decoder. The current decoder caps com
 - **Consensus records:** identifiers, sample, UMI, family size, nucleotide sequence, minimum agreement, and low-agreement site details.
 - **Contamination calls:** nearest non-self label/distance and primary-discard versus wider-suspect status.
 - **Post-processing records:** consensus/aligned/trimmed sequences, every filter decision, panel score, functional rejection reasons, and optional APOBEC posterior summary.
-- **Per-sample products:** nucleotide and protein FASTA alignments plus nucleotide Newick trees.
-- **Run log:** persistent stage counts, execution/storage choices, and fallbacks.
+- **Per-sample products:** nucleotide FASTA alignments, directly translated protein views, and nucleotide Newick trees.
+- **Optional alignment edits:** exact corrected nucleotide FASTA, translation frame, baseline/edited fingerprints, edit source/time, and refreshed Newick tree.
+- **Run timing/log:** per-stage wall times plus persistent stage counts, execution/storage choices, and fallbacks.
 
 Validation requires unique sample, family, consensus, and post-processing identities; valid sample indices/references; complete sample summaries; known family dispositions; numeric counters; consensus-linked contamination calls; exact consensus metadata/sequence agreement between consensus and post-processing records; and known-sample alignment/tree keys.
 
@@ -43,11 +44,11 @@ Validation requires unique sample, family, consensus, and post-processing identi
 | `postproc-csv` | All filter flags, panel score, functional flag, and rejection reasons |
 | `apobec-csv` | Stored APOBEC posterior summaries |
 | `nucleotide-alignment` | Selected sample nucleotide FASTA alignment |
-| `protein-alignment` | Selected sample amino-acid FASTA alignment |
-| `newick` | Selected sample nucleotide tree |
+| `protein-alignment` | Direct translation of the selected sample's active nucleotide alignment and saved frame |
+| `newick` | Selected sample active nucleotide tree, including a refreshed edited tree when present |
 | `log` | Persistent plain-text run log |
 
-Browser exports always use the sample currently selected in the explorer. CLI FASTA/CSV exports accept optional `--sample`; alignment and tree exports require it when a result contains multiple samples.
+Browser exports always use the sample currently selected in the explorer. If Alivibe or an imported FASTA changed the alignment, alignment/protein/tree exports use that persisted edit. CLI FASTA/CSV exports accept optional `--sample`; alignment and tree exports require it when a result contains multiple samples.
 
 ```bash
 node cli/porpid-cli.mjs export results.webporpid \
