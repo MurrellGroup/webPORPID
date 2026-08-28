@@ -167,7 +167,10 @@ export async function resolveReferenceFiles(config: PipelineConfig, files: Map<s
   const cache = new Map<string, NamedSequence[]>();
   const find = (requested: string) => {
     const normalized = normalizePath(requested);
-    const candidates = [...files.entries()].filter(([name]) => normalizePath(name) === normalized || basename(name) === basename(normalized));
+    const exact = [...files.entries()].filter(([name]) => normalizePath(name) === normalized);
+    if (exact.length === 1) return exact[0];
+    if (exact.length > 1) throw new Error(`Reference ${requested} is ambiguous.`);
+    const candidates = [...files.entries()].filter(([name]) => basename(name) === basename(normalized));
     if (candidates.length !== 1) throw new Error(candidates.length ? `Reference ${requested} is ambiguous.` : `Reference ${requested} was not supplied.`);
     return candidates[0];
   };

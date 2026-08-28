@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-CojJD-Gt.mjs";
+import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-0FV66vte.mjs";
 import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
 import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-izZLhWZ1.mjs";
 import { createHash } from "node:crypto";
@@ -354,7 +354,7 @@ const CODONS$1 = {
 	GGA: "G",
 	GGG: "G"
 };
-function exactFasta(records) {
+function exactFasta$1(records) {
 	return records.map((record) => `>${record.name}\n${record.sequence}\n`).join("");
 }
 function parseAlignmentFasta(source) {
@@ -409,7 +409,7 @@ function inspectAlignment(text, minimumRows = 2) {
 		if (names.has(record.name)) throw new Error(`The alignment contains duplicate identifier ${record.name}.`);
 		names.add(record.name);
 	}
-	const fasta = exactFasta(records);
+	const fasta = exactFasta$1(records);
 	return {
 		fasta,
 		records,
@@ -421,35 +421,39 @@ function inspectAlignment(text, minimumRows = 2) {
 function ungapped(sequence) {
 	return sequence.replaceAll("-", "").replaceAll("U", "T");
 }
-function isSubsequence(candidate, original) {
-	let offset = 0;
-	for (const base of candidate) {
-		offset = original.indexOf(base, offset);
-		if (offset < 0) return false;
-		offset += 1;
-	}
-	return true;
-}
-/** Allow gap editing and row/base deletion, but never invented biological content. */
+/**
+* Validate the FASTA shape without restricting biological edits. Substitutions,
+* insertions, deletions, renamed rows and removed rows are all retained in the
+* edit audit so the UI can warn before saving them.
+*/
 function validateCorrectedAlignment(currentText, correctedText) {
 	const current = inspectAlignment(currentText, 1);
 	const corrected = inspectAlignment(correctedText, 1);
 	const currentByName = new Map(current.records.map((record) => [record.name, record.sequence]));
 	const correctedNames = new Set(corrected.records.map((record) => record.name));
 	const removedRows = current.records.filter((record) => !correctedNames.has(record.name)).map((record) => record.name);
-	const added = corrected.records.filter((record) => !currentByName.has(record.name)).map((record) => record.name);
-	if (added.length) throw new Error(`The corrected alignment contains unexpected or renamed rows: ${added.slice(0, 4).join(", ")}${added.length > 4 ? "…" : ""}.`);
-	let removedNucleotides = 0;
+	const addedRows = corrected.records.filter((record) => !currentByName.has(record.name)).map((record) => record.name);
+	const changedRows = [];
+	let removedNucleotides = 0, insertedNucleotides = 0, substitutedNucleotides = 0;
 	for (const record of corrected.records) {
-		const original = ungapped(currentByName.get(record.name));
+		const originalAligned = currentByName.get(record.name);
+		if (originalAligned == null) continue;
+		const original = ungapped(originalAligned);
 		const replacement = ungapped(record.sequence);
-		if (!isSubsequence(replacement, original)) throw new Error(`The ungapped sequence for ${record.name} contains a substitution, inserted base, or changed order.`);
-		removedNucleotides += original.length - replacement.length;
+		if (original !== replacement || originalAligned !== record.sequence) changedRows.push(record.name);
+		const shared = Math.min(original.length, replacement.length);
+		for (let index = 0; index < shared; index += 1) if (original[index] !== replacement[index]) substitutedNucleotides += 1;
+		removedNucleotides += Math.max(0, original.length - replacement.length);
+		insertedNucleotides += Math.max(0, replacement.length - original.length);
 	}
 	return {
 		...corrected,
 		removedRows,
-		removedNucleotides
+		addedRows,
+		changedRows,
+		removedNucleotides,
+		insertedNucleotides,
+		substitutedNucleotides
 	};
 }
 function translateAlignedNucleotides(sequence, frameOffset = 0) {
@@ -462,10 +466,55 @@ function translateAlignedNucleotides(sequence, frameOffset = 0) {
 	return result;
 }
 function translateAlignmentFasta(fasta, frameOffset = 0) {
-	return exactFasta(inspectAlignment(fasta, 1).records.map((record) => ({
+	return exactFasta$1(inspectAlignment(fasta, 1).records.map((record) => ({
 		...record,
 		sequence: translateAlignedNucleotides(record.sequence, frameOffset)
 	})));
+}
+//#endregion
+//#region src/collapse.ts
+function exactFasta(rows) {
+	return rows.map((row) => `>${row.name}\n${row.sequence}\n`).join("");
+}
+/**
+* Collapse identical aligned haplotypes while retaining one count per UMI
+* family. Read-family sizes are metadata only and never contribute to the
+* collapse multiplicity.
+*/
+function collapseAlignment(fasta, sample, records) {
+	const alignment = inspectAlignment(fasta, 1);
+	const metadata = new Map(records.map((record) => [record.id, record]));
+	const bySequence = /* @__PURE__ */ new Map();
+	for (const row of alignment.records) {
+		const haplotype = row.sequence.replaceAll("-", "");
+		let group = bySequence.get(haplotype);
+		if (!group) {
+			group = {
+				name: row.name,
+				sequence: row.sequence,
+				members: [],
+				agreements: []
+			};
+			bySequence.set(haplotype, group);
+		}
+		group.members.push(row.name);
+		const agreement = metadata.get(row.name)?.minimumAgreement;
+		if (agreement != null && Number.isFinite(agreement)) group.agreements.push(agreement);
+	}
+	const groups = [...bySequence.values()].map((group) => ({
+		sample,
+		representativeId: group.name,
+		memberIds: group.members,
+		familyCount: group.members.length,
+		minimumAgreement: group.agreements.length ? Math.min(...group.agreements) : 0
+	}));
+	return {
+		fasta: exactFasta([...bySequence.values()].map((group) => ({
+			name: group.name,
+			sequence: group.sequence
+		}))),
+		groups
+	};
 }
 //#endregion
 //#region src/panel-profile.ts
@@ -928,12 +977,13 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1) {
 	const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
 	const outputs = Array(config.samples.length);
-	let cursor = 0;
+	let cursor = 0, collapseMilliseconds = 0;
 	await Promise.all(Array.from({ length: Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
 		while (true) {
 			const sampleIndex = cursor++;
 			if (sampleIndex >= config.samples.length) return;
 			const sample = config.samples[sampleIndex], records = [], summaries = [], alignments = {};
+			const referenceAlignments = {}, collapseGroups = {};
 			if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
 			const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
 			const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile) * (sample.artefactFractionOverride ?? config.parameters.artefactFraction));
@@ -952,7 +1002,19 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				});
 			} else preliminary.forEach(({ record, index }) => extracted.set(index, degap(record.sequence)));
 			const accepted = preliminary.filter(({ index }) => panelPass[index]);
-			const acceptedAlignment = accepted.length > 1 ? await runScalableMsa(accepted.map(({ index }) => extracted.get(index)), runMsa, signal, 3, "nucleotide") : accepted.map(({ index }) => extracted.get(index));
+			const displayReference = sample.functionalReferenceSequence?.sequence ?? sample.panelSequences[0]?.sequence;
+			let acceptedAlignment = [], alignedReference = "";
+			if (accepted.length) {
+				const inputs = [...displayReference ? [degap(displayReference)] : [], ...accepted.map(({ index }) => extracted.get(index))];
+				const aligned = inputs.length > 1 ? await runScalableMsa(inputs, runMsa, signal, 3, "nucleotide") : inputs;
+				if (displayReference) {
+					alignedReference = aligned[0];
+					acceptedAlignment = aligned.slice(1);
+				} else {
+					acceptedAlignment = aligned;
+					alignedReference = alignmentConsensus(aligned);
+				}
+			}
 			const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
 			const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows = [];
 			const functionalByIndex = /* @__PURE__ */ new Map();
@@ -1001,12 +1063,29 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 					apobec: acceptedRow ? apobec(consensus, acceptedRow) : void 0
 				});
 			});
+			let collapsedCount = 0;
 			if (nucleotideRows.length) {
-				alignments[`${sample.name}/nucleotide`] = fasta$1(nucleotideRows);
-				alignments[`${sample.name}/protein`] = fasta$1(nucleotideRows.map((row) => ({
+				const uncollapsed = fasta$1(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name, records);
+				collapseMilliseconds += performance.now() - collapseStarted;
+				collapsedCount = collapsed.groups.length;
+				alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
+				alignments[`${sample.name}/uncollapsed-nucleotide`] = uncollapsed;
+				alignments[`${sample.name}/protein`] = fasta$1(collapsed.groups.map((group) => {
+					const row = nucleotideRows.find((candidate) => candidate.name === group.representativeId);
+					return {
+						...row,
+						sequence: translateAlignedNucleotides(row.sequence, 0)
+					};
+				}));
+				alignments[`${sample.name}/uncollapsed-protein`] = fasta$1(nucleotideRows.map((row) => ({
 					...row,
 					sequence: translateAlignedNucleotides(row.sequence, 0)
 				})));
+				referenceAlignments[`${sample.name}/nucleotide`] = fasta$1([{
+					name: "reference",
+					sequence: alignedReference
+				}]);
+				collapseGroups[sample.name] = collapsed.groups;
 			}
 			summaries.push({
 				sample: sample.name,
@@ -1016,20 +1095,27 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				consensusSequences: source.length,
 				contaminationPassed: source.filter((record) => !discarded.has(record.id)).length,
 				postprocPassed: accepted.length,
+				collapsedSequences: collapsedCount,
 				functionalPassed: sample.functionalReferenceSequence ? functionalPassed : void 0,
 				artefactCutoff
 			});
 			outputs[sampleIndex] = {
 				records,
 				summaries,
-				alignments
+				alignments,
+				referenceAlignments,
+				collapseGroups,
+				collapseSeconds: 0
 			};
 		}
 	}));
 	return {
 		records: outputs.flatMap((output) => output.records),
 		summaries: outputs.flatMap((output) => output.summaries),
-		alignments: Object.assign({}, ...outputs.map((output) => output.alignments))
+		alignments: Object.assign({}, ...outputs.map((output) => output.alignments)),
+		referenceAlignments: Object.assign({}, ...outputs.map((output) => output.referenceAlignments)),
+		collapseGroups: Object.assign({}, ...outputs.map((output) => output.collapseGroups)),
+		collapseSeconds: collapseMilliseconds / 1e3
 	};
 }
 //#endregion
@@ -3049,6 +3135,7 @@ function validateResult(value) {
 			"postprocPassed",
 			"artefactCutoff"
 		]) count(row[key], `summaries[${index}].${key}`);
+		if (row.collapsedSequences != null) count(row.collapsedSequences, `summaries[${index}].collapsedSequences`);
 		if (row.functionalPassed != null) count(row.functionalPassed, `summaries[${index}].functionalPassed`);
 	});
 	if (summarySamples.size !== samples.length) throw new Error("Result summaries are missing a configured sample.");
@@ -3099,7 +3186,7 @@ function validateResult(value) {
 		bool(row.discarded, "contamination discarded");
 		bool(row.suspectOnly, "contamination suspectOnly");
 	});
-	const recordIds = /* @__PURE__ */ new Set();
+	const recordIds = /* @__PURE__ */ new Set(), recordMetadata = /* @__PURE__ */ new Map();
 	array(bundle.records, "records").forEach((entry, index) => {
 		const row = object(entry, `records[${index}]`), id = text(row.id, `records[${index}].id`);
 		if (recordIds.has(id)) throw new Error("Post-processing identifiers must be unique.");
@@ -3110,7 +3197,7 @@ function validateResult(value) {
 		const umi = text(row.umi, "postproc UMI"), familySize = count(row.familySize, "postproc family size"), minimumAgreement = numeric(row.minimumAgreement, "postproc agreement");
 		if (umi !== source.umi || familySize !== source.familySize || minimumAgreement !== source.minimumAgreement) throw new Error("A post-processing record has inconsistent consensus metadata.");
 		if (text(row.consensusNt, "postproc consensus") !== source.sequence) throw new Error("A post-processing record has inconsistent consensus sequence data.");
-		optionalText(row.alignedNt, "postproc aligned sequence");
+		const alignedNt = row.alignedNt == null ? void 0 : text(row.alignedNt, "postproc aligned sequence");
 		optionalText(row.trimmedNt, "postproc trimmed nucleotide");
 		optionalText(row.trimmedAa, "postproc trimmed protein");
 		numeric(row.panelScore, "postproc panel score");
@@ -3132,6 +3219,11 @@ function validateResult(value) {
 				"totalMutations"
 			]) numeric(model[key], `APOBEC ${key}`);
 		}
+		recordMetadata.set(id, {
+			sample,
+			alignedNt,
+			minimumAgreement
+		});
 	});
 	if (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id))) throw new Error("Consensus and post-processing records are inconsistent.");
 	for (const [label, entries] of [["alignments", object(bundle.alignments, "alignments")], ["trees", object(bundle.trees, "trees")]]) for (const [name, contents] of Object.entries(entries)) {
@@ -3140,10 +3232,65 @@ function validateResult(value) {
 		const sample = name.split("/", 1)[0];
 		knownSample(sample, `${label}.${name}`);
 	}
+	if (bundle.referenceAlignments != null) for (const [name, contents] of Object.entries(object(bundle.referenceAlignments, "referenceAlignments"))) {
+		const sample = name.split("/", 1)[0];
+		knownSample(sample, `referenceAlignments.${name}`);
+		const reference = inspectAlignment(text(contents, `referenceAlignments.${name}`), 1);
+		const nucleotide = object(bundle.alignments, "alignments")[name];
+		if (nucleotide != null && inspectAlignment(text(nucleotide, `alignments.${name}`), 1).columns !== reference.columns) throw new Error("A stored reference row does not match its nucleotide alignment width.");
+	}
+	if (bundle.collapseGroups != null) for (const [sample, rawGroups] of Object.entries(object(bundle.collapseGroups, "collapseGroups"))) {
+		knownSample(sample, `collapseGroups.${sample}`);
+		const representatives = /* @__PURE__ */ new Set(), membersSeen = /* @__PURE__ */ new Set();
+		const collapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/nucleotide`], `alignments.${sample}/nucleotide`), 1);
+		const uncollapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/uncollapsed-nucleotide`], `alignments.${sample}/uncollapsed-nucleotide`), 1);
+		const collapsedByName = new Map(collapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+		const uncollapsedByName = new Map(uncollapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+		array(rawGroups, `collapseGroups.${sample}`).forEach((rawGroup, index) => {
+			const group = object(rawGroup, `collapseGroups.${sample}[${index}]`);
+			if (text(group.sample, "collapse group sample") !== sample) throw new Error("A collapse group has an inconsistent sample.");
+			const representative = text(group.representativeId, "collapse representative");
+			if (representatives.has(representative)) throw new Error("Collapse representative identifiers must be unique.");
+			representatives.add(representative);
+			const members = array(group.memberIds, "collapse members").map((entry) => text(entry, "collapse member"));
+			if (!members.includes(representative)) throw new Error("A collapse group must include its representative.");
+			if (count(group.familyCount, "collapse family count") !== members.length) throw new Error("Collapse counts must count UMI families.");
+			const representativeSequence = collapsedByName.get(representative);
+			if (representativeSequence == null) throw new Error("A collapse representative is missing from the collapsed alignment.");
+			const agreements = [];
+			for (const member of members) {
+				if (membersSeen.has(member)) throw new Error("A retained UMI family occurs in more than one collapse group.");
+				membersSeen.add(member);
+				if (uncollapsedByName.get(member) !== representativeSequence) throw new Error("A collapse group contains different nucleotide haplotypes.");
+				const metadata = recordMetadata.get(member);
+				if (!metadata || metadata.sample !== sample || metadata.alignedNt == null) throw new Error("A collapse member is not a retained UMI-family consensus.");
+				agreements.push(metadata.minimumAgreement);
+			}
+			if (numeric(group.minimumAgreement, "collapse minimum agreement") !== Math.min(...agreements)) throw new Error("A collapse group has inconsistent minimum-agreement metadata.");
+		});
+		if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length) throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
+		const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
+		if (summary?.collapsedSequences != null && count(summary.collapsedSequences, "summary collapsed count") !== representatives.size) throw new Error("A summary has an inconsistent collapsed haplotype count.");
+	}
+	if (bundle.inputMappings != null) array(bundle.inputMappings, "inputMappings").forEach((rawMapping, index) => {
+		const mapping = object(rawMapping, `inputMappings[${index}]`);
+		text(mapping.slot, "input slot");
+		if (![
+			"reads",
+			"configuration",
+			"panel",
+			"functional-reference",
+			"contamination-panel"
+		].includes(text(mapping.role, "input role"))) throw new Error("An input mapping has an unknown role.");
+		optionalText(mapping.expectedName, "expected filename");
+		text(mapping.uploadedName, "uploaded filename");
+		count(mapping.uploadedSize, "uploaded size");
+	});
+	if (bundle.runOptions != null) bool(object(bundle.runOptions, "runOptions").deferPhylogeny, "runOptions.deferPhylogeny");
 	if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
 		const sample = name.split("/", 1)[0];
 		knownSample(sample, `alignmentEdits.${name}`);
-		if (name !== `${sample}/nucleotide`) throw new Error("Edited alignment keys must end in /nucleotide.");
+		if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide`) throw new Error("Edited alignment keys must identify a stored nucleotide view.");
 		const edit = object(rawEdit, `alignmentEdits.${name}`), fasta = text(edit.fasta, `alignmentEdits.${name}.fasta`);
 		if (count(edit.frameOffset, `alignmentEdits.${name}.frameOffset`) > 2) throw new Error("Edited alignment frame offsets must be 0, 1, or 2.");
 		const baselineFingerprint = text(edit.baselineFingerprint, `alignmentEdits.${name}.baselineFingerprint`);
@@ -3151,7 +3298,11 @@ function validateResult(value) {
 		text(edit.source, `alignmentEdits.${name}.source`);
 		text(edit.savedUtc, `alignmentEdits.${name}.savedUtc`);
 		optionalText(edit.treeNewick, `alignmentEdits.${name}.treeNewick`);
-		const original = text(object(bundle.alignments, "alignments")[name], `alignments.${name}`);
+		optionalText(edit.treeFingerprint, `alignmentEdits.${name}.treeFingerprint`);
+		optionalBool(edit.treeStale, `alignmentEdits.${name}.treeStale`);
+		if (edit.warnings != null) array(edit.warnings, `alignmentEdits.${name}.warnings`).forEach((warning) => text(warning, "alignment edit warning"));
+		const storedAlignments = object(bundle.alignments, "alignments");
+		const original = text(storedAlignments[name] ?? (name === `${sample}/uncollapsed-nucleotide` ? storedAlignments[`${sample}/nucleotide`] : void 0), `alignments.${name}`);
 		if (inspectAlignment(original, 1).fingerprint !== baselineFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent baseline fingerprint.`);
 		if (inspectAlignment(fasta, 1).fingerprint !== editedFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent fingerprint.`);
 		validateCorrectedAlignment(original, fasta);
@@ -3166,6 +3317,7 @@ function validateResult(value) {
 			"consensus",
 			"contamination",
 			"postprocessing",
+			"collapse",
 			"tree",
 			"analysis-total"
 		].includes(stage)) throw new Error(`timings[${index}] has an unknown stage.`);
@@ -3374,6 +3526,26 @@ function exportComponent(bundle, kind, sample) {
 				row.apobec.totalMutations
 			]))
 		};
+		case "collapse-csv": {
+			const selected = alignmentSample(bundle, sample);
+			return {
+				extension: "collapsed-families.csv",
+				mime: "text/csv",
+				text: csv([
+					"sample",
+					"representative_id",
+					"family_count",
+					"minimum_agreement",
+					"member_ids"
+				], (bundle.collapseGroups?.[selected] ?? []).map((group) => [
+					selected,
+					group.representativeId,
+					group.familyCount,
+					group.minimumAgreement,
+					group.memberIds.join(";")
+				]))
+			};
+		}
 		case "nucleotide-alignment": {
 			const key = `${alignmentSample(bundle, sample)}/nucleotide`;
 			return {
@@ -3397,6 +3569,31 @@ function exportComponent(bundle, kind, sample) {
 				extension: "tree.newick",
 				mime: "text/plain",
 				text: edit ? edit.treeNewick ?? "" : bundle.trees[key] ?? ""
+			};
+		}
+		case "uncollapsed-nucleotide-alignment": {
+			const selected = alignmentSample(bundle, sample), key = `${selected}/uncollapsed-nucleotide`;
+			return {
+				extension: "uncollapsed-nucleotide-alignment.fasta",
+				mime: "text/x-fasta",
+				text: (bundle.alignmentEdits?.[key])?.fasta ?? bundle.alignments[key] ?? bundle.alignments[`${selected}/nucleotide`] ?? ""
+			};
+		}
+		case "uncollapsed-protein-alignment": {
+			const selected = alignmentSample(bundle, sample), key = `${selected}/uncollapsed-nucleotide`, edit = bundle.alignmentEdits?.[key];
+			const nucleotide = edit?.fasta ?? bundle.alignments[key] ?? bundle.alignments[`${selected}/nucleotide`];
+			return {
+				extension: "uncollapsed-protein-alignment.fasta",
+				mime: "text/x-fasta",
+				text: nucleotide ? translateAlignmentFasta(nucleotide, edit?.frameOffset ?? 0) : ""
+			};
+		}
+		case "uncollapsed-newick": {
+			const key = `${alignmentSample(bundle, sample)}/uncollapsed-nucleotide`;
+			return {
+				extension: "uncollapsed-tree.newick",
+				mime: "text/plain",
+				text: (bundle.alignmentEdits?.[key])?.treeNewick ?? bundle.trees[key] ?? ""
 			};
 		}
 		case "log": return {
@@ -3439,7 +3636,7 @@ function concatenateSpoolRecords(records) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.2.0";
+const VERSION = "0.3.1";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -3454,7 +3651,7 @@ function defaultCliAssets() {
 	};
 }
 function usage() {
-	return `porpid-cli ${VERSION}\n\nRun the complete nanopore/PacBio pipeline:\n  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N]\n\nInspect or export a saved analysis:\n  porpid-cli inspect results.webporpid\n  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\nWorkers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\nComponents: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv,\n            nucleotide-alignment, protein-alignment, newick, log`;
+	return `porpid-cli ${VERSION}\n\nRun the complete nanopore/PacBio pipeline:\n  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--defer-phylogeny]\n\nInspect or export a saved analysis:\n  porpid-cli inspect results.webporpid\n  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\nWorkers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\nComponents: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n            uncollapsed-protein-alignment, uncollapsed-newick, log`;
 }
 function option(args, name) {
 	const index = args.indexOf(name);
@@ -3686,19 +3883,43 @@ async function* fastqBatches(path, hash, batchRecords = 256, maximumBatchBytes =
 	if (!records) throw new Error("The input contains no FASTQ records.");
 }
 async function loadConfiguration(path) {
-	const config = parseConfigYaml(await readFile(path, "utf8")), base = dirname(resolve(path));
-	const requested = new Set([config.contaminationPanel]);
+	const source = await readFile(path, "utf8"), config = parseConfigYaml(source), base = dirname(resolve(path));
+	const requested = /* @__PURE__ */ new Map();
+	const add = (name, role) => {
+		if (!requested.has(name)) requested.set(name, role);
+	};
 	for (const sample of config.samples) {
-		requested.add(sample.panel);
-		if (sample.functionalReference) requested.add(sample.functionalReference);
+		add(sample.panel, "panel");
+		if (sample.functionalReference) add(sample.functionalReference, "functional-reference");
 	}
-	return resolveReferenceFiles(config, new Map([...requested].map((name) => [name, () => readFile(isAbsolute(name) ? name : resolve(base, name), "utf8")])));
+	if (config.parameters.contaminationFilter) add(config.contaminationPanel, "contamination-panel");
+	const resolved = new Map([...requested].map(([name]) => [name, isAbsolute(name) ? name : resolve(base, name)]));
+	const loaded = await resolveReferenceFiles(config, new Map([...resolved].map(([name, filePath]) => [name, () => readFile(filePath, "utf8")])));
+	const mappings = [{
+		slot: "configuration",
+		role: "configuration",
+		uploadedName: basename(path),
+		uploadedSize: Buffer.byteLength(source)
+	}];
+	for (const [name, role] of requested) {
+		const filePath = resolved.get(name), information = await stat(filePath);
+		mappings.push({
+			slot: name,
+			role,
+			expectedName: name,
+			uploadedName: basename(filePath),
+			uploadedSize: information.size
+		});
+	}
+	return {
+		config: loaded,
+		mappings
+	};
 }
-async function runPipeline({ inputPath, configPath, outputPath, workers, assets }) {
+async function runPipeline({ inputPath, configPath, outputPath, workers, assets, deferPhylogeny = false }) {
 	const runStarted = performance.now(), timings = [];
-	const input = resolve(inputPath), configuration = resolve(configPath);
-	await stat(input);
-	const config = await loadConfiguration(configuration), compiledConfig = compileConfig(config);
+	const input = resolve(inputPath), configuration = resolve(configPath), inputInformation = await stat(input);
+	const loadedConfiguration = await loadConfiguration(configuration), config = loadedConfiguration.config, compiledConfig = compileConfig(config);
 	const configHash = createHash("sha256").update(compiledConfig).digest("hex"), inputHash = createHash("sha256");
 	status(`starting ${config.dataset} with ${workers} workers`);
 	const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
@@ -3707,14 +3928,24 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
 		`${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
 		`${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}`
 	];
-	const recordTiming = (stage, started, workItems) => {
+	const inputMappings = [{
+		slot: "reads",
+		role: "reads",
+		uploadedName: basename(input),
+		uploadedSize: inputInformation.size
+	}, ...loadedConfiguration.mappings];
+	for (const mapping of inputMappings) log.push(`${now()} input mapping: ${mapping.role} slot ${mapping.slot}${mapping.expectedName ? ` (${mapping.expectedName})` : ""} <- ${mapping.uploadedName} (${mapping.uploadedSize} bytes)`);
+	const storeTiming = (stage, seconds, workItems) => {
 		const entry = {
 			stage,
-			seconds: (performance.now() - started) / 1e3
+			seconds
 		};
 		if (workItems != null) entry.workItems = workItems;
 		timings.push(entry);
 		log.push(`${now()} timing ${stage}: ${entry.seconds.toFixed(6)} s${workItems == null ? "" : `; ${workItems} work items`}`);
+	};
+	const recordTiming = (stage, started, workItems) => {
+		storeTiming(stage, (performance.now() - started) / 1e3, workItems);
 		return performance.now();
 	};
 	recordTiming("setup", runStarted);
@@ -3802,6 +4033,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
 		log.push(`${now()} contamination: ${contamination.filter((call) => call.discarded).length} discarded; ${contamination.filter((call) => call.suspectOnly).length} suspect calls`);
 		stageStarted = recordTiming("contamination", stageStarted, consensuses.length);
 		const msaRunner = createMsaRunner(assets.msaPath, Math.min(workers, config.samples.length), assets.msaWorkerPath);
+		const downstreamStarted = performance.now();
 		let downstream;
 		try {
 			downstream = await postprocess(consensuses, contamination, config, void 0, msaRunner, workers);
@@ -3813,18 +4045,26 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
 			summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
 			summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
 		});
-		stageStarted = recordTiming("postprocessing", stageStarted, downstream.records.length);
+		const downstreamFinished = performance.now(), downstreamSeconds = (downstreamFinished - downstreamStarted) / 1e3;
+		const collapseSeconds = Math.max(0, Math.min(downstreamSeconds, downstream.collapseSeconds));
+		storeTiming("postprocessing", downstreamSeconds - collapseSeconds, downstream.records.length);
+		const collapsedHaplotypes = Object.values(downstream.collapseGroups).reduce((sum, groups) => sum + groups.length, 0);
+		storeTiming("collapse", collapseSeconds, collapsedHaplotypes);
+		stageStarted = downstreamFinished;
+		log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; multiplicities count families, not reads`);
 		const treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
-		const fastTree = createFastTreeRunner(assets.fastTreeJavascriptPath, assets.fastTreeWasmPath, Math.min(workers, Math.max(1, treeInputs.length)), assets.fastTreeWorkerPath);
-		let treeEntries;
-		try {
-			treeEntries = await Promise.all(treeInputs.map(async ([name, alignment]) => {
-				status(`FastTree: ${name.split("/")[0]}`);
-				return [name, await fastTree(alignment)];
-			}));
-		} finally {
-			await fastTree.close?.();
-		}
+		let treeEntries = [];
+		if (!deferPhylogeny) {
+			const fastTree = createFastTreeRunner(assets.fastTreeJavascriptPath, assets.fastTreeWasmPath, Math.min(workers, Math.max(1, treeInputs.length)), assets.fastTreeWorkerPath);
+			try {
+				treeEntries = await Promise.all(treeInputs.map(async ([name, alignment]) => {
+					status(`FastTree: ${name.split("/")[0]}`);
+					return [name, await fastTree(alignment)];
+				}));
+			} finally {
+				await fastTree.close?.();
+			}
+		} else log.push(`${now()} phylogeny: deferred by user; collapsed alignments are stored and trees can be inferred in the results explorer`);
 		const trees = Object.fromEntries(treeEntries);
 		recordTiming("tree", stageStarted, Object.keys(trees).length);
 		timings.push({
@@ -3855,6 +4095,10 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
 			records: downstream.records,
 			alignments: downstream.alignments,
 			trees,
+			referenceAlignments: downstream.referenceAlignments,
+			collapseGroups: downstream.collapseGroups,
+			inputMappings,
+			runOptions: { deferPhylogeny },
 			timings,
 			log
 		};
@@ -3880,6 +4124,7 @@ async function inspect(path) {
 			families: result.umiFamilies.length,
 			contaminationCalls: result.contamination.length,
 			records: result.records.length,
+			collapsedHaplotypes: Object.values(result.collapseGroups ?? {}).reduce((sum, groups) => sum + groups.length, 0),
 			alignments: Object.keys(result.alignments),
 			trees: Object.keys(result.trees)
 		}
@@ -3920,7 +4165,8 @@ async function runCli(overrideAssets) {
 		configPath,
 		outputPath: option(args, "--output") ?? option(args, "--out") ?? `${basename(inputPath).replace(/\.(fastq|fq)(\.gz)?$/i, "")}.webporpid`,
 		workers: integer(option(args, "--workers"), "--workers", availableParallelism()),
-		assets: overrideAssets ?? defaultCliAssets()
+		assets: overrideAssets ?? defaultCliAssets(),
+		deferPhylogeny: args.includes("--defer-phylogeny")
 	});
 }
 //#endregion

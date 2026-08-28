@@ -127,7 +127,7 @@ export function classifyContamination(consensuses: ConsensusRecord[], config: Pi
     const all = { label: `${sample.name}_All`, sample: sample.name, vector: mean(vectors, vectors.map((_, index) => index)) };
     primary.push(all); suspect.push(all);
   }
-  // Julia concatenates the run-derived cluster database before the external
+  // The reference workflow concatenates the run-derived cluster database before the external
   // panel. Keeping this order preserves argmin tie selection and report labels.
   primary.push(...panel); suspect.push(...panel);
   const output: ContaminationCall[] = [], threshold = config.parameters.contaminationDistanceThreshold;

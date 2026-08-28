@@ -19,7 +19,7 @@ import {
 import { createFastTreeRunner } from "./direct-fasttree.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 
-const VERSION = "0.2.0";
+const VERSION = "0.3.1";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
@@ -34,14 +34,15 @@ export function defaultCliAssets() {
 function usage() {
   return `porpid-cli ${VERSION}\n\n` +
     `Run the complete nanopore/PacBio pipeline:\n` +
-    `  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N]\n\n` +
+    `  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--defer-phylogeny]\n\n` +
     `Inspect or export a saved analysis:\n` +
     `  porpid-cli inspect results.webporpid\n` +
     `  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\n` +
     `Workers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\n` +
     `Components: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n` +
-    `            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv,\n` +
-    `            nucleotide-alignment, protein-alignment, newick, log`;
+    `            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n` +
+    `            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n` +
+    `            uncollapsed-protein-alignment, uncollapsed-newick, log`;
 }
 
 function option(args, name) {
@@ -171,25 +172,39 @@ async function* fastqBatches(path, hash, batchRecords = 256, maximumBatchBytes =
 
 async function loadConfiguration(path) {
   const source = await readFile(path, "utf8"), config = parseConfigYaml(source), base = dirname(resolve(path));
-  const requested = new Set([config.contaminationPanel]);
-  for (const sample of config.samples) { requested.add(sample.panel); if (sample.functionalReference) requested.add(sample.functionalReference); }
-  const files = new Map([...requested].map((name) => [name, () => readFile(isAbsolute(name) ? name : resolve(base, name), "utf8")]));
-  return resolveReferenceFiles(config, files);
+  const requested = new Map();
+  const add = (name, role) => { if (!requested.has(name)) requested.set(name, role); };
+  for (const sample of config.samples) { add(sample.panel, "panel"); if (sample.functionalReference) add(sample.functionalReference, "functional-reference"); }
+  if (config.parameters.contaminationFilter) add(config.contaminationPanel, "contamination-panel");
+  const resolved = new Map([...requested].map(([name]) => [name, isAbsolute(name) ? name : resolve(base, name)]));
+  const files = new Map([...resolved].map(([name, filePath]) => [name, () => readFile(filePath, "utf8")]));
+  const loaded = await resolveReferenceFiles(config, files);
+  const mappings = [{ slot: "configuration", role: "configuration", uploadedName: basename(path), uploadedSize: Buffer.byteLength(source) }];
+  for (const [name, role] of requested) {
+    const filePath = resolved.get(name), information = await stat(filePath);
+    mappings.push({ slot: name, role, expectedName: name, uploadedName: basename(filePath), uploadedSize: information.size });
+  }
+  return { config: loaded, mappings };
 }
 
-async function runPipeline({ inputPath, configPath, outputPath, workers, assets }) {
+async function runPipeline({ inputPath, configPath, outputPath, workers, assets, deferPhylogeny = false }) {
   const runStarted = performance.now(), timings = [];
-  const input = resolve(inputPath), configuration = resolve(configPath); await stat(input);
-  const config = await loadConfiguration(configuration), compiledConfig = compileConfig(config);
+  const input = resolve(inputPath), configuration = resolve(configPath), inputInformation = await stat(input);
+  const loadedConfiguration = await loadConfiguration(configuration), config = loadedConfiguration.config, compiledConfig = compileConfig(config);
   const configHash = createHash("sha256").update(compiledConfig).digest("hex"), inputHash = createHash("sha256");
   status(`starting ${config.dataset} with ${workers} workers`);
   const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
   const log = [`${now()} webPORPID ${VERSION} started`, `${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
     `${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}`];
-  const recordTiming = (stage, started, workItems) => {
-    const entry = { stage, seconds: (performance.now() - started) / 1000 };
+  const inputMappings = [{ slot: "reads", role: "reads", uploadedName: basename(input), uploadedSize: inputInformation.size }, ...loadedConfiguration.mappings];
+  for (const mapping of inputMappings) log.push(`${now()} input mapping: ${mapping.role} slot ${mapping.slot}${mapping.expectedName ? ` (${mapping.expectedName})` : ""} <- ${mapping.uploadedName} (${mapping.uploadedSize} bytes)`);
+  const storeTiming = (stage, seconds, workItems) => {
+    const entry = { stage, seconds };
     if (workItems != null) entry.workItems = workItems;
     timings.push(entry); log.push(`${now()} timing ${stage}: ${entry.seconds.toFixed(6)} s${workItems == null ? "" : `; ${workItems} work items`}`);
+  };
+  const recordTiming = (stage, started, workItems) => {
+    storeTiming(stage, (performance.now() - started) / 1000, workItems);
     return performance.now();
   };
   recordTiming("setup", runStarted);
@@ -256,7 +271,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
     // larger pool only instantiates idle WASM runtimes (and can be surprisingly
     // expensive on machines reporting dozens of logical CPUs).
     const msaRunner = createMsaRunner(assets.msaPath, Math.min(workers, config.samples.length), assets.msaWorkerPath);
-    let downstream;
+    const downstreamStarted = performance.now(); let downstream;
     try { downstream = await postprocess(consensuses, contamination, config, undefined, msaRunner, workers); }
     finally { await msaRunner.close?.(); }
     downstream.summaries.forEach((summary, index) => {
@@ -264,17 +279,24 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
       summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
       summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
     });
-    stageStarted = recordTiming("postprocessing", stageStarted, downstream.records.length);
+    const downstreamFinished = performance.now(), downstreamSeconds = (downstreamFinished - downstreamStarted) / 1000;
+    const collapseSeconds = Math.max(0, Math.min(downstreamSeconds, downstream.collapseSeconds));
+    storeTiming("postprocessing", downstreamSeconds - collapseSeconds, downstream.records.length);
+    const collapsedHaplotypes = Object.values(downstream.collapseGroups).reduce((sum, groups) => sum + groups.length, 0);
+    storeTiming("collapse", collapseSeconds, collapsedHaplotypes); stageStarted = downstreamFinished;
+    log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; multiplicities count families, not reads`);
     const treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
-    const fastTree = createFastTreeRunner(
-      assets.fastTreeJavascriptPath,
-      assets.fastTreeWasmPath,
-      Math.min(workers, Math.max(1, treeInputs.length)),
-      assets.fastTreeWorkerPath,
-    );
-    let treeEntries;
-    try { treeEntries = await Promise.all(treeInputs.map(async ([name, alignment]) => { status(`FastTree: ${name.split("/")[0]}`); return [name, await fastTree(alignment)]; })); }
-    finally { await fastTree.close?.(); }
+    let treeEntries = [];
+    if (!deferPhylogeny) {
+      const fastTree = createFastTreeRunner(
+        assets.fastTreeJavascriptPath,
+        assets.fastTreeWasmPath,
+        Math.min(workers, Math.max(1, treeInputs.length)),
+        assets.fastTreeWorkerPath,
+      );
+      try { treeEntries = await Promise.all(treeInputs.map(async ([name, alignment]) => { status(`FastTree: ${name.split("/")[0]}`); return [name, await fastTree(alignment)]; })); }
+      finally { await fastTree.close?.(); }
+    } else log.push(`${now()} phylogeny: deferred by user; collapsed alignments are stored and trees can be inferred in the results explorer`);
     const trees = Object.fromEntries(treeEntries);
     recordTiming("tree", stageStarted, Object.keys(trees).length);
     timings.push({ stage: "analysis-total", seconds: (performance.now() - runStarted) / 1000 });
@@ -283,7 +305,8 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets 
       workers, inputName: basename(input), inputSha256: inputHash.digest("hex"), configSha256: configHash,
       deterministicSeed: config.parameters.deterministicSeed.toString(), upstreamBranch: "nanopore", upstreamCommit: UPSTREAM_COMMIT },
       config: resultConfig(config), quality, summaries: downstream.summaries, umiFamilies, consensuses, contamination,
-      records: downstream.records, alignments: downstream.alignments, trees, timings, log };
+      records: downstream.records, alignments: downstream.alignments, trees, referenceAlignments: downstream.referenceAlignments,
+      collapseGroups: downstream.collapseGroups, inputMappings, runOptions: { deferPhylogeny }, timings, log };
     await mkdir(dirname(resolve(outputPath)), { recursive: true }); await writeFile(outputPath, encodeResult(result));
     status(`wrote ${outputPath}`); return result;
   } finally { await pool.close(); await store.close(); }
@@ -294,7 +317,8 @@ async function inspect(path) {
   process.stdout.write(JSON.stringify({ schema: result.schema, provenance: result.provenance, quality: result.quality, summaries: result.summaries,
     timings: result.timings ?? [],
     components: { consensuses: result.consensuses.length, families: result.umiFamilies.length, contaminationCalls: result.contamination.length,
-      records: result.records.length, alignments: Object.keys(result.alignments), trees: Object.keys(result.trees) } }, null, 2) + "\n");
+      records: result.records.length, collapsedHaplotypes: Object.values(result.collapseGroups ?? {}).reduce((sum, groups) => sum + groups.length, 0),
+      alignments: Object.keys(result.alignments), trees: Object.keys(result.trees) } }, null, 2) + "\n");
 }
 
 async function exportResult(args) {
@@ -315,5 +339,6 @@ export async function runCli(overrideAssets) {
   const inputPath = args[0], configPath = option(args, "--config");
   if (!inputPath || inputPath.startsWith("--") || !configPath) throw new Error("run requires an input FASTQ and --config config.yaml.");
   const outputPath = option(args, "--output") ?? option(args, "--out") ?? `${basename(inputPath).replace(/\.(fastq|fq)(\.gz)?$/i, "")}.webporpid`;
-  await runPipeline({ inputPath, configPath, outputPath, workers: integer(option(args, "--workers"), "--workers", availableParallelism()), assets: overrideAssets ?? defaultCliAssets() });
+  await runPipeline({ inputPath, configPath, outputPath, workers: integer(option(args, "--workers"), "--workers", availableParallelism()),
+    assets: overrideAssets ?? defaultCliAssets(), deferPhylogeny: args.includes("--defer-phylogeny") });
 }

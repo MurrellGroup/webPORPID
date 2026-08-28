@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { Worker as NodeWorker } from "node:worker_threads";
 import { parseFasta } from "../src/config.ts";
+import { treeTipNames } from "../src/tree-names.ts";
 
 function completeNewick(output) {
   const candidates = output.split(/\r?\n/).filter((line) => line.includes("(") && line.includes(";")).reverse();
@@ -22,10 +23,10 @@ export function createDirectFastTreeRunner(javascriptPath, wasmPath) {
   });
   return async (alignedFasta) => {
     const records = parseFasta(alignedFasta);
-    const safeName = (name, index) => name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;
+    const safeNames = treeTipNames(records.map((record) => record.name));
     if (records.length < 3) return records.length === 2
-      ? `(${safeName(records[0].name, 0)}:0.0,${safeName(records[1].name, 1)}:0.0);`
-      : records.length === 1 ? `(${safeName(records[0].name, 0)}:0.0);` : ";";
+      ? `(${safeNames[0]}:0.0,${safeNames[1]}:0.0);`
+      : records.length === 1 ? `(${safeNames[0]}:0.0);` : ";";
     const width = records[0].sequence.length;
     if (!width || records.some((record) => record.sequence.length !== width)) throw new Error("FastTree input must be a rectangular alignment.");
     const numeric = records.map((record, index) => `>${index}\n${record.sequence}`).join("\n") + "\n";
@@ -35,8 +36,7 @@ export function createDirectFastTreeRunner(javascriptPath, wasmPath) {
     finally { try { runtime.FS.unlink(path); } catch { /* best effort */ } }
     let tree = completeNewick(output.join("\n"));
     records.forEach((record, index) => {
-      const safe = safeName(record.name, index);
-      tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safe}`);
+      tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safeNames[index]}`);
     });
     return tree;
   };

@@ -34,11 +34,16 @@ test("porpid-cli runs, inspects, and exports a complete synthetic analysis", asy
     const inspected = await execute(executable, [...prefix, "inspect", result]); const summary = JSON.parse(inspected.stdout);
     assert.equal(summary.quality.totalReads, 10); assert.equal(summary.quality.demultiplexedReads, 10);
     assert.equal(summary.components.consensuses, 2); assert.equal(summary.components.families, 2);
+    assert.equal(summary.components.collapsedHaplotypes, 2);
+    assert(summary.components.alignments.includes("sample_1/uncollapsed-nucleotide"));
+    assert(summary.timings.some((entry) => entry.stage === "collapse"));
     const exported = join(directory, "consensus.fasta");
     await execute(executable, [...prefix, "export", result, "--component", "consensus-fasta", "--sample", "sample_1", "--output", exported]);
     const consensus = await readFile(exported, "utf8"); assert.match(consensus, /^>sample_1AACCGGTT fs=5 minag=/m);
     const serialResult = join(directory, "serial.webporpid"), serialExport = join(directory, "serial-consensus.fasta");
-    await execute(executable, [...prefix, "run", reads, "--config", join(directory, "config.yaml"), "--output", serialResult, "--workers", "1"], { timeout: 60_000 });
+    await execute(executable, [...prefix, "run", reads, "--config", join(directory, "config.yaml"), "--output", serialResult, "--workers", "1", "--defer-phylogeny"], { timeout: 60_000 });
+    const deferred = JSON.parse((await execute(executable, [...prefix, "inspect", serialResult])).stdout);
+    assert.deepEqual(deferred.components.trees, []);
     await execute(executable, [...prefix, "export", serialResult, "--component", "consensus-fasta", "--sample", "sample_1", "--output", serialExport]);
     assert.equal(await readFile(serialExport, "utf8"), consensus, "consensus changed with worker count");
   } finally { await rm(directory, { recursive: true, force: true }); }

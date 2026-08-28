@@ -6301,7 +6301,10 @@ async function resolveReferenceFiles(config, files) {
 	const cache = /* @__PURE__ */ new Map();
 	const find = (requested) => {
 		const normalized = normalizePath(requested);
-		const candidates = [...files.entries()].filter(([name]) => normalizePath(name) === normalized || basename(name) === basename(normalized));
+		const exact = [...files.entries()].filter(([name]) => normalizePath(name) === normalized);
+		if (exact.length === 1) return exact[0];
+		if (exact.length > 1) throw new Error(`Reference ${requested} is ambiguous.`);
+		const candidates = [...files.entries()].filter(([name]) => basename(name) === basename(normalized));
 		if (candidates.length !== 1) throw new Error(candidates.length ? `Reference ${requested} is ambiguous.` : `Reference ${requested} was not supplied.`);
 		return candidates[0];
 	};
@@ -6379,6 +6382,23 @@ function resultConfig(config) {
 	};
 }
 //#endregion
+//#region src/tree-names.ts
+/**
+* Produce Newick-safe, stable and unique tip identifiers while preserving row
+* order. The numeric FastTree input is restored through this exact mapping in
+* both browser and CLI builds.
+*/
+function treeTipNames(names) {
+	const used = /* @__PURE__ */ new Set();
+	return names.map((name, index) => {
+		const base = name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;
+		let candidate = base, suffix = 1;
+		while (used.has(candidate)) candidate = `${base}__${index + 1}_${suffix++}`;
+		used.add(candidate);
+		return candidate;
+	});
+}
+//#endregion
 //#region cli-src/direct-fasttree.mjs
 function completeNewick(output) {
 	const candidates = output.split(/\r?\n/).filter((line) => line.includes("(") && line.includes(";")).reverse();
@@ -6402,8 +6422,8 @@ function createDirectFastTreeRunner(javascriptPath, wasmPath) {
 	});
 	return async (alignedFasta) => {
 		const records = parseFasta(alignedFasta);
-		const safeName = (name, index) => name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;
-		if (records.length < 3) return records.length === 2 ? `(${safeName(records[0].name, 0)}:0.0,${safeName(records[1].name, 1)}:0.0);` : records.length === 1 ? `(${safeName(records[0].name, 0)}:0.0);` : ";";
+		const safeNames = treeTipNames(records.map((record) => record.name));
+		if (records.length < 3) return records.length === 2 ? `(${safeNames[0]}:0.0,${safeNames[1]}:0.0);` : records.length === 1 ? `(${safeNames[0]}:0.0);` : ";";
 		const width = records[0].sequence.length;
 		if (!width || records.some((record) => record.sequence.length !== width)) throw new Error("FastTree input must be a rectangular alignment.");
 		const numeric = records.map((record, index) => `>${index}\n${record.sequence}`).join("\n") + "\n";
@@ -6425,8 +6445,7 @@ function createDirectFastTreeRunner(javascriptPath, wasmPath) {
 		}
 		let tree = completeNewick(output.join("\n"));
 		records.forEach((record, index) => {
-			const safe = safeName(record.name, index);
-			tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safe}`);
+			tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safeNames[index]}`);
 		});
 		return tree;
 	};

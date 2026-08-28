@@ -6,20 +6,22 @@ webPORPID has one implementation of the read-to-consensus algorithms: a C++20 co
 
 1. A FASTQ byte stream is hashed and, for `.gz` input, decompressed incrementally.
 2. Bounded 256-record/4 MiB batches are distributed across C++/WASM workers for filtering, primer detection, orientation, demultiplexing, and UMI extraction.
-3. Compact binary read records are routed by sample/UMI hash into spool partitions.
+3. Compact binary read records are routed by sample/UMI hash into spool partitions. With a positive `maxReadsPerSample`, a monotone online cutoff prevents records that cannot survive deterministic downsampling from reaching disk.
 4. The partitions are scanned for family counts. Sparse UMI offspring likelihoods and LDA assignments form one run-wide family model.
 5. The model is copied to every worker and the same selected partition records are scanned for family consensus.
 6. Raw-read partitions are closed and deleted. Only consensus and summary data continue into contamination, post-processing, MSA, FastTree, result serialization, and exports.
 
 ## Bounded raw-read storage
 
-The spool is the key memory boundary. A record has a fixed 24-byte header containing its complete record length, sample index, and deterministic sampling hash, followed by UMI, read name, sequence, and quality bytes. Count and consensus passes therefore inspect the header before reading a record body. Records excluded by `maxReadsPerSample` are never materialized again.
+The spool is the key memory boundary. A record has a fixed 24-byte header containing its complete record length, sample index, and deterministic sampling hash, followed by UMI, read name, sequence, and quality bytes. Count and consensus passes therefore inspect the header before reading a record body.
+
+The final downsampling cutoff for a sample is `floor((2^64 - 1) * maximum / final_count)`. During streaming, webPORPID applies the same expression to the count seen so far. That provisional cutoff can only decrease, so it is guaranteed to retain every record that can pass the final cutoff, independent of worker completion order. Non-candidates bypass the spool, and the browser compacts stale early candidates in place every 512 MiB of admitted data and once at the final cutoff. This preserves the selected read set while preventing a highly compressed multi-million-read FASTQ from expanding into an all-read OPFS spool.
 
 - The CLI writes each partition to an isolated temporary directory and removes the directory after consensus, including on errors.
-- A browser analysis uses Origin Private File System synchronous access handles from its dedicated pipeline worker.
+- A browser analysis uses Origin Private File System synchronous access handles from its dedicated pipeline worker. Short reads and writes are completed in loops, and large inputs make a best-effort persistent-storage request. A real quota/I/O failure reports the run spool size and the browser's remaining origin quota instead of presenting a misleading truncated-frame error.
 - If OPFS is unavailable, a bounded in-memory backend is used and stops with a clear error at 512 MiB.
 
-Only one partition per active worker is transferred into WASM at a time. The default 64 hash partitions and default 100,000-read per-sample ceiling keep these working sets substantially smaller than the input dataset. A single unusually dominant UMI family still necessarily requires its selected reads together for faithful consensus.
+Only one partition per active worker is transferred into WASM at a time. The default 64 hash partitions and default 100,000-read per-sample ceiling keep these working sets substantially smaller than the input dataset. Setting the ceiling to zero intentionally disables adaptive admission and retains every demultiplexed read, so the browser must then have enough origin storage for the fully expanded spool. A single unusually dominant UMI family still necessarily requires its selected reads together for faithful consensus.
 
 ## Parallelism and determinism
 
@@ -39,10 +41,10 @@ Alivibe-compatible MSA and FastTree WASM assets are packaged locally; there is n
 
 MSA is monolithic up to 8,000 sequences and 128 MiB of input residues. Beyond either threshold, webPORPID aligns deterministic batches of 2,000 rows against a shared anchor, decomposes every batch into anchor insertion slots, merges slot widths, and reconstructs a rectangular alignment in original order. This bounds each aligner's dynamic-programming workspace while retaining the final alignment required for export and visualization.
 
-FastTree consumes the final nucleotide alignment. The browser uses the packaged BioWASM/Aioli runtime; the CLI invokes the same packaged FastTree WASM directly. Browser tree failure is logged and produces an explicit zero-branch star fallback so a completed analysis remains loadable.
+After non-functional filtering, identical ungapped haplotypes are collapsed. Each representative stores its member UMI-family identifiers; bubble area is therefore proportional to family count rather than read count. FastTree consumes this collapsed nucleotide alignment by default. The uncollapsed alignment is retained for optional on-demand family-level inference. The browser uses the packaged double-precision BioWASM/Aioli FastTree runtime; the CLI invokes the same packaged FastTree WASM directly. Browser tree failure is logged and produces an explicit zero-branch star fallback so a completed analysis remains loadable.
 
 ## Result lifecycle
 
-The post-consensus state is validated, MessagePack encoded, gzip compressed, and prefixed with a versioned `.webporpid` magic header. Loading performs size, framing, schema, type, uniqueness, sample-reference, consensus/postproc-consistency, edit-fingerprint, and alignment/tree-reference checks before the UI receives the bundle. Raw reads and spool records are never serialized. A returned Alivibe/manual edit stores its exact nucleotide FASTA, translation frame, baseline and edited fingerprints, source/time, and refreshed Newick tree in the same project file.
+The post-consensus state is validated, MessagePack encoded, gzip compressed, and prefixed with a versioned `.webporpid` magic header. Loading performs size, framing, schema, type, uniqueness, sample-reference, consensus/postproc-consistency, collapse-membership, edit-fingerprint, and alignment/tree-reference checks before the UI receives the bundle. Raw reads and spool records are never serialized. A returned Alivibe/manual edit stores its exact nucleotide FASTA, translation frame, baseline/edited/tree fingerprints, warnings, source/time, and optional recalculated Newick tree as a separate copy in the same project file.
 
 The same result object backs the browser explorer, CLI `inspect`, and all component exports, so exports do not rerun an algorithm or depend on hidden temporary files.

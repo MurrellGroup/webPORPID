@@ -1,5 +1,6 @@
 import { runAlivibeMsa } from "./alivibe-msa-runtime";
 import { translateAlignedNucleotides } from "./alignment-utils";
+import { collapseAlignment } from "./collapse";
 import { extractAndScorePanel } from "./panel-profile";
 import { runScalableMsa } from "./scalable-msa";
 import type { ApobecResult, ConsensusRecord, ContaminationCall, PipelineConfig, PostprocRecord, SampleSummary } from "./types";
@@ -8,6 +9,9 @@ export interface PostprocessOutput {
   records: PostprocRecord[];
   summaries: SampleSummary[];
   alignments: Record<string, string>;
+  referenceAlignments: Record<string, string>;
+  collapseGroups: Record<string, ReturnType<typeof collapseAlignment>["groups"]>;
+  collapseSeconds: number;
 }
 
 export type MsaRunner = (sequences: readonly string[], signal?: AbortSignal, iterations?: number,
@@ -200,11 +204,12 @@ export async function postprocess(
   runMsa: MsaRunner = runAlivibeMsa, sampleConcurrency = 1,
 ): Promise<PostprocessOutput> {
   const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
-  const outputs: PostprocessOutput[] = Array(config.samples.length); let cursor = 0;
+  const outputs: PostprocessOutput[] = Array(config.samples.length); let cursor = 0, collapseMilliseconds = 0;
   await Promise.all(Array.from({ length: Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
     while (true) {
       const sampleIndex = cursor++; if (sampleIndex >= config.samples.length) return;
       const sample = config.samples[sampleIndex], records: PostprocRecord[] = [], summaries: SampleSummary[] = [], alignments: Record<string, string> = {};
+      const referenceAlignments: Record<string, string> = {}, collapseGroups: PostprocessOutput["collapseGroups"] = {};
     if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
     const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
     const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile)
@@ -218,7 +223,7 @@ export async function postprocess(
         ? await runScalableMsa(preliminary.map(({ record }) => degap(record.sequence)), runMsa, signal, 3, "nucleotide")
         : preliminary.map(({ record }) => degap(record.sequence));
       // The supplied panel is already a reference alignment in PORPID. Align
-      // its profile to the independently aligned sample profile, as Julia does.
+      // its profile to the independently aligned sample profile, matching the reference workflow.
       const panelResult = extractAndScorePanel(candidates, sample.panelSequences.map((record) => record.sequence));
       preliminary.forEach(({ index }, candidate) => {
         extracted.set(index, degap(panelResult.sequences[candidate])); scores[index] = panelResult.scores[candidate];
@@ -228,9 +233,14 @@ export async function postprocess(
       preliminary.forEach(({ record, index }) => extracted.set(index, degap(record.sequence)));
     }
     const accepted = preliminary.filter(({ index }) => panelPass[index]);
-    const acceptedAlignment = accepted.length > 1
-      ? await runScalableMsa(accepted.map(({ index }) => extracted.get(index)!), runMsa, signal, 3, "nucleotide")
-      : accepted.map(({ index }) => extracted.get(index)!);
+    const displayReference = sample.functionalReferenceSequence?.sequence ?? sample.panelSequences[0]?.sequence;
+    let acceptedAlignment: string[] = [], alignedReference = "";
+    if (accepted.length) {
+      const inputs = [...(displayReference ? [degap(displayReference)] : []), ...accepted.map(({ index }) => extracted.get(index)!)];
+      const aligned = inputs.length > 1 ? await runScalableMsa(inputs, runMsa, signal, 3, "nucleotide") : inputs;
+      if (displayReference) { alignedReference = aligned[0]; acceptedAlignment = aligned.slice(1); }
+      else { acceptedAlignment = aligned; alignedReference = alignmentConsensus(aligned); }
+    }
     const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
     const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows: Array<{ name: string; sequence: string }> = [];
     const functionalByIndex = new Map<number, FunctionalOutcome>();
@@ -260,21 +270,33 @@ export async function postprocess(
         panelScore: scores[index], artefactPass, agreementPass, contaminationPass, panelPass: panelPass[index], functionalPass,
         rejectionReasons, apobec: acceptedRow ? apobec(consensus, acceptedRow) : undefined });
     });
+    let collapsedCount = 0;
     if (nucleotideRows.length) {
-      alignments[`${sample.name}/nucleotide`] = fasta(nucleotideRows);
+      const uncollapsed = fasta(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name, records);
+      collapseMilliseconds += performance.now() - collapseStarted;
+      collapsedCount = collapsed.groups.length;
+      alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
+      alignments[`${sample.name}/uncollapsed-nucleotide`] = uncollapsed;
       // Protein exploration is a direct view of every retained nucleotide row,
       // independent of the optional functional filter.  A complete gap codon
       // becomes '-', while mixed/ambiguous/incomplete codons become 'X'.
-      alignments[`${sample.name}/protein`] = fasta(nucleotideRows.map((row) => ({
-        ...row, sequence: translateAlignedNucleotides(row.sequence, 0),
-      })));
+      alignments[`${sample.name}/protein`] = fasta(collapsed.groups.map((group) => {
+        const row = nucleotideRows.find((candidate) => candidate.name === group.representativeId)!;
+        return { ...row, sequence: translateAlignedNucleotides(row.sequence, 0) };
+      }));
+      alignments[`${sample.name}/uncollapsed-protein`] = fasta(nucleotideRows.map((row) => ({ ...row, sequence: translateAlignedNucleotides(row.sequence, 0) })));
+      referenceAlignments[`${sample.name}/nucleotide`] = fasta([{ name: "reference", sequence: alignedReference }]);
+      collapseGroups[sample.name] = collapsed.groups;
     }
     summaries.push({ sample: sample.name, demultiplexedReads: 0, observedUmis: 0, likelyRealUmis: 0,
       consensusSequences: source.length, contaminationPassed: source.filter((record) => !discarded.has(record.id)).length,
-      postprocPassed: accepted.length, functionalPassed: sample.functionalReferenceSequence ? functionalPassed : undefined, artefactCutoff });
-      outputs[sampleIndex] = { records, summaries, alignments };
+      postprocPassed: accepted.length, collapsedSequences: collapsedCount,
+      functionalPassed: sample.functionalReferenceSequence ? functionalPassed : undefined, artefactCutoff });
+      outputs[sampleIndex] = { records, summaries, alignments, referenceAlignments, collapseGroups, collapseSeconds: 0 };
     }
   }));
   return { records: outputs.flatMap((output) => output.records), summaries: outputs.flatMap((output) => output.summaries),
-    alignments: Object.assign({}, ...outputs.map((output) => output.alignments)) };
+    alignments: Object.assign({}, ...outputs.map((output) => output.alignments)),
+    referenceAlignments: Object.assign({}, ...outputs.map((output) => output.referenceAlignments)),
+    collapseGroups: Object.assign({}, ...outputs.map((output) => output.collapseGroups)), collapseSeconds: collapseMilliseconds / 1000 };
 }

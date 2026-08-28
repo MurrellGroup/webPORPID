@@ -141,6 +141,8 @@ export interface SampleSummary {
   consensusSequences: number;
   contaminationPassed: number;
   postprocPassed: number;
+  /** Number of distinct retained nucleotide haplotypes after family-level collapse. */
+  collapsedSequences?: number;
   functionalPassed?: number;
   artefactCutoff: number;
 }
@@ -166,7 +168,7 @@ export interface ResultConfig {
 }
 
 export interface PipelineTiming {
-  stage: "setup" | "preprocessing" | "umi" | "consensus" | "contamination" | "postprocessing" | "tree" | "analysis-total";
+  stage: "setup" | "preprocessing" | "umi" | "consensus" | "contamination" | "postprocessing" | "collapse" | "tree" | "analysis-total";
   seconds: number;
   workItems?: number;
 }
@@ -179,6 +181,32 @@ export interface AlignmentEdit {
   source: string;
   savedUtc: string;
   treeNewick?: string;
+  /** Fingerprint of the alignment used for treeNewick. */
+  treeFingerprint?: string;
+  /** True when the alignment changed after the most recent tree inference. */
+  treeStale?: boolean;
+  warnings?: string[];
+}
+
+export interface CollapseGroup {
+  sample: string;
+  representativeId: string;
+  memberIds: string[];
+  /** One count per retained UMI family; deliberately not a read count. */
+  familyCount: number;
+  minimumAgreement: number;
+}
+
+export interface InputFileMapping {
+  slot: string;
+  role: "reads" | "configuration" | "panel" | "functional-reference" | "contamination-panel";
+  expectedName?: string;
+  uploadedName: string;
+  uploadedSize: number;
+}
+
+export interface RunOptions {
+  deferPhylogeny: boolean;
 }
 
 export interface ResultBundle {
@@ -193,6 +221,13 @@ export interface ResultBundle {
   records: PostprocRecord[];
   alignments: Record<string, string>;
   trees: Record<string, string>;
+  /** Reference rows projected into each stored nucleotide alignment. */
+  referenceAlignments?: Record<string, string>;
+  /** Collapsed haplotypes and the UMI-family members represented by each tip. */
+  collapseGroups?: Record<string, CollapseGroup[]>;
+  /** Exact user-file to configuration-slot assignments used for this run. */
+  inputMappings?: InputFileMapping[];
+  runOptions?: RunOptions;
   /** Manual Alivibe/import corrections, keyed like `sample/nucleotide`. */
   alignmentEdits?: Record<string, AlignmentEdit>;
   /** Optional so results written by webPORPID 0.1.x remain loadable. */
@@ -201,7 +236,7 @@ export interface ResultBundle {
 }
 
 export interface PipelineProgress {
-  stage: "preprocessing" | "umi" | "consensus" | "contamination" | "postprocessing" | "tree" | "complete";
+  stage: "preprocessing" | "umi" | "consensus" | "contamination" | "postprocessing" | "collapse" | "tree" | "complete";
   fraction: number;
   detail: string;
   reads?: number;

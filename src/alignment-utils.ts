@@ -12,7 +12,11 @@ export interface AlignmentInspection {
 
 export interface AlignmentCorrectionInspection extends AlignmentInspection {
   removedRows: string[];
+  addedRows: string[];
+  changedRows: string[];
   removedNucleotides: number;
+  insertedNucleotides: number;
+  substitutedNucleotides: number;
 }
 
 const CODONS: Record<string, string> = {
@@ -90,17 +94,11 @@ export function inspectAlignment(text: string, minimumRows = 2): AlignmentInspec
 
 function ungapped(sequence: string): string { return sequence.replaceAll("-", "").replaceAll("U", "T"); }
 
-function isSubsequence(candidate: string, original: string): boolean {
-  let offset = 0;
-  for (const base of candidate) {
-    offset = original.indexOf(base, offset);
-    if (offset < 0) return false;
-    offset += 1;
-  }
-  return true;
-}
-
-/** Allow gap editing and row/base deletion, but never invented biological content. */
+/**
+ * Validate the FASTA shape without restricting biological edits. Substitutions,
+ * insertions, deletions, renamed rows and removed rows are all retained in the
+ * edit audit so the UI can warn before saving them.
+ */
 export function validateCorrectedAlignment(currentText: string, correctedText: string): AlignmentCorrectionInspection {
   // A run can legitimately contain a single passing consensus.  Alivibe and
   // manual correction must still round-trip that alignment even though tree
@@ -110,17 +108,21 @@ export function validateCorrectedAlignment(currentText: string, correctedText: s
   const currentByName = new Map(current.records.map((record) => [record.name, record.sequence]));
   const correctedNames = new Set(corrected.records.map((record) => record.name));
   const removedRows = current.records.filter((record) => !correctedNames.has(record.name)).map((record) => record.name);
-  const added = corrected.records.filter((record) => !currentByName.has(record.name)).map((record) => record.name);
-  if (added.length) throw new Error(`The corrected alignment contains unexpected or renamed rows: ${added.slice(0, 4).join(", ")}${added.length > 4 ? "…" : ""}.`);
-  let removedNucleotides = 0;
+  const addedRows = corrected.records.filter((record) => !currentByName.has(record.name)).map((record) => record.name);
+  const changedRows: string[] = [];
+  let removedNucleotides = 0, insertedNucleotides = 0, substitutedNucleotides = 0;
   for (const record of corrected.records) {
-    const original = ungapped(currentByName.get(record.name)!);
+    const originalAligned = currentByName.get(record.name);
+    if (originalAligned == null) continue;
+    const original = ungapped(originalAligned);
     const replacement = ungapped(record.sequence);
-    if (!isSubsequence(replacement, original))
-      throw new Error(`The ungapped sequence for ${record.name} contains a substitution, inserted base, or changed order.`);
-    removedNucleotides += original.length - replacement.length;
+    if (original !== replacement || originalAligned !== record.sequence) changedRows.push(record.name);
+    const shared = Math.min(original.length, replacement.length);
+    for (let index = 0; index < shared; index += 1) if (original[index] !== replacement[index]) substitutedNucleotides += 1;
+    removedNucleotides += Math.max(0, original.length - replacement.length);
+    insertedNucleotides += Math.max(0, replacement.length - original.length);
   }
-  return { ...corrected, removedRows, removedNucleotides };
+  return { ...corrected, removedRows, addedRows, changedRows, removedNucleotides, insertedNucleotides, substitutedNucleotides };
 }
 
 export function translateAlignedNucleotides(sequence: string, frameOffset: number = 0): string {
@@ -138,9 +140,14 @@ export function translateAlignmentFasta(fasta: string, frameOffset: AlignmentFra
   return exactFasta(inspected.records.map((record) => ({ ...record, sequence: translateAlignedNucleotides(record.sequence, frameOffset) })));
 }
 
-export function alignmentKey(sample: string): string { return `${sample}/nucleotide`; }
+export type AlignmentVariant = "collapsed" | "uncollapsed";
 
-export function effectiveAlignment(bundle: ResultBundle, sample: string): { fasta?: string; edit?: AlignmentEdit; frameOffset: AlignmentFrameOffset } {
-  const key = alignmentKey(sample), edit = bundle.alignmentEdits?.[key];
-  return { fasta: edit?.fasta ?? bundle.alignments[key], edit, frameOffset: edit?.frameOffset ?? 0 };
+export function alignmentKey(sample: string, variant: AlignmentVariant = "collapsed"): string {
+  return variant === "collapsed" ? `${sample}/nucleotide` : `${sample}/uncollapsed-nucleotide`;
+}
+
+export function effectiveAlignment(bundle: ResultBundle, sample: string, variant: AlignmentVariant = "collapsed"): { fasta?: string; edit?: AlignmentEdit; frameOffset: AlignmentFrameOffset; key: string } {
+  const key = alignmentKey(sample, variant), edit = bundle.alignmentEdits?.[key];
+  const legacyFallback = variant === "uncollapsed" && !bundle.collapseGroups?.[sample] ? bundle.alignments[alignmentKey(sample)] : undefined;
+  return { fasta: edit?.fasta ?? bundle.alignments[key] ?? legacyFallback, edit, frameOffset: edit?.frameOffset ?? 0, key };
 }

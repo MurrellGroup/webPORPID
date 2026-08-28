@@ -1,6 +1,7 @@
 import Aioli from "@biowasm/aioli";
 import fastTreeWasmUrl from "/biowasm/fasttree/fasttree.wasm?url";
 import { parseFasta } from "./config";
+import { treeTipNames } from "./tree-names";
 
 interface AioliRuntime {
   write(options: { path: string; buffer: Uint8Array }): Promise<void>;
@@ -23,10 +24,10 @@ function completeNewick(output: string) {
 
 export async function runFastTree(alignedFasta: string, alphabet: "nt" | "aa" = "nt"): Promise<string> {
   const records = parseFasta(alignedFasta);
-  const safeName = (name: string, index: number) => name.replace(/[^A-Za-z0-9_.|*+\-]/g, "_") || `tip_${index + 1}`;
+  const safeNames = treeTipNames(records.map((record) => record.name));
   if (records.length < 3) return records.length === 2
-    ? `(${safeName(records[0].name, 0)}:0.0,${safeName(records[1].name, 1)}:0.0);`
-    : records.length === 1 ? `(${safeName(records[0].name, 0)}:0.0);` : ";";
+    ? `(${safeNames[0]}:0.0,${safeNames[1]}:0.0);`
+    : records.length === 1 ? `(${safeNames[0]}:0.0);` : ";";
   const width = records[0].sequence.length;
   if (!width || records.some((record) => record.sequence.length !== width)) throw new Error("FastTree input must be a rectangular alignment.");
   const numeric = records.map((record, index) => `>${index}\n${record.sequence}`).join("\n") + "\n";
@@ -34,8 +35,7 @@ export async function runFastTree(alignedFasta: string, alphabet: "nt" | "aa" = 
   await cli.write({ path, buffer: new TextEncoder().encode(numeric) });
   let tree = completeNewick(await cli.exec(alphabet === "nt" ? `fasttree -nosupport -nt -gtr ${path}` : `fasttree -nosupport ${path}`));
   records.forEach((record, index) => {
-    const safe = safeName(record.name, index);
-    tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safe}`);
+    tree = tree.replace(new RegExp(`([,(])${index}(?=[:),])`, "g"), `$1${safeNames[index]}`);
   });
   return tree;
 }

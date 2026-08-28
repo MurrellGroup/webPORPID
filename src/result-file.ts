@@ -64,6 +64,7 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     if (!sampleSet.has(sample) || summarySamples.has(sample)) throw new Error("Result summaries contain an unknown or duplicate sample."); summarySamples.add(sample);
     for (const key of ["demultiplexedReads", "observedUmis", "likelyRealUmis", "consensusSequences", "contaminationPassed", "postprocPassed", "artefactCutoff"])
       count(row[key], `summaries[${index}].${key}`);
+    if (row.collapsedSequences != null) count(row.collapsedSequences, `summaries[${index}].collapsedSequences`);
     if (row.functionalPassed != null) count(row.functionalPassed, `summaries[${index}].functionalPassed`);
   });
   if (summarySamples.size !== samples.length) throw new Error("Result summaries are missing a configured sample.");
@@ -103,7 +104,7 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     bool(row.flagged, "contamination flagged"); bool(row.discarded, "contamination discarded"); bool(row.suspectOnly, "contamination suspectOnly");
   });
 
-  const recordIds = new Set<string>();
+  const recordIds = new Set<string>(), recordMetadata = new Map<string, { sample: string; alignedNt?: string; minimumAgreement: number }>();
   array(bundle.records, "records").forEach((entry, index) => {
     const row = object(entry, `records[${index}]`), id = text(row.id, `records[${index}].id`);
     if (recordIds.has(id)) throw new Error("Post-processing identifiers must be unique."); recordIds.add(id);
@@ -113,10 +114,12 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     if (umi !== source.umi || familySize !== source.familySize || minimumAgreement !== source.minimumAgreement)
       throw new Error("A post-processing record has inconsistent consensus metadata.");
     const consensusNt = text(row.consensusNt, "postproc consensus"); if (consensusNt !== source.sequence) throw new Error("A post-processing record has inconsistent consensus sequence data.");
-    optionalText(row.alignedNt, "postproc aligned sequence"); optionalText(row.trimmedNt, "postproc trimmed nucleotide"); optionalText(row.trimmedAa, "postproc trimmed protein");
+    const alignedNt = row.alignedNt == null ? undefined : text(row.alignedNt, "postproc aligned sequence");
+    optionalText(row.trimmedNt, "postproc trimmed nucleotide"); optionalText(row.trimmedAa, "postproc trimmed protein");
     numeric(row.panelScore, "postproc panel score"); for (const key of ["artefactPass", "agreementPass", "contaminationPass", "panelPass"]) bool(row[key], `postproc ${key}`);
     optionalBool(row.functionalPass, "postproc functionalPass"); array(row.rejectionReasons, "postproc rejectionReasons").forEach((reason) => text(reason, "postproc rejection reason"));
     if (row.apobec != null) { const model = object(row.apobec, "postproc APOBEC"); for (const key of ["posteriorMeanGaMultiplier", "posteriorGaInflated", "posteriorMeanMutationRate", "gaMutations", "totalMutations"]) numeric(model[key], `APOBEC ${key}`); }
+    recordMetadata.set(id, { sample, alignedNt, minimumAgreement });
   });
   if (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id)))
     throw new Error("Consensus and post-processing records are inconsistent.");
@@ -126,9 +129,61 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       text(name, `${label} name`); text(contents, `${label}.${name}`);
       const sample = name.split("/", 1)[0]; knownSample(sample, `${label}.${name}`);
     }
+  if (bundle.referenceAlignments != null) for (const [name, contents] of Object.entries(object(bundle.referenceAlignments, "referenceAlignments"))) {
+    const sample = name.split("/", 1)[0]; knownSample(sample, `referenceAlignments.${name}`);
+    const reference = inspectAlignment(text(contents, `referenceAlignments.${name}`), 1);
+    const nucleotide = object(bundle.alignments, "alignments")[name];
+    if (nucleotide != null && inspectAlignment(text(nucleotide, `alignments.${name}`), 1).columns !== reference.columns)
+      throw new Error("A stored reference row does not match its nucleotide alignment width.");
+  }
+  if (bundle.collapseGroups != null) for (const [sample, rawGroups] of Object.entries(object(bundle.collapseGroups, "collapseGroups"))) {
+    knownSample(sample, `collapseGroups.${sample}`);
+    const representatives = new Set<string>(), membersSeen = new Set<string>();
+    const collapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/nucleotide`], `alignments.${sample}/nucleotide`), 1);
+    const uncollapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/uncollapsed-nucleotide`], `alignments.${sample}/uncollapsed-nucleotide`), 1);
+    const collapsedByName = new Map(collapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+    const uncollapsedByName = new Map(uncollapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+    array(rawGroups, `collapseGroups.${sample}`).forEach((rawGroup, index) => {
+      const group = object(rawGroup, `collapseGroups.${sample}[${index}]`);
+      if (text(group.sample, "collapse group sample") !== sample) throw new Error("A collapse group has an inconsistent sample.");
+      const representative = text(group.representativeId, "collapse representative");
+      if (representatives.has(representative)) throw new Error("Collapse representative identifiers must be unique.");
+      representatives.add(representative);
+      const members = array(group.memberIds, "collapse members").map((entry) => text(entry, "collapse member"));
+      if (!members.includes(representative)) throw new Error("A collapse group must include its representative.");
+      if (count(group.familyCount, "collapse family count") !== members.length) throw new Error("Collapse counts must count UMI families.");
+      const representativeSequence = collapsedByName.get(representative);
+      if (representativeSequence == null) throw new Error("A collapse representative is missing from the collapsed alignment.");
+      const agreements: number[] = [];
+      for (const member of members) {
+        if (membersSeen.has(member)) throw new Error("A retained UMI family occurs in more than one collapse group.");
+        membersSeen.add(member);
+        if (uncollapsedByName.get(member) !== representativeSequence) throw new Error("A collapse group contains different nucleotide haplotypes.");
+        const metadata = recordMetadata.get(member);
+        if (!metadata || metadata.sample !== sample || metadata.alignedNt == null) throw new Error("A collapse member is not a retained UMI-family consensus.");
+        agreements.push(metadata.minimumAgreement);
+      }
+      if (numeric(group.minimumAgreement, "collapse minimum agreement") !== Math.min(...agreements))
+        throw new Error("A collapse group has inconsistent minimum-agreement metadata.");
+    });
+    if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length)
+      throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
+    const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
+    if (summary?.collapsedSequences != null && count(summary.collapsedSequences, "summary collapsed count") !== representatives.size)
+      throw new Error("A summary has an inconsistent collapsed haplotype count.");
+  }
+  if (bundle.inputMappings != null) array(bundle.inputMappings, "inputMappings").forEach((rawMapping, index) => {
+    const mapping = object(rawMapping, `inputMappings[${index}]`);
+    text(mapping.slot, "input slot");
+    if (!["reads", "configuration", "panel", "functional-reference", "contamination-panel"].includes(text(mapping.role, "input role")))
+      throw new Error("An input mapping has an unknown role.");
+    optionalText(mapping.expectedName, "expected filename");
+    text(mapping.uploadedName, "uploaded filename"); count(mapping.uploadedSize, "uploaded size");
+  });
+  if (bundle.runOptions != null) bool(object(bundle.runOptions, "runOptions").deferPhylogeny, "runOptions.deferPhylogeny");
   if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
     const sample = name.split("/", 1)[0]; knownSample(sample, `alignmentEdits.${name}`);
-    if (name !== `${sample}/nucleotide`) throw new Error("Edited alignment keys must end in /nucleotide.");
+    if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide`) throw new Error("Edited alignment keys must identify a stored nucleotide view.");
     const edit = object(rawEdit, `alignmentEdits.${name}`), fasta = text(edit.fasta, `alignmentEdits.${name}.fasta`);
     const frameOffset = count(edit.frameOffset, `alignmentEdits.${name}.frameOffset`);
     if (frameOffset > 2) throw new Error("Edited alignment frame offsets must be 0, 1, or 2.");
@@ -136,7 +191,12 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     const editedFingerprint = text(edit.editedFingerprint, `alignmentEdits.${name}.editedFingerprint`);
     text(edit.source, `alignmentEdits.${name}.source`); text(edit.savedUtc, `alignmentEdits.${name}.savedUtc`);
     optionalText(edit.treeNewick, `alignmentEdits.${name}.treeNewick`);
-    const original = text(object(bundle.alignments, "alignments")[name], `alignments.${name}`);
+    optionalText(edit.treeFingerprint, `alignmentEdits.${name}.treeFingerprint`);
+    optionalBool(edit.treeStale, `alignmentEdits.${name}.treeStale`);
+    if (edit.warnings != null) array(edit.warnings, `alignmentEdits.${name}.warnings`).forEach((warning) => text(warning, "alignment edit warning"));
+    const storedAlignments = object(bundle.alignments, "alignments");
+    const originalValue = storedAlignments[name] ?? (name === `${sample}/uncollapsed-nucleotide` ? storedAlignments[`${sample}/nucleotide`] : undefined);
+    const original = text(originalValue, `alignments.${name}`);
     if (inspectAlignment(original, 1).fingerprint !== baselineFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent baseline fingerprint.`);
     if (inspectAlignment(fasta, 1).fingerprint !== editedFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent fingerprint.`);
     validateCorrectedAlignment(original, fasta);
@@ -144,7 +204,7 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   if (bundle.timings != null) array(bundle.timings, "timings").forEach((entry, index) => {
     const timing = object(entry, `timings[${index}]`);
     const stage = text(timing.stage, `timings[${index}].stage`);
-    if (!["setup", "preprocessing", "umi", "consensus", "contamination", "postprocessing", "tree", "analysis-total"].includes(stage))
+    if (!["setup", "preprocessing", "umi", "consensus", "contamination", "postprocessing", "collapse", "tree", "analysis-total"].includes(stage))
       throw new Error(`timings[${index}] has an unknown stage.`);
     const seconds = numeric(timing.seconds, `timings[${index}].seconds`);
     if (seconds < 0) throw new Error(`timings[${index}].seconds must be non-negative.`);
@@ -182,7 +242,8 @@ const passed = (record: ResultBundle["records"][number]) => record.artefactPass 
 
 export type ExportKind = "consensus-fasta" | "passed-consensus-fasta" | "rejected-consensus-fasta" | "trimmed-nt-fasta" | "trimmed-aa-fasta"
   | "family-csv" | "low-agreement-csv" | "contamination-csv" | "postproc-csv" | "apobec-csv"
-  | "nucleotide-alignment" | "protein-alignment" | "newick" | "log";
+  | "collapse-csv" | "nucleotide-alignment" | "protein-alignment" | "newick"
+  | "uncollapsed-nucleotide-alignment" | "uncollapsed-protein-alignment" | "uncollapsed-newick" | "log";
 
 function alignmentSample(bundle: ResultBundle, sample?: string) {
   if (sample) return sample;
@@ -219,6 +280,13 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
       ["sample", "id", "posterior_mean_GA_multiplier", "posterior_probability_GA_inflated", "posterior_mean_mutation_rate", "GA_mutations", "total_mutations"],
       records.filter((row) => row.apobec).map((row) => [row.sample, row.id, row.apobec!.posteriorMeanGaMultiplier, row.apobec!.posteriorGaInflated, row.apobec!.posteriorMeanMutationRate, row.apobec!.gaMutations, row.apobec!.totalMutations]),
     ) };
+    case "collapse-csv": {
+      const selected = alignmentSample(bundle, sample);
+      return { extension: "collapsed-families.csv", mime: "text/csv", text: csv(
+        ["sample", "representative_id", "family_count", "minimum_agreement", "member_ids"],
+        (bundle.collapseGroups?.[selected] ?? []).map((group) => [selected, group.representativeId, group.familyCount, group.minimumAgreement, group.memberIds.join(";")]),
+      ) };
+    }
     case "nucleotide-alignment": {
       const selected = alignmentSample(bundle, sample), key = `${selected}/nucleotide`;
       return { extension: "nucleotide-alignment.fasta", mime: "text/x-fasta", text: bundle.alignmentEdits?.[key]?.fasta ?? bundle.alignments[key] ?? "" };
@@ -229,6 +297,19 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
       return { extension: "protein-alignment.fasta", mime: "text/x-fasta", text: nucleotide ? translateAlignmentFasta(nucleotide, edit?.frameOffset ?? 0) : "" };
     }
     case "newick": { const selected = alignmentSample(bundle, sample), key = `${selected}/nucleotide`, edit = bundle.alignmentEdits?.[key]; return { extension: "tree.newick", mime: "text/plain", text: edit ? edit.treeNewick ?? "" : bundle.trees[key] ?? "" }; }
+    case "uncollapsed-nucleotide-alignment": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/uncollapsed-nucleotide`, edit = bundle.alignmentEdits?.[key];
+      return { extension: "uncollapsed-nucleotide-alignment.fasta", mime: "text/x-fasta", text: edit?.fasta ?? bundle.alignments[key] ?? bundle.alignments[`${selected}/nucleotide`] ?? "" };
+    }
+    case "uncollapsed-protein-alignment": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/uncollapsed-nucleotide`, edit = bundle.alignmentEdits?.[key];
+      const nucleotide = edit?.fasta ?? bundle.alignments[key] ?? bundle.alignments[`${selected}/nucleotide`];
+      return { extension: "uncollapsed-protein-alignment.fasta", mime: "text/x-fasta", text: nucleotide ? translateAlignmentFasta(nucleotide, edit?.frameOffset ?? 0) : "" };
+    }
+    case "uncollapsed-newick": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/uncollapsed-nucleotide`, edit = bundle.alignmentEdits?.[key];
+      return { extension: "uncollapsed-tree.newick", mime: "text/plain", text: edit?.treeNewick ?? bundle.trees[key] ?? "" };
+    }
     case "log": return { extension: "log.txt", mime: "text/plain", text: bundle.log.join("\n") + "\n" };
   }
 }
