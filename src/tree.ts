@@ -150,36 +150,130 @@ export function serializeNewick(node: TreeNode): string {
   return visit(node, true);
 }
 
-export function rootOnOutgroup(root: TreeNode, outgroupName: string): TreeNode {
-  const adjacency = new Map<TreeNode, Array<{ node: TreeNode; length: number }>>();
-  let outgroup: TreeNode | null = null;
-  const visit = (node: TreeNode, parent?: TreeNode) => {
-    if (!node.children.length && node.name === outgroupName) outgroup = node;
+type UndirectedTree = Map<TreeNode, Array<{ node: TreeNode; length: number }>>;
+
+function undirectedTree(root: TreeNode): { adjacency: UndirectedTree; leaves: TreeNode[] } {
+  const adjacency: UndirectedTree = new Map(), leaves: TreeNode[] = [];
+  const visit = (node: TreeNode) => {
     if (!adjacency.has(node)) adjacency.set(node, []);
+    if (!node.children.length) leaves.push(node);
     for (const child of node.children) {
       adjacency.get(node)!.push({ node: child, length: child.length });
-      adjacency.set(child, [{ node, length: child.length }]);
-      visit(child, node);
+      if (!adjacency.has(child)) adjacency.set(child, []);
+      adjacency.get(child)!.push({ node, length: child.length });
+      visit(child);
     }
-    void parent;
   };
   visit(root);
-  if (!outgroup) throw new Error(`The tree does not contain the outgroup ${outgroupName}.`);
-  const neighbor = adjacency.get(outgroup)?.[0];
-  if (!neighbor) return root;
-  const orient = (node: TreeNode, parent: TreeNode, branchLength: number): TreeNode => ({
+  return { adjacency, leaves };
+}
+
+function orientTree(adjacency: UndirectedTree, node: TreeNode, parent: TreeNode, branchLength: number): TreeNode {
+  return {
     name: node.name,
     length: branchLength,
-    children: (adjacency.get(node) ?? []).filter((edge) => edge.node !== parent).map((edge) => orient(edge.node, node, edge.length)),
-  });
+    children: (adjacency.get(node) ?? [])
+      .filter((edge) => edge.node !== parent)
+      .map((edge) => orientTree(adjacency, edge.node, node, edge.length)),
+  };
+}
+
+export function rootOnOutgroup(root: TreeNode, outgroupName: string): TreeNode {
+  const { adjacency, leaves } = undirectedTree(root);
+  const outgroup = leaves.find((leaf) => leaf.name === outgroupName) ?? null;
+  if (!outgroup) throw new Error(`The tree does not contain the outgroup ${outgroupName}.`);
+  if (leaves.length === 1) return { ...outgroup, length: 0, children: [] };
+  const neighbor = adjacency.get(outgroup)?.[0];
+  if (!neighbor) return { ...outgroup, length: 0, children: [] };
   // The N-masked germline represents the UCA anchor, not an ordinary sampled
   // outgroup. Place the root exactly at that tip: its root edge is zero and
   // the ingroup receives the complete original connecting-edge length.
   return {
     name: "",
     length: 0,
-    children: [orient(outgroup, neighbor.node, 0), orient(neighbor.node, outgroup, neighbor.length)],
+    children: [orientTree(adjacency, outgroup, neighbor.node, 0), orientTree(adjacency, neighbor.node, outgroup, neighbor.length)],
   };
+}
+
+/**
+ * Root at the exact midpoint of the longest leaf-to-leaf path. Only the edge
+ * containing that midpoint is split; all other topology and lengths are
+ * copied verbatim, so every pairwise patristic distance is preserved.
+ */
+export function midpointRoot(root: TreeNode): TreeNode {
+  const { adjacency, leaves } = undirectedTree(root);
+  if (leaves.length <= 1) return { ...(leaves[0] ?? root), length: 0, children: [] };
+
+  interface WalkResult {
+    leaf: TreeNode;
+    distance: number;
+    parent: Map<TreeNode, { node: TreeNode; length: number }>;
+  }
+  const walk = (start: TreeNode): WalkResult => {
+    const distances = new Map<TreeNode, number>([[start, 0]]);
+    const parent = new Map<TreeNode, { node: TreeNode; length: number }>();
+    const stack: Array<{ node: TreeNode; previous?: TreeNode }> = [{ node: start }];
+    while (stack.length) {
+      const { node, previous } = stack.pop()!;
+      for (const edge of adjacency.get(node) ?? []) {
+        if (edge.node === previous) continue;
+        // Negative inferred lengths do not define a metric. Match the
+        // phylogram renderer by treating them as zero while locating the
+        // midpoint; untouched edge values are nevertheless retained below.
+        const metricLength = Number.isFinite(edge.length) ? Math.max(0, edge.length) : 0;
+        distances.set(edge.node, (distances.get(node) ?? 0) + metricLength);
+        parent.set(edge.node, { node, length: edge.length });
+        stack.push({ node: edge.node, previous: node });
+      }
+    }
+    const candidates = leaves.slice().sort((left, right) => left.name.localeCompare(right.name));
+    let leaf = candidates[0], distance = distances.get(leaf) ?? Number.NEGATIVE_INFINITY;
+    for (const candidate of candidates.slice(1)) {
+      const value = distances.get(candidate) ?? Number.NEGATIVE_INFINITY;
+      if (value > distance) { leaf = candidate; distance = value; }
+    }
+    return { leaf, distance, parent };
+  };
+
+  // Two weighted-tree sweeps find the diameter endpoints in linear time.
+  const first = walk(leaves.slice().sort((left, right) => left.name.localeCompare(right.name))[0]);
+  const diameter = walk(first.leaf);
+  if (!(diameter.distance > 0)) return { ...root, length: 0, children: root.children.map((child) => ({ ...child })) };
+
+  const reversedNodes: TreeNode[] = [diameter.leaf], reversedLengths: number[] = [];
+  let cursor = diameter.leaf;
+  while (cursor !== first.leaf) {
+    const step = diameter.parent.get(cursor);
+    if (!step) throw new Error("Could not reconstruct the tree diameter while midpoint-rooting.");
+    reversedLengths.push(step.length); cursor = step.node; reversedNodes.push(cursor);
+  }
+  const pathNodes = reversedNodes.reverse(), pathLengths = reversedLengths.reverse();
+  const target = diameter.distance / 2, tolerance = Math.max(1, diameter.distance) * 1e-12;
+  const rootAtNode = (node: TreeNode): TreeNode => ({
+    name: node.name,
+    length: 0,
+    children: (adjacency.get(node) ?? []).map((edge) => orientTree(adjacency, edge.node, node, edge.length)),
+  });
+  let travelled = 0;
+  for (let index = 0; index < pathLengths.length; index += 1) {
+    if (Math.abs(target - travelled) <= tolerance) return rootAtNode(pathNodes[index]);
+    const rawLength = pathLengths[index], length = Number.isFinite(rawLength) ? Math.max(0, rawLength) : 0;
+    const next = travelled + length;
+    if (target < next - tolerance) {
+      const leftLength = target - travelled, rightLength = length - leftLength;
+      return {
+        name: "",
+        length: 0,
+        children: [
+          orientTree(adjacency, pathNodes[index], pathNodes[index + 1], leftLength),
+          orientTree(adjacency, pathNodes[index + 1], pathNodes[index], rightLength),
+        ],
+      };
+    }
+    if (Math.abs(target - next) <= tolerance) return rootAtNode(pathNodes[index + 1]);
+    travelled = next;
+  }
+  return rootAtNode(pathNodes.at(-1)!);
 }
 
 /** Reorder children for display without changing topology or branch lengths. */

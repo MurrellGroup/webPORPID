@@ -27,13 +27,15 @@ test("porpid-cli runs, inspects, and exports a complete synthetic analysis", asy
     const reads = join(directory, "reads.fastq.gz"); await writeFile(reads, gzipSync(fastq));
     await writeFile(join(directory, "panels", "panel.fasta"), `>reference\n${reverseComplement(payload)}\n`);
     await writeFile(join(directory, "panels", "contam.fasta"), ">external\nACGTACGTACGTACGT\n");
-    await writeFile(join(directory, "config.yaml"), `dataset: synthetic\nsamples:\n  sample_1:\n    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fasta\n  sample_2:\n    cDNA_primer: CCGCTtgcattNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fasta\ncontaminationPanel: panels/contam.fasta\nparameters:\n  minLength: 20\n  maxLength: 300\n  primerTolerance: 0\n  primerWindow: 150\n  contaminationFilter: false\n  panelThreshold: 1000\n  spoolPartitions: 8\n`);
+    await writeFile(join(directory, "config.yaml"), `dataset: synthetic\nsamples:\n  sample_1:\n    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fasta\n  sample_2:\n    cDNA_primer: CCGCTtgcattNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fasta\ncontaminationPanel: panels/contam.fasta\nparameters:\n  minLength: 20\n  maxLength: 300\n  primerTolerance: 0\n  primerWindow: 150\n  contaminationFilter: true\n  contaminationDistanceThreshold: 0\n  panelThreshold: 1000\n  spoolPartitions: 8\n`);
     const cli = resolve("cli/porpid-cli.mjs"), executable = process.env.WEBPORPID_CLI_EXECUTABLE || process.execPath;
     const prefix = process.env.WEBPORPID_CLI_EXECUTABLE ? [] : [cli], result = join(directory, "result.webporpid");
     await execute(executable, [...prefix, "run", reads, "--config", join(directory, "config.yaml"), "--output", result, "--workers", "2"], { timeout: 60_000 });
     const inspected = await execute(executable, [...prefix, "inspect", result]); const summary = JSON.parse(inspected.stdout);
     assert.equal(summary.quality.totalReads, 10); assert.equal(summary.quality.demultiplexedReads, 10);
     assert.equal(summary.components.consensuses, 2); assert.equal(summary.components.families, 2);
+    assert.equal(summary.components.contaminationReferences, 1);
+    assert.equal(summary.summaries[0].selectedReads, 5); assert.equal(summary.summaries[0].downsampledReads, 0);
     assert.equal(summary.components.collapsedHaplotypes, 2);
     assert(summary.components.alignments.includes("sample_1/uncollapsed-nucleotide"));
     assert(summary.timings.some((entry) => entry.stage === "collapse"));

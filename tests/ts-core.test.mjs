@@ -8,21 +8,23 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { build } from "rolldown";
 import { gunzipSync } from "fflate";
 
-import { inspectAlignment, translateAlignmentFasta, validateCorrectedAlignment } from "../src/alignment-utils.ts";
+import { inspectAlignment, summarizeAlignmentChanges, translateAlignmentFasta, validateCorrectedAlignment } from "../src/alignment-utils.ts";
 import { referenceDisplayColumns } from "../src/alignment-regions.ts";
 import {
   ALIVIBE_BRIDGE_VERSION, ALIVIBE_SOURCE_REVISION, assertAlivibeInitialLoad, assertAlivibeRoundTripTarget,
   loadAlivibeNucleotideFasta, readAlivibeNucleotideFasta,
 } from "../src/alivibe-roundtrip.ts";
 import { decodeResult, encodeResult, exportComponent } from "../src/result-file.ts";
+import { deduplicateContaminationCalls } from "../src/contamination.ts";
 import { collapseAlignment } from "../src/collapse.ts";
 import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
+import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
 import { adaptiveSpoolCutoff, PartitionStore, writeAllSync } from "../src/partition-store.ts";
 import { runScalableMsa } from "../src/scalable-msa.ts";
 import { parseSpoolRecordHeader, selectSpoolChunks } from "../src/spool-record.ts";
-import { layoutTree, parseNewick } from "../src/tree.ts";
+import { layoutTree, midpointRoot, parseNewick, rootOnOutgroup } from "../src/tree.ts";
 import { treeTipNames } from "../src/tree-names.ts";
 
 function spoolRecord(sample, hash, umi = "AACCGGTT", name = "read", sequence = "ACGT") {
@@ -53,6 +55,42 @@ function tarEntries(archive) {
     offset += 512; entries.set(name, bytes.slice(offset, offset + size)); offset += Math.ceil(size / 512) * 512;
   }
   return entries;
+}
+
+function pairwiseLeafDistances(root) {
+  const adjacency = new Map(), leaves = [];
+  const visit = (node) => {
+    if (!adjacency.has(node)) adjacency.set(node, []);
+    if (!node.children.length) leaves.push(node);
+    for (const child of node.children) {
+      adjacency.get(node).push({ node: child, length: child.length });
+      if (!adjacency.has(child)) adjacency.set(child, []);
+      adjacency.get(child).push({ node, length: child.length }); visit(child);
+    }
+  };
+  visit(root); const result = new Map();
+  for (let left = 0; left < leaves.length; left += 1) {
+    const distances = new Map([[leaves[left], 0]]), stack = [{ node: leaves[left], parent: undefined }];
+    while (stack.length) {
+      const { node, parent } = stack.pop();
+      for (const edge of adjacency.get(node) ?? []) if (edge.node !== parent) {
+        distances.set(edge.node, distances.get(node) + edge.length); stack.push({ node: edge.node, parent: node });
+      }
+    }
+    for (let right = left + 1; right < leaves.length; right += 1)
+      result.set([leaves[left].name, leaves[right].name].sort().join("|"), distances.get(leaves[right]));
+  }
+  return result;
+}
+
+function rootToLeafDistances(root) {
+  const output = new Map(), stack = [{ node: root, distance: 0 }];
+  while (stack.length) {
+    const { node, distance } = stack.pop();
+    if (!node.children.length) output.set(node.name, distance);
+    else node.children.forEach((child) => stack.push({ node: child, distance: distance + child.length }));
+  }
+  return output;
 }
 
 class MemoryScratchWritable {
@@ -171,6 +209,23 @@ test("single-tip Newick trees remain renderable", () => {
   assert.equal(tree.children[0].length, 0);
 });
 
+test("modal-tip and midpoint rooting preserve topology, tips, and every patristic distance", () => {
+  const original = parseNewick("(((a:1,b:2):3,c:4):2,(d:5,e:1):6);");
+  const expected = pairwiseLeafDistances(original);
+  const modalRooted = rootOnOutgroup(original, "a"), midpointRooted = midpointRoot(original);
+  for (const rerooted of [modalRooted, midpointRooted]) {
+    const observed = pairwiseLeafDistances(rerooted);
+    assert.deepEqual([...observed.keys()].sort(), [...expected.keys()].sort());
+    for (const [pair, distance] of expected)
+      assert(Math.abs(observed.get(pair) - distance) < 1e-12, `${pair} changed after rerooting`);
+  }
+  assert.equal(modalRooted.children.find((child) => child.name === "a")?.length, 0, "the modal-tip edge must be exactly zero");
+  assert.equal(modalRooted.children.find((child) => child.name !== "a")?.length, 1, "the opposite root edge retains the complete pendant length");
+  const midpointDepths = rootToLeafDistances(midpointRooted);
+  assert.equal(midpointDepths.get("b"), 9); assert.equal(midpointDepths.get("d"), 9);
+  assert.deepEqual([...rootToLeafDistances(rootOnOutgroup(parseNewick("(only:0);"), "only")).keys()], ["only"], "single-tip rerooting must not create a phantom leaf");
+});
+
 test("FastTree tip identifiers remain unique after Newick sanitization", () => {
   assert.deepEqual(treeTipNames(["a b", "a=b", "a_b"]), ["a_b", "a_b__2_1", "a_b__3_1"]);
 });
@@ -196,8 +251,15 @@ test("aligned translation, permissive edit validation, and Swig tree scaling sta
   assert.equal(corrected.removedNucleotides, 2);
   const biologicalEdit = validateCorrectedAlignment(">a\nATGCCC\n>b\nATGCCC\n", ">a\nATGACC-\n>renamed\nATGCCCC\n");
   assert.equal(biologicalEdit.substitutedNucleotides, 1);
+  assert.deepEqual(biologicalEdit.rowChanges.map((row) => [row.name, row.substitutedNucleotides]), [["a", 1]]);
   assert.equal(biologicalEdit.addedRows.length, 1);
   assert.equal(biologicalEdit.removedRows.length, 1);
+  const shiftedInsertion = validateCorrectedAlignment(">a\nAACCGG\n", ">a\nAACTCGG\n");
+  assert.equal(shiftedInsertion.insertedNucleotides, 1); assert.equal(shiftedInsertion.substitutedNucleotides, 0);
+  const removedWithoutReordering = summarizeAlignmentChanges(">a\nAAAA\n>b\nAAAA\n>c\nAAAA\n", ">a\nAAAA\n>c\nAAAA\n");
+  assert.equal(removedWithoutReordering.rowOrderChanged, false);
+  const reordered = summarizeAlignmentChanges(">a\nAAAA\n>b\nAAAA\n>c\nAAAA\n", ">c\nAAAA\n>a\nAAAA\n>b\nAAAA\n");
+  assert.equal(reordered.rowOrderChanged, true);
   const layout = layoutTree(parseNewick("(a:0.001,b:0.002);"), 500, 20, "phylogram", 20, 10);
   assert.equal(layout.leaves, 2); assert.equal(layout.maximumDistance, 0.002);
   assert(Math.max(...layout.nodes.map((node) => node.x)) > 400, "ordinary fractional branch lengths must fill the tree viewport");
@@ -235,7 +297,7 @@ test("report figures and the Swig-derived viewer render from a result payload", 
     await build({ input: { charts: resolve("src/components/charts.tsx"), viewer: resolve("src/components/alignment-tree-viewer.tsx") },
       external: /^react(?:\/|$)/, output: { dir: directory, format: "es", entryFileNames: "[name].mjs" } });
     const charts = await import(pathToFileURL(join(directory, "charts.mjs")).href);
-    const { AlignmentTreeViewer } = await import(pathToFileURL(join(directory, "viewer.mjs")).href);
+    const { AlignmentTreeViewer, abundanceBubbleRadius, chooseModalRootTip, treeAlignmentSvg } = await import(pathToFileURL(join(directory, "viewer.mjs")).href);
     const bundle = resultBundle(), family = bundle.umiFamilies[0], consensus = bundle.consensuses[0], record = bundle.records[0];
     const markup = [
       createElement(charts.UmiDecisionPlot, { families: [family], artefactCutoff: 1, agreementThreshold: .6, outlierQuantile: .99 }),
@@ -248,8 +310,21 @@ test("report figures and the Swig-derived viewer render from a result payload", 
     ].map((component) => renderToStaticMarkup(component)).join("\n");
     for (const label of ["UMI family size", "artefact cutoff", "Minimum-agreement positions", "multidimensional scaling", "dinucleotide frequencies", "Phylogram coordinated"])
       assert.match(markup, new RegExp(label, "i"));
-    assert.match(markup, /<canvas/); assert.match(markup, /substitutions\/site/); assert.match(markup, /Export SVG/); assert.match(markup, /Bubble size/);
-    assert.match(markup, /r="5\.6"/, "bubble radius must be proportional to the square root of family count");
+    assert.match(markup, /<canvas/); assert.match(markup, /substitutions\/site/); assert.match(markup, /Export SVG/); assert.match(markup, /Bubble area/);
+    assert.match(markup, /Tree \+ alignment SVG/); assert.match(markup, /Apply regions/); assert.match(markup, /Amino acid/);
+    assert.match(markup, /Modal node/); assert.match(markup, /Midpoint root/); assert.match(markup, /exactly zero-length edge/);
+    const weightedModal = chooseModalRootTip([{ name: "a", sequence: "AAA" }, { name: "b", sequence: "CCC" }], ["a", "b"], { a: { familyCount: 1 }, b: { familyCount: 4 } });
+    assert.deepEqual(weightedModal, { treeName: "b", sequenceName: "b", modalSequence: "CCC", representedFamilies: 4, matchingTips: 1 });
+    const uncollapsedModal = chooseModalRootTip([{ name: "first", sequence: "AAA" }, { name: "second", sequence: "CCC" }, { name: "third", sequence: "AAA" }], ["first", "second", "third"]);
+    assert.deepEqual(uncollapsedModal, { treeName: "first", sequenceName: "first", modalSequence: "AAA", representedFamilies: 2, matchingTips: 2 });
+    const radiusOne = abundanceBubbleRadius(1, 25), radiusFour = abundanceBubbleRadius(4, 25), radiusMillion = abundanceBubbleRadius(1_000_000, 25);
+    assert(Math.abs((Math.PI * radiusFour ** 2) / (Math.PI * radiusOne ** 2) - 4) < 1e-12, "bubble area must be exactly linear in UMI-family count");
+    assert(radiusMillion > 2_000, "large family counts must not encounter a display cap");
+    const combined = treeAlignmentSvg({ root: parseNewick("(a:0.001,b:0.002);"), treeWidth: 500, rowHeight: 20, cellWidth: 11,
+      layoutMode: "phylogram", showNames: true, leafMetadata: { a: { familyCount: 4 }, b: { familyCount: 1 } }, leafLabels: { a: "a", b: "b" },
+      sequencesByTip: { a: "ATGTAA", b: "ATGTAG" }, columns: [0, 1, 2, 3, 4, 5], labels: ["1", "2", "3", "4", "5", "6"], modal: "ATGTAA",
+      alphabet: "nt", highlighter: false, bubbleAreaPerFamily: 25, showAbundanceScale: true, colorByAgreement: false, mutations: new Map(), mutationLimit: 2, tipLegend: [] });
+    assert.match(combined, /Tree coordinated with aligned leaf sequences/); assert.match(combined, /<rect[^>]+fill="#78c679"/); assert.match(combined, />A<\/text>/); assert.match(combined, /no radius floor, cap, or dataset normalization/);
     const collapsedViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);", collapsed: true,
       leafMetadata: { a: { familyCount: 3, minimumAgreement: .7 } } }));
     assert.doesNotMatch(collapsedViewer, /Tip color|family minimum agreement/i, "legacy agreement metadata must not appear as a collapsed-haplotype property");
@@ -271,6 +346,33 @@ test("collapse counts retained UMI families without assigning family agreement t
   assert.equal("minimumAgreement" in collapsed.groups[0], false);
   assert.deepEqual(collapsed.groups[0].memberIds, ["family_a", "family_b"]);
   assert.match(collapsed.fasta, /^>family_a\nAC-GT\n>family_c\nAT-GT\n$/);
+});
+
+test("overview statistics expose family- and read-level rejection proportions", () => {
+  const bundle = resultBundle();
+  bundle.summaries[0].selectedReads = 10; bundle.summaries[0].downsampledReads = 2; bundle.summaries[0].demultiplexedReads = 12;
+  bundle.quality.perSample[0] = 12; bundle.quality.demultiplexedReads = 12; bundle.quality.downsampledReads = 2;
+  bundle.umiFamilies = [
+    { ...bundle.umiFamilies[0], familySize: 6, disposition: "likely_real" },
+    { ...bundle.umiFamilies[0], umi: "TTTTGGGG", familySize: 4, disposition: "heteroduplex" },
+  ];
+  const calls = porpidCallStats(bundle, "sample_1"), heteroduplex = calls.find((row) => row.key === "heteroduplex");
+  assert.equal(heteroduplex.families, 1); assert.equal(heteroduplex.familyPercent, 50); assert.equal(heteroduplex.reads, 4); assert.equal(heteroduplex.readPercent, 40);
+  const overview = sampleOverviewStats(bundle)[0]; assert(Math.abs(overview.downsampledPercent - 100 / 6) < 1e-12); assert.equal(overview.heteroduplexReadPercent, 40);
+  const functional = functionalFilterStats(bundle, "sample_1"); assert(functional.some((row) => row.key === "frameshift"), "zero-count functional categories must remain visible");
+  bundle.umiFamilies.push({ ...bundle.umiFamilies[0], umi: "REJECTED", familySize: 2, disposition: "BPB-rejects" });
+  const bpb = porpidCallStats(bundle, "sample_1").find((row) => row.key === "BPB-rejects");
+  assert.equal(bpb.families, 0, "the aggregate BPB read bucket must not be presented as one UMI family"); assert.equal(bpb.reads, 2);
+});
+
+test("contamination calls are unique per family with the primary decision taking precedence", () => {
+  const calls = deduplicateContaminationCalls([
+    { sample: "s", sequenceId: "x", nearestNonselfVariant: "suspect", nearestNonselfDistance: .01, flagged: true, discarded: false, suspectOnly: true },
+    { sample: "s", sequenceId: "x", nearestNonselfVariant: "primary", nearestNonselfDistance: .012, flagged: true, discarded: true, suspectOnly: false },
+    { sample: "s", sequenceId: "y", nearestNonselfVariant: "only", nearestNonselfDistance: .02, flagged: true, discarded: false, suspectOnly: true },
+  ]);
+  assert.equal(calls.length, 2); assert.equal(calls.find((row) => row.sequenceId === "x").nearestNonselfVariant, "primary");
+  assert.equal(calls.find((row) => row.sequenceId === "x").discarded, true);
 });
 
 test("reference regions and mutation mapping follow the active alignment", () => {
@@ -305,20 +407,20 @@ function resultBundle() {
     functionalMatchThreshold: 0.7, spoolPartitions: 8, deterministicSeed: "1" };
   return {
     schema: "webporpid-results/1",
-    provenance: { webporpidVersion: "0.3.4", createdUtc: "2026-08-27T00:00:00.000Z", engine: "test", workers: 2,
+    provenance: { webporpidVersion: "0.3.5", createdUtc: "2026-08-27T00:00:00.000Z", engine: "test", workers: 2,
       inputName: "reads.fastq.gz", inputSha256: "a".repeat(64), configSha256: "b".repeat(64), deterministicSeed: "1",
       upstreamBranch: "nanopore", upstreamCommit: "c".repeat(40) },
-    config: { dataset: "test", samples: [{ name: "sample_1", cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa" }],
+    config: { dataset: "test", samples: [{ name: "sample_1", cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa", functionalReference: "functional.fa" }],
       contaminationPanel: "contam.fa", parameters },
     quality: { totalReads: 3, qualityReads: 3, badReads: 0, shortReads: 0, longReads: 0, primerRejects: 0, idRejects: 0,
       demultiplexedReads: 3, bpbRejects: 0, malformedRecords: 0, downsampledReads: 0, perSample: [3] },
-    summaries: [{ sample: "sample_1", demultiplexedReads: 3, observedUmis: 1, likelyRealUmis: 1, consensusSequences: 1,
+    summaries: [{ sample: "sample_1", demultiplexedReads: 3, selectedReads: 3, downsampledReads: 0, observedUmis: 1, likelyRealUmis: 1, consensusSequences: 1,
       contaminationPassed: 1, postprocPassed: 1, collapsedSequences: 1, functionalPassed: 1, artefactCutoff: 1 }],
     umiFamilies: [{ sample: "sample_1", sampleIndex: 0, umi: "AACCGGTT", familySize: 3, mostLikelyParent: "AACCGGTT",
       posteriorProbability: 1, logOffspringProbability: Number.NEGATIVE_INFINITY, disposition: "likely_real", minimumAgreement: 0.67 }],
     consensuses: [{ id: "c1", sample: "sample_1", sampleIndex: 0, umi: "AACCGGTT", familySize: 3, minimumAgreement: 0.67,
       sequence: "ATGTAA", lowAgreementSites: [{ position: 2, agreement: 0.67, modalReadBase: "A", modalRunLength: 1 }] }],
-    contamination: [],
+    contamination: [], contaminationReferences: [{ name: "contam_ref", sequence: "ATGTAA" }],
     records: [{ id: "c1", sample: "sample_1", umi: "AACCGGTT", familySize: 3, minimumAgreement: 0.67, consensusNt: "ATGTAA",
       alignedNt: "ATGTAA", trimmedNt: "ATGTAA", trimmedAa: "M*", panelScore: 0, artefactPass: true, agreementPass: true,
       contaminationPass: true, panelPass: true, functionalPass: true, rejectionReasons: [] }],
@@ -342,7 +444,10 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   const baselineFingerprint = inspectAlignment(decoded.alignments["sample_1/nucleotide"], 1).fingerprint;
   const editedFasta = ">c1\nATG---\n", editedFingerprint = inspectAlignment(editedFasta, 1).fingerprint;
   decoded.alignmentEdits = { "sample_1/nucleotide": { fasta: editedFasta, frameOffset: 0, baselineFingerprint, editedFingerprint,
-    source: "Alivibe test", savedUtc: "2026-08-27T00:00:01.000Z", treeNewick: "(c1:0.0);" } };
+    source: "Alivibe test", savedUtc: "2026-08-27T00:00:01.000Z", treeNewick: "(c1:0.0);",
+    changes: summarizeAlignmentChanges(decoded.alignments["sample_1/nucleotide"], editedFasta) } };
+  decoded.alignmentEditHistory = [{ alignmentKey: "sample_1/nucleotide", action: "alignment-edit", timestamp: "2026-08-27T00:00:01.000Z",
+    source: "Alivibe test", details: ["3 deleted bases"], beforeFingerprint: baselineFingerprint, afterFingerprint: editedFingerprint }];
   const editedRoundTrip = decodeResult(encodeResult(decoded));
   assert.equal(exportComponent(editedRoundTrip, "nucleotide-alignment", "sample_1").text, editedFasta);
   assert.equal(exportComponent(editedRoundTrip, "protein-alignment", "sample_1").text, ">c1\nM-\n");
@@ -354,10 +459,14 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   assert.throws(() => encodeResult(inconsistent), /inconsistent consensus sequence/);
   const unknownStorage = structuredClone(bundle); unknownStorage.runOptions.spoolStorage = "cloud";
   assert.throws(() => encodeResult(unknownStorage), /spoolStorage is not recognized/);
+  const wrongSelection = structuredClone(bundle); wrongSelection.summaries[0].selectedReads = 2; wrongSelection.summaries[0].downsampledReads = 1;
+  assert.throws(() => encodeResult(wrongSelection), /selected-read count does not match/);
   const legacyCollapse = structuredClone(bundle); legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .67;
   assert.doesNotThrow(() => encodeResult(legacyCollapse), "results through 0.3.2 must remain loadable");
   legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .5;
   assert.throws(() => encodeResult(legacyCollapse), /legacy collapse group has inconsistent family-agreement metadata/);
+  const pre035 = structuredClone(bundle); delete pre035.summaries[0].selectedReads; delete pre035.summaries[0].downsampledReads; delete pre035.contaminationReferences;
+  assert.doesNotThrow(() => decodeResult(encodeResult(pre035)), "pre-0.3.5 results must remain loadable without new optional statistics and references");
 });
 
 test("export all is one gzip-compressed tar with every sample output in its sample directory", () => {
@@ -379,4 +488,6 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(app, /addEventListener\("popstate", interceptHistoryDeparture\)/);
   assert.match(app, /Leave anyway/); assert.match(app, /history\.go\(-2\)/);
   assert.match(styles, /overscroll-behavior-x:\s*none/);
+  assert.match(app, /className="app-version"/); assert.match(app, /packageInformation\.version/);
+  assert.match(styles, /\.app-version/);
 });

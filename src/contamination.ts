@@ -108,6 +108,24 @@ function nearest(sample: string, vector: KmerVector, database: DatabaseEntry[], 
   return nonself && nonselfDistance < threshold ? { label: nonself.label, distance: nonselfDistance, discard: closestSelf > threshold } : undefined;
 }
 
+/**
+ * One consensus must have one displayed/stored contamination decision. Older
+ * result files can contain both the primary call and the wider suspect-pass
+ * call; prefer the primary decision and use the suspect call only when there
+ * was no primary match.
+ */
+export function deduplicateContaminationCalls(calls: readonly ContaminationCall[]): ContaminationCall[] {
+  const bySequence = new Map<string, ContaminationCall>();
+  for (const call of calls) {
+    const key = `${call.sample}\0${call.sequenceId}`, previous = bySequence.get(key);
+    if (!previous || (previous.suspectOnly && !call.suspectOnly)
+      || (previous.suspectOnly === call.suspectOnly && call.nearestNonselfDistance < previous.nearestNonselfDistance))
+      bySequence.set(key, { ...call });
+  }
+  return [...bySequence.values()].sort((a, b) => a.sample.localeCompare(b.sample)
+    || a.nearestNonselfDistance - b.nearestNonselfDistance || a.sequenceId.localeCompare(b.sequenceId));
+}
+
 export function classifyContamination(consensuses: ConsensusRecord[], config: PipelineConfig): ContaminationCall[] {
   if (!config.parameters.contaminationFilter) return [];
   const panel: DatabaseEntry[] = config.contaminationPanelSequences.map((record, index) => ({
@@ -136,8 +154,8 @@ export function classifyContamination(consensuses: ConsensusRecord[], config: Pi
     if (call) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: call.label,
       nearestNonselfDistance: call.distance, flagged: true, discarded: call.discard, suspectOnly: false });
     const possible = nearest(record.sample, vector, suspect, threshold);
-    if (possible) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: possible.label,
+    if (!call && possible) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: possible.label,
       nearestNonselfDistance: possible.distance, flagged: true, discarded: false, suspectOnly: true });
   }
-  return output.sort((a, b) => a.nearestNonselfDistance - b.nearestNonselfDistance);
+  return deduplicateContaminationCalls(output);
 }

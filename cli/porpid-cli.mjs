@@ -186,6 +186,20 @@ function nearest(sample, vector, database, threshold) {
 		discard: closestSelf > threshold
 	} : void 0;
 }
+/**
+* One consensus must have one displayed/stored contamination decision. Older
+* result files can contain both the primary call and the wider suspect-pass
+* call; prefer the primary decision and use the suspect call only when there
+* was no primary match.
+*/
+function deduplicateContaminationCalls(calls) {
+	const bySequence = /* @__PURE__ */ new Map();
+	for (const call of calls) {
+		const key = `${call.sample}\0${call.sequenceId}`, previous = bySequence.get(key);
+		if (!previous || previous.suspectOnly && !call.suspectOnly || previous.suspectOnly === call.suspectOnly && call.nearestNonselfDistance < previous.nearestNonselfDistance) bySequence.set(key, { ...call });
+	}
+	return [...bySequence.values()].sort((a, b) => a.sample.localeCompare(b.sample) || a.nearestNonselfDistance - b.nearestNonselfDistance || a.sequenceId.localeCompare(b.sequenceId));
+}
 function classifyContamination(consensuses, config) {
 	if (!config.parameters.contaminationFilter) return [];
 	const panel = config.contaminationPanelSequences.map((record, index) => ({
@@ -230,7 +244,7 @@ function classifyContamination(consensuses, config) {
 			suspectOnly: false
 		});
 		const possible = nearest(record.sample, vector, suspect, threshold);
-		if (possible) output.push({
+		if (!call && possible) output.push({
 			sample: record.sample,
 			sequenceId: record.id,
 			nearestNonselfVariant: possible.label,
@@ -240,7 +254,7 @@ function classifyContamination(consensuses, config) {
 			suspectOnly: true
 		});
 	}
-	return output.sort((a, b) => a.nearestNonselfDistance - b.nearestNonselfDistance);
+	return deduplicateContaminationCalls(output);
 }
 //#endregion
 //#region src/alivibe-msa-runtime.ts
@@ -421,6 +435,61 @@ function inspectAlignment(text, minimumRows = 2) {
 function ungapped(sequence) {
 	return sequence.replaceAll("-", "").replaceAll("U", "T");
 }
+/** Exact unit-cost Levenshtein decomposition with deterministic diagonal ties. */
+function nucleotideEditCounts(original, replacement) {
+	if (original === replacement) return {
+		substitutedNucleotides: 0,
+		insertedNucleotides: 0,
+		removedNucleotides: 0
+	};
+	const width = replacement.length + 1;
+	let previousCost = new Uint32Array(width), previousSubstitutions = new Uint32Array(width), previousInsertions = new Uint32Array(width), previousDeletions = new Uint32Array(width);
+	let currentCost = new Uint32Array(width), currentSubstitutions = new Uint32Array(width), currentInsertions = new Uint32Array(width), currentDeletions = new Uint32Array(width);
+	for (let column = 0; column < width; column += 1) {
+		previousCost[column] = column;
+		previousInsertions[column] = column;
+	}
+	for (let row = 1; row <= original.length; row += 1) {
+		currentCost[0] = row;
+		currentSubstitutions[0] = 0;
+		currentInsertions[0] = 0;
+		currentDeletions[0] = row;
+		for (let column = 1; column < width; column += 1) {
+			const mismatch = original[row - 1] === replacement[column - 1] ? 0 : 1;
+			let cost = previousCost[column - 1] + mismatch;
+			let substitutions = previousSubstitutions[column - 1] + mismatch;
+			let insertions = previousInsertions[column - 1], deletions = previousDeletions[column - 1];
+			const deletionCost = previousCost[column] + 1;
+			if (deletionCost < cost) {
+				cost = deletionCost;
+				substitutions = previousSubstitutions[column];
+				insertions = previousInsertions[column];
+				deletions = previousDeletions[column] + 1;
+			}
+			const insertionCost = currentCost[column - 1] + 1;
+			if (insertionCost < cost) {
+				cost = insertionCost;
+				substitutions = currentSubstitutions[column - 1];
+				insertions = currentInsertions[column - 1] + 1;
+				deletions = currentDeletions[column - 1];
+			}
+			currentCost[column] = cost;
+			currentSubstitutions[column] = substitutions;
+			currentInsertions[column] = insertions;
+			currentDeletions[column] = deletions;
+		}
+		[previousCost, currentCost] = [currentCost, previousCost];
+		[previousSubstitutions, currentSubstitutions] = [currentSubstitutions, previousSubstitutions];
+		[previousInsertions, currentInsertions] = [currentInsertions, previousInsertions];
+		[previousDeletions, currentDeletions] = [currentDeletions, previousDeletions];
+	}
+	const column = replacement.length;
+	return {
+		substitutedNucleotides: previousSubstitutions[column],
+		insertedNucleotides: previousInsertions[column],
+		removedNucleotides: previousDeletions[column]
+	};
+}
 /**
 * Validate the FASTA shape without restricting biological edits. Substitutions,
 * insertions, deletions, renamed rows and removed rows are all retained in the
@@ -433,7 +502,7 @@ function validateCorrectedAlignment(currentText, correctedText) {
 	const correctedNames = new Set(corrected.records.map((record) => record.name));
 	const removedRows = current.records.filter((record) => !correctedNames.has(record.name)).map((record) => record.name);
 	const addedRows = corrected.records.filter((record) => !currentByName.has(record.name)).map((record) => record.name);
-	const changedRows = [];
+	const changedRows = [], rowChanges = [];
 	let removedNucleotides = 0, insertedNucleotides = 0, substitutedNucleotides = 0;
 	for (const record of corrected.records) {
 		const originalAligned = currentByName.get(record.name);
@@ -441,19 +510,50 @@ function validateCorrectedAlignment(currentText, correctedText) {
 		const original = ungapped(originalAligned);
 		const replacement = ungapped(record.sequence);
 		if (original !== replacement || originalAligned !== record.sequence) changedRows.push(record.name);
-		const shared = Math.min(original.length, replacement.length);
-		for (let index = 0; index < shared; index += 1) if (original[index] !== replacement[index]) substitutedNucleotides += 1;
-		removedNucleotides += Math.max(0, original.length - replacement.length);
-		insertedNucleotides += Math.max(0, replacement.length - original.length);
+		const edits = nucleotideEditCounts(original, replacement);
+		const rowSubstitutions = edits.substitutedNucleotides, rowRemoved = edits.removedNucleotides, rowInserted = edits.insertedNucleotides;
+		substitutedNucleotides += rowSubstitutions;
+		removedNucleotides += rowRemoved;
+		insertedNucleotides += rowInserted;
+		if (original !== replacement || originalAligned !== record.sequence) rowChanges.push({
+			name: record.name,
+			substitutedNucleotides: rowSubstitutions,
+			insertedNucleotides: rowInserted,
+			removedNucleotides: rowRemoved,
+			gapPlacementChanged: originalAligned !== record.sequence && original === replacement
+		});
 	}
 	return {
 		...corrected,
 		removedRows,
 		addedRows,
 		changedRows,
+		rowChanges,
 		removedNucleotides,
 		insertedNucleotides,
 		substitutedNucleotides
+	};
+}
+function summarizeAlignmentChanges(currentText, correctedText) {
+	const current = inspectAlignment(currentText, 1), corrected = validateCorrectedAlignment(currentText, correctedText);
+	const currentNames = new Set(current.records.map((record) => record.name)), correctedNames = new Set(corrected.records.map((record) => record.name));
+	const sharedBefore = current.records.map((record) => record.name).filter((name) => correctedNames.has(name));
+	const sharedAfter = corrected.records.map((record) => record.name).filter((name) => currentNames.has(name));
+	return {
+		rowsBefore: current.rows,
+		rowsAfter: corrected.rows,
+		columnsBefore: current.columns,
+		columnsAfter: corrected.columns,
+		rowOrderChanged: sharedBefore.join("\0") !== sharedAfter.join("\0"),
+		rowOrderBefore: current.records.map((record) => record.name),
+		rowOrderAfter: corrected.records.map((record) => record.name),
+		removedRows: corrected.removedRows,
+		addedRows: corrected.addedRows,
+		changedRows: corrected.changedRows,
+		rowChanges: corrected.rowChanges,
+		removedNucleotides: corrected.removedNucleotides,
+		insertedNucleotides: corrected.insertedNucleotides,
+		substitutedNucleotides: corrected.substitutedNucleotides
 	};
 }
 function translateAlignedNucleotides(sequence, frameOffset = 0) {
@@ -1042,14 +1142,16 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				if (!contaminationPass) rejectionReasons.push("contamination filter");
 				if (!panelPass[index]) rejectionReasons.push(`distance_from_panel >= ${config.parameters.panelThreshold}`);
 				let trimmedNt, trimmedAa, functionalPass;
-				if (sample.functionalReferenceSequence) if (acceptedRow) {
-					const outcome = functionalByIndex.get(index);
-					functionalPass = outcome.passed;
-					trimmedNt = outcome.nt;
-					trimmedAa = outcome.aa;
-					rejectionReasons.push(...outcome.reasons);
-					if (outcome.passed) functionalPassed++;
-				} else functionalPass = false;
+				if (sample.functionalReferenceSequence) {
+					if (acceptedRow) {
+						const outcome = functionalByIndex.get(index);
+						functionalPass = outcome.passed;
+						trimmedNt = outcome.nt;
+						trimmedAa = outcome.aa;
+						rejectionReasons.push(...outcome.reasons);
+						if (outcome.passed) functionalPassed++;
+					}
+				}
 				if (acceptedRow) nucleotideRows.push({
 					name: record.id,
 					sequence: acceptedRow
@@ -3147,11 +3249,14 @@ function validateResult(value) {
 			"postprocPassed",
 			"artefactCutoff"
 		]) count(row[key], `summaries[${index}].${key}`);
+		if (row.selectedReads != null) count(row.selectedReads, `summaries[${index}].selectedReads`);
+		if (row.downsampledReads != null) count(row.downsampledReads, `summaries[${index}].downsampledReads`);
+		if (row.selectedReads != null && row.downsampledReads != null && count(row.selectedReads, `summaries[${index}].selectedReads`) + count(row.downsampledReads, `summaries[${index}].downsampledReads`) !== count(row.demultiplexedReads, `summaries[${index}].demultiplexedReads`)) throw new Error("A sample summary has inconsistent selected and subsampled read counts.");
 		if (row.collapsedSequences != null) count(row.collapsedSequences, `summaries[${index}].collapsedSequences`);
 		if (row.functionalPassed != null) count(row.functionalPassed, `summaries[${index}].functionalPassed`);
 	});
 	if (summarySamples.size !== samples.length) throw new Error("Result summaries are missing a configured sample.");
-	const familyKeys = /* @__PURE__ */ new Set();
+	const familyKeys = /* @__PURE__ */ new Set(), familyReadsBySample = /* @__PURE__ */ new Map();
 	array(bundle.umiFamilies, "umiFamilies").forEach((entry, index) => {
 		const row = object(entry, `umiFamilies[${index}]`), sample = text(row.sample, `umiFamilies[${index}].sample`), sampleIndex = count(row.sampleIndex, `umiFamilies[${index}].sampleIndex`);
 		knownSample(sample, `umiFamilies[${index}]`);
@@ -3159,12 +3264,17 @@ function validateResult(value) {
 		const familyKey = `${sampleIndex}\0${text(row.umi, `umiFamilies[${index}].umi`)}`;
 		if (familyKeys.has(familyKey)) throw new Error("UMI family identifiers must be unique within a sample.");
 		familyKeys.add(familyKey);
-		count(row.familySize, `umiFamilies[${index}].familySize`);
+		const familySize = count(row.familySize, `umiFamilies[${index}].familySize`);
+		familyReadsBySample.set(sample, (familyReadsBySample.get(sample) ?? 0) + familySize);
 		text(row.mostLikelyParent, `umiFamilies[${index}].mostLikelyParent`);
 		numeric(row.posteriorProbability, `umiFamilies[${index}].posteriorProbability`);
 		numeric(row.logOffspringProbability, `umiFamilies[${index}].logOffspringProbability`, false);
 		if (!DISPOSITIONS.has(text(row.disposition, `umiFamilies[${index}].disposition`))) throw new Error("A UMI family has an unknown disposition.");
 		optionalNumber(row.minimumAgreement, `umiFamilies[${index}].minimumAgreement`);
+	});
+	array(bundle.summaries, "summaries").forEach((entry, index) => {
+		const row = object(entry, `summaries[${index}]`), sample = text(row.sample, `summaries[${index}].sample`);
+		if (row.selectedReads != null && count(row.selectedReads, `summaries[${index}].selectedReads`) !== (familyReadsBySample.get(sample) ?? 0)) throw new Error("A sample summary selected-read count does not match its stored family calls.");
 	});
 	const consensusIds = /* @__PURE__ */ new Set();
 	const consensusById = /* @__PURE__ */ new Map();
@@ -3197,6 +3307,11 @@ function validateResult(value) {
 		bool(row.flagged, "contamination flagged");
 		bool(row.discarded, "contamination discarded");
 		bool(row.suspectOnly, "contamination suspectOnly");
+	});
+	if (bundle.contaminationReferences != null) array(bundle.contaminationReferences, "contaminationReferences").forEach((entry, index) => {
+		const record = object(entry, `contaminationReferences[${index}]`);
+		text(record.name, `contaminationReferences[${index}].name`);
+		text(record.sequence, `contaminationReferences[${index}].sequence`);
 	});
 	const recordIds = /* @__PURE__ */ new Set(), recordMetadata = /* @__PURE__ */ new Map();
 	array(bundle.records, "records").forEach((entry, index) => {
@@ -3317,12 +3432,80 @@ function validateResult(value) {
 		optionalText(edit.treeFingerprint, `alignmentEdits.${name}.treeFingerprint`);
 		optionalBool(edit.treeStale, `alignmentEdits.${name}.treeStale`);
 		if (edit.warnings != null) array(edit.warnings, `alignmentEdits.${name}.warnings`).forEach((warning) => text(warning, "alignment edit warning"));
+		if (edit.changes != null) {
+			const changes = object(edit.changes, `alignmentEdits.${name}.changes`);
+			for (const field of [
+				"rowsBefore",
+				"rowsAfter",
+				"columnsBefore",
+				"columnsAfter",
+				"removedNucleotides",
+				"insertedNucleotides",
+				"substitutedNucleotides"
+			]) count(changes[field], `alignmentEdits.${name}.changes.${field}`);
+			bool(changes.rowOrderChanged, `alignmentEdits.${name}.changes.rowOrderChanged`);
+			for (const field of [
+				"rowOrderBefore",
+				"rowOrderAfter",
+				"removedRows",
+				"addedRows",
+				"changedRows"
+			]) array(changes[field], `alignmentEdits.${name}.changes.${field}`).forEach((value) => text(value, `alignmentEdits.${name}.changes.${field} entry`));
+			array(changes.rowChanges, `alignmentEdits.${name}.changes.rowChanges`).forEach((rawRow, index) => {
+				const row = object(rawRow, `alignmentEdits.${name}.changes.rowChanges[${index}]`);
+				text(row.name, "alignment row change name");
+				for (const field of [
+					"removedNucleotides",
+					"insertedNucleotides",
+					"substitutedNucleotides"
+				]) count(row[field], `alignment row change ${field}`);
+				bool(row.gapPlacementChanged, "alignment row gap-placement flag");
+			});
+		}
 		const storedAlignments = object(bundle.alignments, "alignments");
 		const original = text(storedAlignments[name] ?? (name === `${sample}/uncollapsed-nucleotide` ? storedAlignments[`${sample}/nucleotide`] : void 0), `alignments.${name}`);
 		if (inspectAlignment(original, 1).fingerprint !== baselineFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent baseline fingerprint.`);
 		if (inspectAlignment(fasta, 1).fingerprint !== editedFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent fingerprint.`);
 		validateCorrectedAlignment(original, fasta);
+		if (edit.changes != null) {
+			const expected = summarizeAlignmentChanges(original, fasta), stored = edit.changes;
+			for (const field of [
+				"rowsBefore",
+				"rowsAfter",
+				"columnsBefore",
+				"columnsAfter",
+				"removedNucleotides",
+				"insertedNucleotides",
+				"substitutedNucleotides"
+			]) if (stored[field] !== expected[field]) throw new Error(`alignmentEdits.${name}.changes.${field} is inconsistent with the stored alignments.`);
+			if (stored.rowOrderChanged !== expected.rowOrderChanged) throw new Error(`alignmentEdits.${name}.changes.rowOrderChanged is inconsistent with the stored alignments.`);
+			for (const field of [
+				"rowOrderBefore",
+				"rowOrderAfter",
+				"removedRows",
+				"addedRows",
+				"changedRows"
+			]) if (JSON.stringify(stored[field]) !== JSON.stringify(expected[field])) throw new Error(`alignmentEdits.${name}.changes.${field} is inconsistent with the stored alignments.`);
+			if (JSON.stringify(stored.rowChanges) !== JSON.stringify(expected.rowChanges)) throw new Error(`alignmentEdits.${name}.changes.rowChanges is inconsistent with the stored alignments.`);
+		}
 	}
+	if (bundle.alignmentEditHistory != null) array(bundle.alignmentEditHistory, "alignmentEditHistory").forEach((rawEntry, index) => {
+		const entry = object(rawEntry, `alignmentEditHistory[${index}]`), key = text(entry.alignmentKey, `alignmentEditHistory[${index}].alignmentKey`);
+		const sample = key.split("/", 1)[0];
+		knownSample(sample, `alignmentEditHistory[${index}]`);
+		if (key !== `${sample}/nucleotide` && key !== `${sample}/uncollapsed-nucleotide`) throw new Error("Alignment audit keys must identify a nucleotide view.");
+		if (![
+			"alignment-edit",
+			"frame-change",
+			"tree-recalculation",
+			"edit-reset"
+		].includes(text(entry.action, `alignmentEditHistory[${index}].action`))) throw new Error("Alignment audit action is not recognized.");
+		text(entry.timestamp, `alignmentEditHistory[${index}].timestamp`);
+		text(entry.source, `alignmentEditHistory[${index}].source`);
+		array(entry.details, `alignmentEditHistory[${index}].details`).forEach((value) => text(value, "alignment audit detail"));
+		optionalText(entry.beforeFingerprint, `alignmentEditHistory[${index}].beforeFingerprint`);
+		optionalText(entry.afterFingerprint, `alignmentEditHistory[${index}].afterFingerprint`);
+	});
 	if (bundle.timings != null) array(bundle.timings, "timings").forEach((entry, index) => {
 		const timing = object(entry, `timings[${index}]`);
 		const stage = text(timing.stage, `timings[${index}].stage`);
@@ -3480,7 +3663,7 @@ function exportComponent(bundle, kind, sample) {
 				"flagged",
 				"discarded",
 				"suspect_only"
-			], bundle.contamination.filter((row) => !sample || row.sample === sample).map((row) => [
+			], deduplicateContaminationCalls(bundle.contamination).filter((row) => !sample || row.sample === sample).map((row) => [
 				row.sample,
 				row.sequenceId,
 				row.nearestNonselfVariant,
@@ -3650,7 +3833,7 @@ function concatenateSpoolRecords(records) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.4";
+const VERSION = "0.3.5";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -3997,7 +4180,10 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 				}, [data, cutoffCopy]));
 			}
 		}));
-		const mergedCounts = mergeFamilyCounts(countParts), selectedReads = decodeFamilyCounts(mergedCounts).reduce((sum, entry) => sum + entry.count, 0);
+		const mergedCounts = mergeFamilyCounts(countParts), decodedCounts = decodeFamilyCounts(mergedCounts);
+		const selectedReadsBySample = Array(config.samples.length).fill(0);
+		for (const entry of decodedCounts) selectedReadsBySample[entry.sample] += entry.count;
+		const selectedReads = selectedReadsBySample.reduce((sum, count) => sum + count, 0);
 		quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
 		const modelData = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
 		const familyModel = new Uint8Array(await pool.at(0, {
@@ -4056,6 +4242,8 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 		}
 		downstream.summaries.forEach((summary, index) => {
 			summary.demultiplexedReads = quality.perSample[index] ?? 0;
+			summary.selectedReads = selectedReadsBySample[index] ?? 0;
+			summary.downsampledReads = Math.max(0, summary.demultiplexedReads - summary.selectedReads);
 			summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
 			summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
 		});
@@ -4106,6 +4294,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 			umiFamilies,
 			consensuses,
 			contamination,
+			contaminationReferences: config.contaminationPanelSequences,
 			records: downstream.records,
 			alignments: downstream.alignments,
 			trees,
@@ -4137,6 +4326,7 @@ async function inspect(path) {
 			consensuses: result.consensuses.length,
 			families: result.umiFamilies.length,
 			contaminationCalls: result.contamination.length,
+			contaminationReferences: result.contaminationReferences?.length ?? 0,
 			records: result.records.length,
 			collapsedHaplotypes: Object.values(result.collapseGroups ?? {}).reduce((sum, groups) => sum + groups.length, 0),
 			alignments: Object.keys(result.alignments),

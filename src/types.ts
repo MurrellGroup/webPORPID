@@ -136,6 +136,10 @@ export interface PostprocRecord {
 export interface SampleSummary {
   sample: string;
   demultiplexedReads: number;
+  /** Reads retained for this sample after deterministic subsampling. */
+  selectedReads?: number;
+  /** Demultiplexed reads omitted by deterministic subsampling. */
+  downsampledReads?: number;
   observedUmis: number;
   likelyRealUmis: number;
   consensusSequences: number;
@@ -186,6 +190,43 @@ export interface AlignmentEdit {
   /** True when the alignment changed after the most recent tree inference. */
   treeStale?: boolean;
   warnings?: string[];
+  /** Current edited alignment compared with the immutable pipeline alignment. */
+  changes?: AlignmentChangeSummary;
+}
+
+export interface AlignmentChangeSummary {
+  rowsBefore: number;
+  rowsAfter: number;
+  columnsBefore: number;
+  columnsAfter: number;
+  rowOrderChanged: boolean;
+  rowOrderBefore: string[];
+  rowOrderAfter: string[];
+  removedRows: string[];
+  addedRows: string[];
+  changedRows: string[];
+  rowChanges: AlignmentRowChange[];
+  removedNucleotides: number;
+  insertedNucleotides: number;
+  substitutedNucleotides: number;
+}
+
+export interface AlignmentRowChange {
+  name: string;
+  substitutedNucleotides: number;
+  insertedNucleotides: number;
+  removedNucleotides: number;
+  gapPlacementChanged: boolean;
+}
+
+export interface AlignmentAuditEntry {
+  alignmentKey: string;
+  action: "alignment-edit" | "frame-change" | "tree-recalculation" | "edit-reset";
+  timestamp: string;
+  source: string;
+  details: string[];
+  beforeFingerprint?: string;
+  afterFingerprint?: string;
 }
 
 export interface CollapseGroup {
@@ -225,6 +266,8 @@ export interface ResultBundle {
   umiFamilies: UmiFamily[];
   consensuses: ConsensusRecord[];
   contamination: ContaminationCall[];
+  /** External contamination-panel records retained for on-demand reference/donor phylogenies. */
+  contaminationReferences?: NamedSequence[];
   records: PostprocRecord[];
   alignments: Record<string, string>;
   trees: Record<string, string>;
@@ -237,6 +280,8 @@ export interface ResultBundle {
   runOptions?: RunOptions;
   /** Manual Alivibe/import corrections, keyed like `sample/nucleotide`. */
   alignmentEdits?: Record<string, AlignmentEdit>;
+  /** Append-only record of interactive alignment and tree operations. */
+  alignmentEditHistory?: AlignmentAuditEntry[];
   /** Optional so results written by webPORPID 0.1.x remain loadable. */
   timings?: PipelineTiming[];
   log: string[];

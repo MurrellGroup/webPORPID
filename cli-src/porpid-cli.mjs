@@ -19,7 +19,7 @@ import {
 import { createFastTreeRunner } from "./direct-fasttree.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 
-const VERSION = "0.3.4";
+const VERSION = "0.3.5";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
@@ -232,7 +232,10 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
         countParts[partition] = new Uint8Array(await pool.at(worker, { type: "countFamilies", bytes: data, cutoffs: cutoffCopy }, [data, cutoffCopy]));
       }
     }));
-    const mergedCounts = mergeFamilyCounts(countParts), selectedReads = decodeFamilyCounts(mergedCounts).reduce((sum, entry) => sum + entry.count, 0);
+    const mergedCounts = mergeFamilyCounts(countParts), decodedCounts = decodeFamilyCounts(mergedCounts);
+    const selectedReadsBySample = Array(config.samples.length).fill(0);
+    for (const entry of decodedCounts) selectedReadsBySample[entry.sample] += entry.count;
+    const selectedReads = selectedReadsBySample.reduce((sum, count) => sum + count, 0);
     quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
     const modelData = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
     const familyModel = new Uint8Array(await pool.at(0, { type: "buildModel", bytes: modelData }, [modelData]));
@@ -276,6 +279,8 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
     finally { await msaRunner.close?.(); }
     downstream.summaries.forEach((summary, index) => {
       summary.demultiplexedReads = quality.perSample[index] ?? 0;
+      summary.selectedReads = selectedReadsBySample[index] ?? 0;
+      summary.downsampledReads = Math.max(0, summary.demultiplexedReads - summary.selectedReads);
       summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
       summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
     });
@@ -305,6 +310,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
       workers, inputName: basename(input), inputSha256: inputHash.digest("hex"), configSha256: configHash,
       deterministicSeed: config.parameters.deterministicSeed.toString(), upstreamBranch: "nanopore", upstreamCommit: UPSTREAM_COMMIT },
       config: resultConfig(config), quality, summaries: downstream.summaries, umiFamilies, consensuses, contamination,
+      contaminationReferences: config.contaminationPanelSequences,
       records: downstream.records, alignments: downstream.alignments, trees, referenceAlignments: downstream.referenceAlignments,
       collapseGroups: downstream.collapseGroups, inputMappings, runOptions: { deferPhylogeny }, timings, log };
     await mkdir(dirname(resolve(outputPath)), { recursive: true }); await writeFile(outputPath, encodeResult(result));
@@ -317,6 +323,7 @@ async function inspect(path) {
   process.stdout.write(JSON.stringify({ schema: result.schema, provenance: result.provenance, quality: result.quality, summaries: result.summaries,
     timings: result.timings ?? [],
     components: { consensuses: result.consensuses.length, families: result.umiFamilies.length, contaminationCalls: result.contamination.length,
+      contaminationReferences: result.contaminationReferences?.length ?? 0,
       records: result.records.length, collapsedHaplotypes: Object.values(result.collapseGroups ?? {}).reduce((sum, groups) => sum + groups.length, 0),
       alignments: Object.keys(result.alignments), trees: Object.keys(result.trees) } }, null, 2) + "\n");
 }

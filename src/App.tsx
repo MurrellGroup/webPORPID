@@ -6,6 +6,9 @@ import { decodeResult, encodeResult, safeDatasetName } from "./result-file";
 import type { InputFileMapping, PipelineConfig, PipelineProgress, ResultBundle } from "./types";
 import { ResultsExplorer } from "./components/results-explorer";
 import { ConfigForm } from "./components/config-form";
+import packageInformation from "../package.json";
+
+export const APP_VERSION = packageInformation.version;
 
 function download(name: string, data: string | Uint8Array, mime: string) {
   const body: BlobPart = typeof data === "string" ? data : data.slice().buffer as ArrayBuffer;
@@ -289,7 +292,7 @@ export default function App() {
   }
 
   return <div className="app-shell">
-    <header className="site-header"><a className="brand" href={import.meta.env.BASE_URL} aria-label="webPORPID home"><span className="brand-mark">wp</span><span>webPORPID<small>Nanopore &amp; PacBio analysis</small></span></a><nav><a href="#run">Run</a><a href="#about">Methods</a><a href="https://github.com/MurrellGroup/webPORPID">GitHub</a></nav></header>
+    <header className="site-header"><a className="brand" href={import.meta.env.BASE_URL} aria-label="webPORPID home"><span className="brand-mark">wp</span><span>webPORPID<small>Nanopore &amp; PacBio analysis</small></span></a><div className="site-header-right"><nav><a href="#run">Run</a><a href="#about">Methods</a><a href="https://github.com/MurrellGroup/webPORPID">GitHub</a></nav><span className="app-version" title={`webPORPID ${APP_VERSION}`}>v{APP_VERSION}</span></div></header>
     {!result ? <>
       <main className="landing">
         <section className="intro"><div><span className="section-kicker">PORPID, entirely on your machine</span><h1>From long reads to auditable within-host variants.</h1><p>Stream compressed FASTQ through demultiplexing, probabilistic UMI grouping, indel-aware consensus, contamination control, panel and functional filters—without uploading sequence data.</p><div className="privacy-pill"><span />Input reads stay in this browser or CLI process.</div></div><div className="intro-card"><strong>C++20 · WASI · SIMD</strong><p>The same portable core runs in browser workers and <code>porpid-cli</code>. Intermediate reads are partitioned to disk-backed storage and released after consensus.</p><dl><div><dt>Input</dt><dd>.fastq / .fastq.gz</dd></div><div><dt>Output</dt><dd>.webporpid</dd></div><div><dt>Default CPUs</dt><dd>{maxWorkers}</dd></div></dl></div></section>

@@ -13,13 +13,17 @@ The repository contains a neutral simulated demo only. Raw reads are processed l
 - Run-aware contamination clustering and filtering.
 - Artefact, agreement, panel-profile, and functional filters, plus APOBEC summaries.
 - Post-filter haplotype collapse with one multiplicity per retained UMI family, collapsed-tree abundance bubbles, and optional on-demand family-level trees.
+- Exact abundance geometry: bubble area is strictly linear in retained UMI-family count with no radius cap or floor, and the display slider is expressed as area per family.
 - Live, scrollable per-sample demultiplexing counts and phase-specific feedback with an independent working heartbeat for long operations.
 - Browser-history protection and unload warnings while selected inputs, an active run, or loaded results would otherwise be lost.
 - One-click `.tar.gz` export containing the editable project and every donor-specific component under its sample-ID directory.
-- Direct frame-selectable translation plus a Swig-derived linked tree/alignment viewer with modal highlighting, reference-coordinate regions, mutation mapping, and hideable names.
-- A bundled Alivibe pop-out editor with permissive biological-edit warnings, validated return, explicit tree recalculation, and separately persisted alignment/frame/tree edits.
+- An across-sample sortable overview with explicit demultiplexing/subsampling counts and family- and read/CCS-level percentages for every UMI and consensus filter, including heteroduplex, LDA, and every functional category.
+- Direct frame-selectable translation plus a Swig-derived linked tree/alignment viewer with prominent nucleotide/amino-acid switching, explicitly applied reference-coordinate regions, modal highlighting, mutation mapping, hideable names, and both tree-only and coordinated tree+alignment SVG exports. Trees open rooted on the zero-length edge to the UMI-family-weighted modal tip, with a topology- and distance-preserving midpoint-root control.
+- A contamination workbench with one decision per family and on-demand alignment/tree inference for contamination-panel references, discarded donor contaminants, and retained donor sequences using three categorical tip colors.
+- A bundled Alivibe pop-out editor with permissive biological-edit warnings, validated return, explicit tree recalculation, separately persisted alignment/frame/tree edits, and a detailed append-only edit audit.
 - Interactive UMI, artefact, agreement, MDS/APOBEC, and dinucleotide figures with labelled axes and SVG export.
 - A single compressed `.webporpid` result file, eighteen component export types, and a complete gzip-compressed tar bundle.
+- A subtle package-derived version label in the page header, so a deployed build can be identified immediately.
 
 ## Browser application
 

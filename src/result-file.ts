@@ -1,6 +1,7 @@
 import { decode, encode } from "@msgpack/msgpack";
 import { gzipSync, gunzipSync } from "fflate";
-import { inspectAlignment, translateAlignmentFasta, validateCorrectedAlignment } from "./alignment-utils.ts";
+import { inspectAlignment, summarizeAlignmentChanges, translateAlignmentFasta, validateCorrectedAlignment } from "./alignment-utils.ts";
+import { deduplicateContaminationCalls } from "./contamination.ts";
 import type { ResultBundle } from "./types";
 
 const MAGIC = Uint8Array.of(0x57, 0x50, 0x52, 0x00, 0x01, 0x0d, 0x0a, 0x1a);
@@ -64,21 +65,32 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     if (!sampleSet.has(sample) || summarySamples.has(sample)) throw new Error("Result summaries contain an unknown or duplicate sample."); summarySamples.add(sample);
     for (const key of ["demultiplexedReads", "observedUmis", "likelyRealUmis", "consensusSequences", "contaminationPassed", "postprocPassed", "artefactCutoff"])
       count(row[key], `summaries[${index}].${key}`);
+    if (row.selectedReads != null) count(row.selectedReads, `summaries[${index}].selectedReads`);
+    if (row.downsampledReads != null) count(row.downsampledReads, `summaries[${index}].downsampledReads`);
+    if (row.selectedReads != null && row.downsampledReads != null
+      && count(row.selectedReads, `summaries[${index}].selectedReads`) + count(row.downsampledReads, `summaries[${index}].downsampledReads`) !== count(row.demultiplexedReads, `summaries[${index}].demultiplexedReads`))
+      throw new Error("A sample summary has inconsistent selected and subsampled read counts.");
     if (row.collapsedSequences != null) count(row.collapsedSequences, `summaries[${index}].collapsedSequences`);
     if (row.functionalPassed != null) count(row.functionalPassed, `summaries[${index}].functionalPassed`);
   });
   if (summarySamples.size !== samples.length) throw new Error("Result summaries are missing a configured sample.");
 
-  const familyKeys = new Set<string>();
+  const familyKeys = new Set<string>(), familyReadsBySample = new Map<string, number>();
   array(bundle.umiFamilies, "umiFamilies").forEach((entry, index) => {
     const row = object(entry, `umiFamilies[${index}]`), sample = text(row.sample, `umiFamilies[${index}].sample`), sampleIndex = count(row.sampleIndex, `umiFamilies[${index}].sampleIndex`);
     knownSample(sample, `umiFamilies[${index}]`); if (sampleIndices.get(sample) !== sampleIndex) throw new Error("A UMI family has an inconsistent sample index.");
     const umi = text(row.umi, `umiFamilies[${index}].umi`), familyKey = `${sampleIndex}\0${umi}`;
     if (familyKeys.has(familyKey)) throw new Error("UMI family identifiers must be unique within a sample."); familyKeys.add(familyKey);
-    count(row.familySize, `umiFamilies[${index}].familySize`); text(row.mostLikelyParent, `umiFamilies[${index}].mostLikelyParent`);
+    const familySize = count(row.familySize, `umiFamilies[${index}].familySize`); familyReadsBySample.set(sample, (familyReadsBySample.get(sample) ?? 0) + familySize);
+    text(row.mostLikelyParent, `umiFamilies[${index}].mostLikelyParent`);
     numeric(row.posteriorProbability, `umiFamilies[${index}].posteriorProbability`); numeric(row.logOffspringProbability, `umiFamilies[${index}].logOffspringProbability`, false);
     if (!DISPOSITIONS.has(text(row.disposition, `umiFamilies[${index}].disposition`))) throw new Error("A UMI family has an unknown disposition.");
     optionalNumber(row.minimumAgreement, `umiFamilies[${index}].minimumAgreement`);
+  });
+  array(bundle.summaries, "summaries").forEach((entry, index) => {
+    const row = object(entry, `summaries[${index}]`), sample = text(row.sample, `summaries[${index}].sample`);
+    if (row.selectedReads != null && count(row.selectedReads, `summaries[${index}].selectedReads`) !== (familyReadsBySample.get(sample) ?? 0))
+      throw new Error("A sample summary selected-read count does not match its stored family calls.");
   });
 
   const consensusIds = new Set<string>();
@@ -103,6 +115,12 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     text(row.nearestNonselfVariant, "nearest non-self variant"); numeric(row.nearestNonselfDistance, "nearest non-self distance");
     bool(row.flagged, "contamination flagged"); bool(row.discarded, "contamination discarded"); bool(row.suspectOnly, "contamination suspectOnly");
   });
+  if (bundle.contaminationReferences != null) {
+    array(bundle.contaminationReferences, "contaminationReferences").forEach((entry, index) => {
+      const record = object(entry, `contaminationReferences[${index}]`); text(record.name, `contaminationReferences[${index}].name`);
+      text(record.sequence, `contaminationReferences[${index}].sequence`);
+    });
+  }
 
   const recordIds = new Set<string>(), recordMetadata = new Map<string, { sample: string; alignedNt?: string; minimumAgreement: number }>();
   array(bundle.records, "records").forEach((entry, index) => {
@@ -201,13 +219,46 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     optionalText(edit.treeFingerprint, `alignmentEdits.${name}.treeFingerprint`);
     optionalBool(edit.treeStale, `alignmentEdits.${name}.treeStale`);
     if (edit.warnings != null) array(edit.warnings, `alignmentEdits.${name}.warnings`).forEach((warning) => text(warning, "alignment edit warning"));
+    if (edit.changes != null) {
+      const changes = object(edit.changes, `alignmentEdits.${name}.changes`);
+      for (const field of ["rowsBefore", "rowsAfter", "columnsBefore", "columnsAfter", "removedNucleotides", "insertedNucleotides", "substitutedNucleotides"])
+        count(changes[field], `alignmentEdits.${name}.changes.${field}`);
+      bool(changes.rowOrderChanged, `alignmentEdits.${name}.changes.rowOrderChanged`);
+      for (const field of ["rowOrderBefore", "rowOrderAfter", "removedRows", "addedRows", "changedRows"])
+        array(changes[field], `alignmentEdits.${name}.changes.${field}`).forEach((value) => text(value, `alignmentEdits.${name}.changes.${field} entry`));
+      array(changes.rowChanges, `alignmentEdits.${name}.changes.rowChanges`).forEach((rawRow, index) => {
+        const row = object(rawRow, `alignmentEdits.${name}.changes.rowChanges[${index}]`); text(row.name, "alignment row change name");
+        for (const field of ["removedNucleotides", "insertedNucleotides", "substitutedNucleotides"]) count(row[field], `alignment row change ${field}`);
+        bool(row.gapPlacementChanged, "alignment row gap-placement flag");
+      });
+    }
     const storedAlignments = object(bundle.alignments, "alignments");
     const originalValue = storedAlignments[name] ?? (name === `${sample}/uncollapsed-nucleotide` ? storedAlignments[`${sample}/nucleotide`] : undefined);
     const original = text(originalValue, `alignments.${name}`);
     if (inspectAlignment(original, 1).fingerprint !== baselineFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent baseline fingerprint.`);
     if (inspectAlignment(fasta, 1).fingerprint !== editedFingerprint) throw new Error(`alignmentEdits.${name} has an inconsistent fingerprint.`);
     validateCorrectedAlignment(original, fasta);
+    if (edit.changes != null) {
+      const expected = summarizeAlignmentChanges(original, fasta), stored = edit.changes as Record<string, unknown>;
+      for (const field of ["rowsBefore", "rowsAfter", "columnsBefore", "columnsAfter", "removedNucleotides", "insertedNucleotides", "substitutedNucleotides"] as const)
+        if (stored[field] !== expected[field]) throw new Error(`alignmentEdits.${name}.changes.${field} is inconsistent with the stored alignments.`);
+      if (stored.rowOrderChanged !== expected.rowOrderChanged) throw new Error(`alignmentEdits.${name}.changes.rowOrderChanged is inconsistent with the stored alignments.`);
+      for (const field of ["rowOrderBefore", "rowOrderAfter", "removedRows", "addedRows", "changedRows"] as const)
+        if (JSON.stringify(stored[field]) !== JSON.stringify(expected[field])) throw new Error(`alignmentEdits.${name}.changes.${field} is inconsistent with the stored alignments.`);
+      if (JSON.stringify(stored.rowChanges) !== JSON.stringify(expected.rowChanges)) throw new Error(`alignmentEdits.${name}.changes.rowChanges is inconsistent with the stored alignments.`);
+    }
   }
+  if (bundle.alignmentEditHistory != null) array(bundle.alignmentEditHistory, "alignmentEditHistory").forEach((rawEntry, index) => {
+    const entry = object(rawEntry, `alignmentEditHistory[${index}]`), key = text(entry.alignmentKey, `alignmentEditHistory[${index}].alignmentKey`);
+    const sample = key.split("/", 1)[0]; knownSample(sample, `alignmentEditHistory[${index}]`);
+    if (key !== `${sample}/nucleotide` && key !== `${sample}/uncollapsed-nucleotide`) throw new Error("Alignment audit keys must identify a nucleotide view.");
+    if (!["alignment-edit", "frame-change", "tree-recalculation", "edit-reset"].includes(text(entry.action, `alignmentEditHistory[${index}].action`)))
+      throw new Error("Alignment audit action is not recognized.");
+    text(entry.timestamp, `alignmentEditHistory[${index}].timestamp`); text(entry.source, `alignmentEditHistory[${index}].source`);
+    array(entry.details, `alignmentEditHistory[${index}].details`).forEach((value) => text(value, "alignment audit detail"));
+    optionalText(entry.beforeFingerprint, `alignmentEditHistory[${index}].beforeFingerprint`);
+    optionalText(entry.afterFingerprint, `alignmentEditHistory[${index}].afterFingerprint`);
+  });
   if (bundle.timings != null) array(bundle.timings, "timings").forEach((entry, index) => {
     const timing = object(entry, `timings[${index}]`);
     const stage = text(timing.stage, `timings[${index}].stage`);
@@ -277,7 +328,7 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
     ) };
     case "contamination-csv": return { extension: "contamination.csv", mime: "text/csv", text: csv(
       ["sample", "sequence_name", "nearest_nonself_variant", "nearest_nonself_distance", "flagged", "discarded", "suspect_only"],
-      bundle.contamination.filter((row) => !sample || row.sample === sample).map((row) => [row.sample, row.sequenceId, row.nearestNonselfVariant, row.nearestNonselfDistance, row.flagged, row.discarded, row.suspectOnly]),
+      deduplicateContaminationCalls(bundle.contamination).filter((row) => !sample || row.sample === sample).map((row) => [row.sample, row.sequenceId, row.nearestNonselfVariant, row.nearestNonselfDistance, row.flagged, row.discarded, row.suspectOnly]),
     ) };
     case "postproc-csv": return { extension: "postproc.csv", mime: "text/csv", text: csv(
       ["sample", "id", "UMI", "fs", "minag", "panel_score", "artefact_pass", "agreement_pass", "contamination_pass", "panel_pass", "functional_pass", "rejection_reasons"],

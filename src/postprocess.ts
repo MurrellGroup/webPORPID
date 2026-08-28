@@ -276,7 +276,7 @@ export async function postprocess(
           const outcome = functionalByIndex.get(index)!;
           functionalPass = outcome.passed; trimmedNt = outcome.nt; trimmedAa = outcome.aa; rejectionReasons.push(...outcome.reasons);
           if (outcome.passed) functionalPassed++;
-        } else functionalPass = false;
+        }
       }
       if (acceptedRow) nucleotideRows.push({ name: record.id, sequence: acceptedRow });
       records.push({ id: record.id, sample: sample.name, umi: record.umi, familySize: record.familySize,

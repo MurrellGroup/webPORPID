@@ -1,4 +1,4 @@
-import type { AlignmentEdit, NamedSequence, ResultBundle } from "./types";
+import type { AlignmentChangeSummary, AlignmentEdit, AlignmentRowChange, NamedSequence, ResultBundle } from "./types";
 
 export type AlignmentFrameOffset = 0 | 1 | 2;
 
@@ -14,6 +14,7 @@ export interface AlignmentCorrectionInspection extends AlignmentInspection {
   removedRows: string[];
   addedRows: string[];
   changedRows: string[];
+  rowChanges: AlignmentRowChange[];
   removedNucleotides: number;
   insertedNucleotides: number;
   substitutedNucleotides: number;
@@ -94,6 +95,41 @@ export function inspectAlignment(text: string, minimumRows = 2): AlignmentInspec
 
 function ungapped(sequence: string): string { return sequence.replaceAll("-", "").replaceAll("U", "T"); }
 
+/** Exact unit-cost Levenshtein decomposition with deterministic diagonal ties. */
+function nucleotideEditCounts(original: string, replacement: string) {
+  if (original === replacement) return { substitutedNucleotides: 0, insertedNucleotides: 0, removedNucleotides: 0 };
+  const width = replacement.length + 1;
+  let previousCost = new Uint32Array(width), previousSubstitutions = new Uint32Array(width), previousInsertions = new Uint32Array(width), previousDeletions = new Uint32Array(width);
+  let currentCost = new Uint32Array(width), currentSubstitutions = new Uint32Array(width), currentInsertions = new Uint32Array(width), currentDeletions = new Uint32Array(width);
+  for (let column = 0; column < width; column += 1) { previousCost[column] = column; previousInsertions[column] = column; }
+  for (let row = 1; row <= original.length; row += 1) {
+    currentCost[0] = row; currentSubstitutions[0] = 0; currentInsertions[0] = 0; currentDeletions[0] = row;
+    for (let column = 1; column < width; column += 1) {
+      const mismatch = original[row - 1] === replacement[column - 1] ? 0 : 1;
+      // Start with the diagonal candidate so a tied one-base substitution is
+      // reported as such instead of an arbitrary delete/insert pair.
+      let cost = previousCost[column - 1] + mismatch;
+      let substitutions = previousSubstitutions[column - 1] + mismatch;
+      let insertions = previousInsertions[column - 1], deletions = previousDeletions[column - 1];
+      const deletionCost = previousCost[column] + 1;
+      if (deletionCost < cost) {
+        cost = deletionCost; substitutions = previousSubstitutions[column]; insertions = previousInsertions[column]; deletions = previousDeletions[column] + 1;
+      }
+      const insertionCost = currentCost[column - 1] + 1;
+      if (insertionCost < cost) {
+        cost = insertionCost; substitutions = currentSubstitutions[column - 1]; insertions = currentInsertions[column - 1] + 1; deletions = currentDeletions[column - 1];
+      }
+      currentCost[column] = cost; currentSubstitutions[column] = substitutions; currentInsertions[column] = insertions; currentDeletions[column] = deletions;
+    }
+    [previousCost, currentCost] = [currentCost, previousCost];
+    [previousSubstitutions, currentSubstitutions] = [currentSubstitutions, previousSubstitutions];
+    [previousInsertions, currentInsertions] = [currentInsertions, previousInsertions];
+    [previousDeletions, currentDeletions] = [currentDeletions, previousDeletions];
+  }
+  const column = replacement.length;
+  return { substitutedNucleotides: previousSubstitutions[column], insertedNucleotides: previousInsertions[column], removedNucleotides: previousDeletions[column] };
+}
+
 /**
  * Validate the FASTA shape without restricting biological edits. Substitutions,
  * insertions, deletions, renamed rows and removed rows are all retained in the
@@ -109,7 +145,7 @@ export function validateCorrectedAlignment(currentText: string, correctedText: s
   const correctedNames = new Set(corrected.records.map((record) => record.name));
   const removedRows = current.records.filter((record) => !correctedNames.has(record.name)).map((record) => record.name);
   const addedRows = corrected.records.filter((record) => !currentByName.has(record.name)).map((record) => record.name);
-  const changedRows: string[] = [];
+  const changedRows: string[] = [], rowChanges: AlignmentRowChange[] = [];
   let removedNucleotides = 0, insertedNucleotides = 0, substitutedNucleotides = 0;
   for (const record of corrected.records) {
     const originalAligned = currentByName.get(record.name);
@@ -117,12 +153,29 @@ export function validateCorrectedAlignment(currentText: string, correctedText: s
     const original = ungapped(originalAligned);
     const replacement = ungapped(record.sequence);
     if (original !== replacement || originalAligned !== record.sequence) changedRows.push(record.name);
-    const shared = Math.min(original.length, replacement.length);
-    for (let index = 0; index < shared; index += 1) if (original[index] !== replacement[index]) substitutedNucleotides += 1;
-    removedNucleotides += Math.max(0, original.length - replacement.length);
-    insertedNucleotides += Math.max(0, replacement.length - original.length);
+    const edits = nucleotideEditCounts(original, replacement);
+    const rowSubstitutions = edits.substitutedNucleotides, rowRemoved = edits.removedNucleotides, rowInserted = edits.insertedNucleotides;
+    substitutedNucleotides += rowSubstitutions; removedNucleotides += rowRemoved; insertedNucleotides += rowInserted;
+    if (original !== replacement || originalAligned !== record.sequence) rowChanges.push({ name: record.name,
+      substitutedNucleotides: rowSubstitutions, insertedNucleotides: rowInserted, removedNucleotides: rowRemoved,
+      gapPlacementChanged: originalAligned !== record.sequence && original === replacement });
   }
-  return { ...corrected, removedRows, addedRows, changedRows, removedNucleotides, insertedNucleotides, substitutedNucleotides };
+  return { ...corrected, removedRows, addedRows, changedRows, rowChanges, removedNucleotides, insertedNucleotides, substitutedNucleotides };
+}
+
+export function summarizeAlignmentChanges(currentText: string, correctedText: string): AlignmentChangeSummary {
+  const current = inspectAlignment(currentText, 1), corrected = validateCorrectedAlignment(currentText, correctedText);
+  const currentNames = new Set(current.records.map((record) => record.name)), correctedNames = new Set(corrected.records.map((record) => record.name));
+  const sharedBefore = current.records.map((record) => record.name).filter((name) => correctedNames.has(name));
+  const sharedAfter = corrected.records.map((record) => record.name).filter((name) => currentNames.has(name));
+  return {
+    rowsBefore: current.rows, rowsAfter: corrected.rows, columnsBefore: current.columns, columnsAfter: corrected.columns,
+    rowOrderChanged: sharedBefore.join("\0") !== sharedAfter.join("\0"),
+    rowOrderBefore: current.records.map((record) => record.name), rowOrderAfter: corrected.records.map((record) => record.name),
+    removedRows: corrected.removedRows, addedRows: corrected.addedRows, changedRows: corrected.changedRows, rowChanges: corrected.rowChanges,
+    removedNucleotides: corrected.removedNucleotides, insertedNucleotides: corrected.insertedNucleotides,
+    substitutedNucleotides: corrected.substitutedNucleotides,
+  };
 }
 
 export function translateAlignedNucleotides(sequence: string, frameOffset: number = 0): string {

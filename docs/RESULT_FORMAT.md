@@ -17,16 +17,16 @@ The browser and CLI share the same encoder/decoder. The current decoder caps com
 ## Stored components
 
 - **Provenance:** webPORPID version, creation time, engine, worker count, input name and SHA-256, compiled-configuration SHA-256, deterministic seed, and supplied PORPID branch/commit identifier.
-- **Configuration:** dataset, sample primers, reference filenames, overrides, and every pipeline parameter. Reference sequence bodies are not duplicated here.
-- **Quality summary:** total, expected-error, length, primer, sample-ID, BPB, malformed, demultiplexed, downsampled, and per-sample counters.
+- **Configuration:** dataset, sample primers, reference filenames, overrides, and every pipeline parameter. The external contamination-panel records are stored separately so a joint reference/donor contamination phylogeny can be built after reload; raw reads and the larger preprocessing spool are never retained.
+- **Quality summary:** total, expected-error, length, primer, sample-ID, BPB, malformed, demultiplexed, downsampled, and per-sample counters, including exact selected/subsampled reads for each sample.
 - **UMI family table:** observed UMI, size, most likely parent, posterior/log-offspring probability, disposition, and consensus minimum agreement where available.
 - **Consensus records:** identifiers, sample, UMI, family size, nucleotide sequence, minimum agreement, and low-agreement site details.
-- **Contamination calls:** nearest non-self label/distance and primary-discard versus wider-suspect status.
+- **Contamination calls:** one decision per consensus family, with nearest non-self label/distance and primary-discard versus wider-suspect status. A primary decision takes precedence over the wider suspect pass.
 - **Post-processing records:** consensus/aligned/trimmed sequences, every filter decision, panel score, functional rejection reasons, and optional APOBEC posterior summary.
 - **Per-sample products:** collapsed and uncollapsed nucleotide FASTA alignments, directly translated protein views, optional nucleotide Newick trees, and the aligned reference row used for coordinate display.
-- **Collapse membership:** representative, member identifiers, conservative minimum agreement, and a multiplicity that counts UMI families rather than reads.
+- **Collapse membership:** representative, member identifiers, and a multiplicity that counts UMI families rather than reads. Minimum agreement remains exclusively attached to the member UMI families.
 - **Input mapping/run options:** exact uploaded-file to YAML-slot assignments, whether automatic phylogeny inference was deferred, and automatic versus external scratch-spool selection. Scratch directory handles and paths are never serialized.
-- **Optional alignment edits:** exact corrected nucleotide FASTA, translation frame, baseline/edited/tree fingerprints, warning summary, edit source/time, stale-tree state, and optional recalculated Newick tree. The original alignment remains untouched.
+- **Optional alignment edits:** exact corrected nucleotide FASTA, translation frame, baseline/edited/tree fingerprints, row/column dimensions, exact added/deleted/changed row identifiers, deterministic minimum-edit per-row and aggregate substitution/insertion/deletion counts, explicit shared-row reorder state, gap-only change flags, warning summary, edit source/time, stale-tree state, and optional recalculated Newick tree. An append-only action history records edits, frame changes, resets, and tree recalculations. The original alignment remains untouched.
 - **Run timing/log:** per-stage wall times plus persistent stage counts, input mappings, interactive tree runs, execution/storage choices, and fallbacks.
 
 Validation requires unique sample, family, consensus, and post-processing identities; valid sample indices/references; complete sample summaries; known family dispositions; numeric counters; consensus-linked contamination calls; exact consensus metadata/sequence agreement between consensus and post-processing records; complete family-count collapse membership; reference/alignment width agreement; edit fingerprints; and known-sample alignment/tree keys.
@@ -42,7 +42,7 @@ Validation requires unique sample, family, consensus, and post-processing identi
 | `trimmed-aa-fasta` | Functionally accepted translated amino-acid sequences |
 | `family-csv` | UMI parent, family size, posterior/log probability, disposition, and minimum agreement |
 | `low-agreement-csv` | Per-site agreement, 3′ coordinate, modal base, and homopolymer run length |
-| `contamination-csv` | Primary and wider-suspect contamination calls |
+| `contamination-csv` | One primary-or-suspect contamination decision per consensus family |
 | `postproc-csv` | All filter flags, panel score, functional flag, and rejection reasons |
 | `apobec-csv` | Stored APOBEC posterior summaries |
 | `collapse-csv` | Collapsed representatives, UMI-family multiplicities, and member identifiers; per-family agreement remains in the post-processing export |

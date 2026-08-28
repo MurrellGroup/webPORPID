@@ -66,7 +66,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   } catch (cause) { pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.4 started`,
+  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.5 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}`];
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
@@ -147,7 +147,10 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       }
     }));
     progress({ stage: "umi", fraction: .64, detail: "Combining UMI counts across all temporary read blocks" });
-    const mergedCounts = mergeFamilyCounts(countParts), selectedReads = decodeFamilyCounts(mergedCounts).reduce((sum, entry) => sum + entry.count, 0);
+    const mergedCounts = mergeFamilyCounts(countParts), decodedCounts = decodeFamilyCounts(mergedCounts);
+    const selectedReadsBySample = Array(request.config.samples.length).fill(0) as number[];
+    for (const entry of decodedCounts) selectedReadsBySample[entry.sample] += entry.count;
+    const selectedReads = selectedReadsBySample.reduce((sum, count) => sum + count, 0);
     quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
     const modelBuffer = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
     progress({ stage: "umi", fraction: .72, detail: "Fitting the global UMI offspring-probability model and classifying families" });
@@ -207,6 +210,8 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       (state) => progress({ stage: "postprocessing", fraction: state.fraction, detail: state.detail }));
     downstream.summaries.forEach((summary, index) => {
       summary.demultiplexedReads = quality.perSample[index] ?? 0;
+      summary.selectedReads = selectedReadsBySample[index] ?? 0;
+      summary.downsampledReads = Math.max(0, summary.demultiplexedReads - summary.selectedReads);
       summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
       summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
     });
@@ -242,12 +247,13 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.4", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.5", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
       config: resultConfig(request.config), quality, summaries: downstream.summaries, umiFamilies,
-      consensuses, contamination, records: downstream.records, alignments: downstream.alignments, trees,
+      consensuses, contamination, contaminationReferences: request.config.contaminationPanelSequences,
+      records: downstream.records, alignments: downstream.alignments, trees,
       referenceAlignments: downstream.referenceAlignments, collapseGroups: downstream.collapseGroups,
       inputMappings: request.inputMappings, runOptions: { deferPhylogeny: Boolean(request.deferPhylogeny),
         spoolStorage: request.spoolStorage === "external-directory" ? "external-directory" : "automatic" }, timings, log,
