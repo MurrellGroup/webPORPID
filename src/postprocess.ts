@@ -17,6 +17,8 @@ export interface PostprocessOutput {
 export type MsaRunner = (sequences: readonly string[], signal?: AbortSignal, iterations?: number,
   scoringMode?: "literal" | "nucleotide" | "amino-acid") => Promise<string[]>;
 
+export interface PostprocessProgress { fraction: number; detail: string }
+
 const degap = (sequence: string) => sequence.replaceAll("-", "").toUpperCase();
 const fasta = (rows: Array<{ name: string; sequence: string }>) => rows.map((row) => `>${row.name}\n${row.sequence.match(/.{1,80}/g)?.join("\n") ?? ""}`).join("\n") + (rows.length ? "\n" : "");
 
@@ -201,16 +203,22 @@ async function functionalFilterBatch(
 
 export async function postprocess(
   consensuses: ConsensusRecord[], contamination: ContaminationCall[], config: PipelineConfig, signal?: AbortSignal,
-  runMsa: MsaRunner = runAlivibeMsa, sampleConcurrency = 1,
+  runMsa: MsaRunner = runAlivibeMsa, sampleConcurrency = 1, onProgress?: (progress: PostprocessProgress) => void,
 ): Promise<PostprocessOutput> {
   const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
   const outputs: PostprocessOutput[] = Array(config.samples.length); let cursor = 0, collapseMilliseconds = 0;
+  const sampleProgress = Array(config.samples.length).fill(0);
+  const report = (sampleIndex: number, fraction: number, detail: string) => {
+    sampleProgress[sampleIndex] = Math.max(sampleProgress[sampleIndex], Math.max(0, Math.min(1, fraction)));
+    onProgress?.({ fraction: sampleProgress.reduce((sum, value) => sum + value, 0) / Math.max(1, sampleProgress.length), detail });
+  };
   await Promise.all(Array.from({ length: Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
     while (true) {
       const sampleIndex = cursor++; if (sampleIndex >= config.samples.length) return;
       const sample = config.samples[sampleIndex], records: PostprocRecord[] = [], summaries: SampleSummary[] = [], alignments: Record<string, string> = {};
       const referenceAlignments: Record<string, string> = {}, collapseGroups: PostprocessOutput["collapseGroups"] = {};
     if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
+    report(sampleIndex, .03, `Preparing filters for sample ${sample.name}`);
     const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
     const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile)
       * (sample.artefactFractionOverride ?? config.parameters.artefactFraction));
@@ -219,6 +227,7 @@ export async function postprocess(
       && record.minimumAgreement >= agreementThreshold && !discarded.has(record.id));
     const scores = Array(source.length).fill(0), panelPass = Array(source.length).fill(true), extracted = new Map<number, string>();
     if (preliminary.length && sample.panelSequences.length) {
+      report(sampleIndex, .18, `Screening candidate sequences against the reference panel for sample ${sample.name}`);
       const candidates = preliminary.length > 1
         ? await runScalableMsa(preliminary.map(({ record }) => degap(record.sequence)), runMsa, signal, 3, "nucleotide")
         : preliminary.map(({ record }) => degap(record.sequence));
@@ -232,23 +241,28 @@ export async function postprocess(
     } else {
       preliminary.forEach(({ record, index }) => extracted.set(index, degap(record.sequence)));
     }
+    report(sampleIndex, .4, `Reference-panel screening complete for sample ${sample.name}`);
     const accepted = preliminary.filter(({ index }) => panelPass[index]);
     const displayReference = sample.functionalReferenceSequence?.sequence ?? sample.panelSequences[0]?.sequence;
     let acceptedAlignment: string[] = [], alignedReference = "";
     if (accepted.length) {
+      report(sampleIndex, .48, `Building the retained-sequence alignment for sample ${sample.name}`);
       const inputs = [...(displayReference ? [degap(displayReference)] : []), ...accepted.map(({ index }) => extracted.get(index)!)];
       const aligned = inputs.length > 1 ? await runScalableMsa(inputs, runMsa, signal, 3, "nucleotide") : inputs;
       if (displayReference) { alignedReference = aligned[0]; acceptedAlignment = aligned.slice(1); }
       else { acceptedAlignment = aligned; alignedReference = alignmentConsensus(aligned); }
     }
+    report(sampleIndex, .66, `Retained-sequence alignment complete for sample ${sample.name}`);
     const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
     const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows: Array<{ name: string; sequence: string }> = [];
     const functionalByIndex = new Map<number, FunctionalOutcome>();
     if (sample.functionalReferenceSequence && accepted.length) {
+      report(sampleIndex, .72, `Checking coding-frame and functional-reference requirements for sample ${sample.name}`);
       const outcomes = await functionalFilterBatch(sample.functionalReferenceSequence.sequence,
         accepted.map(({ index }) => extracted.get(index)!), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
       accepted.forEach(({ index }, position) => functionalByIndex.set(index, outcomes[position]));
     }
+    report(sampleIndex, .84, `Calculating sequence annotations and filter decisions for sample ${sample.name}`);
     let functionalPassed = 0;
     source.forEach((record, index) => {
       const artefactPass = record.familySize >= artefactCutoff, agreementPass = record.minimumAgreement >= agreementThreshold;
@@ -272,7 +286,7 @@ export async function postprocess(
     });
     let collapsedCount = 0;
     if (nucleotideRows.length) {
-      const uncollapsed = fasta(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name, records);
+      const uncollapsed = fasta(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name);
       collapseMilliseconds += performance.now() - collapseStarted;
       collapsedCount = collapsed.groups.length;
       alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
@@ -293,6 +307,7 @@ export async function postprocess(
       postprocPassed: accepted.length, collapsedSequences: collapsedCount,
       functionalPassed: sample.functionalReferenceSequence ? functionalPassed : undefined, artefactCutoff });
       outputs[sampleIndex] = { records, summaries, alignments, referenceAlignments, collapseGroups, collapseSeconds: 0 };
+      report(sampleIndex, 1, `Downstream processing complete for sample ${sample.name}`);
     }
   }));
   return { records: outputs.flatMap((output) => output.records), summaries: outputs.flatMap((output) => output.summaries),

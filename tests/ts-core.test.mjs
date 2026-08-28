@@ -6,6 +6,7 @@ import { pathToFileURL } from "node:url";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { build } from "rolldown";
+import { gunzipSync } from "fflate";
 
 import { inspectAlignment, translateAlignmentFasta, validateCorrectedAlignment } from "../src/alignment-utils.ts";
 import { referenceDisplayColumns } from "../src/alignment-regions.ts";
@@ -15,6 +16,7 @@ import {
 } from "../src/alivibe-roundtrip.ts";
 import { decodeResult, encodeResult, exportComponent } from "../src/result-file.ts";
 import { collapseAlignment } from "../src/collapse.ts";
+import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
 import { adaptiveSpoolCutoff, PartitionStore, writeAllSync } from "../src/partition-store.ts";
@@ -41,6 +43,49 @@ function countSpoolRecords(bytes) {
   let count = 0, offset = 0;
   while (offset < bytes.byteLength) { const header = parseSpoolRecordHeader(bytes.subarray(offset)); offset += header.recordLength; count++; }
   assert.equal(offset, bytes.byteLength); return count;
+}
+
+function tarEntries(archive) {
+  const bytes = gunzipSync(archive), decoder = new TextDecoder(), entries = new Map(); let offset = 0;
+  while (offset + 512 <= bytes.byteLength && bytes.subarray(offset, offset + 512).some(Boolean)) {
+    const header = bytes.subarray(offset, offset + 512), name = decoder.decode(header.subarray(0, 100)).replace(/\0.*$/, "");
+    const sizeText = decoder.decode(header.subarray(124, 136)).replace(/\0.*$/, "").trim(), size = Number.parseInt(sizeText || "0", 8);
+    offset += 512; entries.set(name, bytes.slice(offset, offset + size)); offset += Math.ceil(size / 512) * 512;
+  }
+  return entries;
+}
+
+class MemoryScratchWritable {
+  constructor(file) { this.file = file; this.chunks = []; this.finished = false; }
+  async write(bytes) { assert(!this.finished); this.file.writeCalls++; this.chunks.push(bytes.slice()); }
+  async close() {
+    assert(!this.finished); this.finished = true;
+    const length = this.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0), output = new Uint8Array(length); let offset = 0;
+    for (const chunk of this.chunks) { output.set(chunk, offset); offset += chunk.byteLength; } this.file.bytes = output;
+  }
+  async abort() { this.finished = true; this.chunks = []; }
+}
+
+class MemoryScratchFile {
+  bytes = new Uint8Array();
+  writeCalls = 0;
+  async createWritable() { return new MemoryScratchWritable(this); }
+  async getFile() { return new Blob([this.bytes]); }
+}
+
+class MemoryScratchDirectory {
+  constructor(name) { this.name = name; this.directories = new Map(); this.files = new Map(); this.removed = []; }
+  async getDirectoryHandle(name, options = {}) {
+    let directory = this.directories.get(name);
+    if (!directory && options.create) { directory = new MemoryScratchDirectory(name); this.directories.set(name, directory); }
+    if (!directory) throw new Error("directory missing"); return directory;
+  }
+  async getFileHandle(name, options = {}) {
+    let file = this.files.get(name);
+    if (!file && options.create) { file = new MemoryScratchFile(); this.files.set(name, file); }
+    if (!file) throw new Error("file missing"); return file;
+  }
+  async removeEntry(name) { if (!this.directories.delete(name) && !this.files.delete(name)) throw new Error("entry missing"); this.removed.push(name); }
 }
 
 test("spool cutoff filtering materializes only selected records", () => {
@@ -81,6 +126,25 @@ test("adaptive spool admission retains every final deterministic selection while
     assert.equal(statistics.observedRecords, hashes.length); assert(statistics.bypassedRecords > 0);
     assert(statistics.reclaimedBytes > 0); assert(statistics.currentBytes < statistics.writtenBytes);
   } finally { await store.close(); }
+});
+
+test("external scratch mode streams complete no-downsampling partitions and removes its temporary directory", async () => {
+  const root = new MemoryScratchDirectory("chosen-disk"), maximumHash = (1n << 64n) - 1n;
+  const store = await PartitionStore.create(4, { sampleCount: 1, maximumReadsPerSample: 0, externalDirectory: root });
+  try {
+    assert.equal(store.mode, "external-directory");
+    for (let index = 0; index < 40; index++) {
+      const record = spoolRecord(0, (BigInt(index + 1) * 11400714819323198485n) & maximumHash, "AACCGGTT", `external-${index}`);
+      await store.appendFrames(routedSpoolRecord(index % 4, record));
+    }
+    await store.seal();
+    const temporary = [...root.directories.values()][0];
+    assert.equal([...temporary.files.values()].reduce((sum, file) => sum + file.writeCalls, 0), 4, "small frames should be coalesced into one sequential write per partition");
+    const selected = await Promise.all(Array.from({ length: 4 }, (_, partition) => store.readSelected(partition, [maximumHash])));
+    assert.equal(selected.reduce((sum, bytes) => sum + countSpoolRecords(bytes), 0), 40);
+    assert.equal(store.statistics().bypassedRecords, 0); assert(store.statistics().currentBytes > 0);
+  } finally { await store.close(); }
+  assert.equal(root.directories.size, 0); assert.equal(root.removed.length, 1);
 });
 
 test("original single-dataset PORPID YAML remains accepted", async () => {
@@ -180,12 +244,18 @@ test("report figures and the Swig-derived viewer render from a result payload", 
       createElement(charts.MdsApobecPlot, { records: [record] }),
       createElement(charts.DinucleotideHeatmaps, { families: [family] }),
       createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n>b\nATGTAG\n", newick: "(a:0.001,b:0.002);", alphabet: "nt", collapsed: true,
-        leafMetadata: { a: { familyCount: 4, minimumAgreement: .7 }, b: { familyCount: 1, minimumAgreement: .9 } } }),
+        leafMetadata: { a: { familyCount: 4 }, b: { familyCount: 1 } } }),
     ].map((component) => renderToStaticMarkup(component)).join("\n");
     for (const label of ["UMI family size", "artefact cutoff", "Minimum-agreement positions", "multidimensional scaling", "dinucleotide frequencies", "Phylogram coordinated"])
       assert.match(markup, new RegExp(label, "i"));
     assert.match(markup, /<canvas/); assert.match(markup, /substitutions\/site/); assert.match(markup, /Export SVG/); assert.match(markup, /Bubble size/);
     assert.match(markup, /r="5\.6"/, "bubble radius must be proportional to the square root of family count");
+    const collapsedViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);", collapsed: true,
+      leafMetadata: { a: { familyCount: 3, minimumAgreement: .7 } } }));
+    assert.doesNotMatch(collapsedViewer, /Tip color|family minimum agreement/i, "legacy agreement metadata must not appear as a collapsed-haplotype property");
+    const familyViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);",
+      leafMetadata: { a: { familyCount: 1, minimumAgreement: .7 } } }));
+    assert.match(familyViewer, /Family minimum agreement/i);
     const mismatched = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0,b:0.0);", alphabet: "nt" }));
     assert.match(mismatched, /stale tree is hidden/i);
     const coordinates = charts.classicalMds(["AAAA", "AAAT", "AATA", "ATAA", "TAAA"]);
@@ -194,16 +264,11 @@ test("report figures and the Swig-derived viewer render from a result payload", 
   } finally { await rm(directory, { recursive: true, force: true }); }
 });
 
-test("collapse counts retained UMI families, not reads", () => {
-  const records = [
-    { id: "family_a", minimumAgreement: .91, familySize: 100 },
-    { id: "family_b", minimumAgreement: .72, familySize: 2 },
-    { id: "family_c", minimumAgreement: .88, familySize: 40 },
-  ];
-  const collapsed = collapseAlignment(">family_a\nAC-GT\n>family_b\nA-CGT\n>family_c\nAT-GT\n", "sample_1", records);
+test("collapse counts retained UMI families without assigning family agreement to haplotypes", () => {
+  const collapsed = collapseAlignment(">family_a\nAC-GT\n>family_b\nA-CGT\n>family_c\nAT-GT\n", "sample_1");
   assert.equal(collapsed.groups.length, 2);
   assert.equal(collapsed.groups[0].familyCount, 2);
-  assert.equal(collapsed.groups[0].minimumAgreement, .72);
+  assert.equal("minimumAgreement" in collapsed.groups[0], false);
   assert.deepEqual(collapsed.groups[0].memberIds, ["family_a", "family_b"]);
   assert.match(collapsed.fasta, /^>family_a\nAC-GT\n>family_c\nAT-GT\n$/);
 });
@@ -240,7 +305,7 @@ function resultBundle() {
     functionalMatchThreshold: 0.7, spoolPartitions: 8, deterministicSeed: "1" };
   return {
     schema: "webporpid-results/1",
-    provenance: { webporpidVersion: "0.3.0", createdUtc: "2026-08-27T00:00:00.000Z", engine: "test", workers: 2,
+    provenance: { webporpidVersion: "0.3.4", createdUtc: "2026-08-27T00:00:00.000Z", engine: "test", workers: 2,
       inputName: "reads.fastq.gz", inputSha256: "a".repeat(64), configSha256: "b".repeat(64), deterministicSeed: "1",
       upstreamBranch: "nanopore", upstreamCommit: "c".repeat(40) },
     config: { dataset: "test", samples: [{ name: "sample_1", cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa" }],
@@ -260,9 +325,9 @@ function resultBundle() {
     alignments: { "sample_1/nucleotide": ">c1\nATGTAA\n", "sample_1/uncollapsed-nucleotide": ">c1\nATGTAA\n",
       "sample_1/protein": ">c1\nM*\n", "sample_1/uncollapsed-protein": ">c1\nM*\n" },
     referenceAlignments: { "sample_1/nucleotide": ">reference\nATGTAA\n" },
-    collapseGroups: { sample_1: [{ sample: "sample_1", representativeId: "c1", memberIds: ["c1"], familyCount: 1, minimumAgreement: .67 }] },
+    collapseGroups: { sample_1: [{ sample: "sample_1", representativeId: "c1", memberIds: ["c1"], familyCount: 1 }] },
     inputMappings: [{ slot: "panel.fa", role: "panel", expectedName: "panel.fa", uploadedName: "renamed.fasta", uploadedSize: 12 }],
-    runOptions: { deferPhylogeny: false }, trees: { "sample_1/nucleotide": "(c1:0.0);" }, log: ["complete"],
+    runOptions: { deferPhylogeny: false, spoolStorage: "external-directory" }, trees: { "sample_1/nucleotide": "(c1:0.0);" }, log: ["complete"],
   };
 }
 
@@ -270,7 +335,7 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   const bundle = resultBundle(), encoded = encodeResult(bundle), decoded = decodeResult(encoded);
   assert.deepEqual(decoded, bundle);
   assert.equal(exportComponent(decoded, "trimmed-aa-fasta", "sample_1").text, ">c1\nM*\n");
-  assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /c1,1,0\.67,c1/);
+  assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /representative_id,family_count,member_ids\nsample_1,c1,1,c1/);
   assert.equal(exportComponent(decoded, "uncollapsed-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
   decoded.alignments["sample_1/protein"] = ">c1\nWRONG\n";
   assert.equal(exportComponent(decoded, "protein-alignment", "sample_1").text, ">c1\nM*\n", "protein export must translate the nucleotide alignment directly");
@@ -287,4 +352,31 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   assert.throws(() => decodeResult(encoded.subarray(0, encoded.length - 5)), /(corrupt|truncated|too large)/);
   const inconsistent = structuredClone(bundle); inconsistent.records[0].consensusNt = "ATGTAG";
   assert.throws(() => encodeResult(inconsistent), /inconsistent consensus sequence/);
+  const unknownStorage = structuredClone(bundle); unknownStorage.runOptions.spoolStorage = "cloud";
+  assert.throws(() => encodeResult(unknownStorage), /spoolStorage is not recognized/);
+  const legacyCollapse = structuredClone(bundle); legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .67;
+  assert.doesNotThrow(() => encodeResult(legacyCollapse), "results through 0.3.2 must remain loadable");
+  legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .5;
+  assert.throws(() => encodeResult(legacyCollapse), /legacy collapse group has inconsistent family-agreement metadata/);
+});
+
+test("export all is one gzip-compressed tar with every sample output in its sample directory", () => {
+  const bundle = resultBundle(), entries = tarEntries(buildExportArchive(bundle)), decoder = new TextDecoder();
+  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 3);
+  assert(entries.has("README.txt")); assert(entries.has("test.webporpid")); assert(entries.has("run.log.txt"));
+  assert.equal(decoder.decode(entries.get("sample_1/trimmed-aa.fasta")), exportComponent(bundle, "trimmed-aa-fasta", "sample_1").text);
+  assert.equal(decoder.decode(entries.get("sample_1/families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
+  assert.deepEqual(decodeResult(entries.get("test.webporpid")), bundle);
+});
+
+test("live demultiplexing and Swig-style navigation-loss guards stay wired into the app", async () => {
+  const [app, pipeline, styles] = await Promise.all([
+    readFile("src/App.tsx", "utf8"), readFile("src/pipeline-worker.ts", "utf8"), readFile("src/styles.css", "utf8"),
+  ]);
+  assert.match(pipeline, /sampleAssignments:\s*sampleAssignments\(\)/);
+  assert.match(app, /Live sample assignments/); assert.match(app, /last pipeline update/);
+  assert.match(app, /addEventListener\("beforeunload", warnBeforeLeaving\)/);
+  assert.match(app, /addEventListener\("popstate", interceptHistoryDeparture\)/);
+  assert.match(app, /Leave anyway/); assert.match(app, /history\.go\(-2\)/);
+  assert.match(styles, /overscroll-behavior-x:\s*none/);
 });

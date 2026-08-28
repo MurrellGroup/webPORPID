@@ -479,11 +479,11 @@ function exactFasta(rows) {
 /**
 * Collapse identical aligned haplotypes while retaining one count per UMI
 * family. Read-family sizes are metadata only and never contribute to the
-* collapse multiplicity.
+* collapse multiplicity. Per-family agreement is deliberately not projected
+* onto the resulting haplotype.
 */
-function collapseAlignment(fasta, sample, records) {
+function collapseAlignment(fasta, sample) {
 	const alignment = inspectAlignment(fasta, 1);
-	const metadata = new Map(records.map((record) => [record.id, record]));
 	const bySequence = /* @__PURE__ */ new Map();
 	for (const row of alignment.records) {
 		const haplotype = row.sequence.replaceAll("-", "");
@@ -492,21 +492,17 @@ function collapseAlignment(fasta, sample, records) {
 			group = {
 				name: row.name,
 				sequence: row.sequence,
-				members: [],
-				agreements: []
+				members: []
 			};
 			bySequence.set(haplotype, group);
 		}
 		group.members.push(row.name);
-		const agreement = metadata.get(row.name)?.minimumAgreement;
-		if (agreement != null && Number.isFinite(agreement)) group.agreements.push(agreement);
 	}
 	const groups = [...bySequence.values()].map((group) => ({
 		sample,
 		representativeId: group.name,
 		memberIds: group.members,
-		familyCount: group.members.length,
-		minimumAgreement: group.agreements.length ? Math.min(...group.agreements) : 0
+		familyCount: group.members.length
 	}));
 	return {
 		fasta: exactFasta([...bySequence.values()].map((group) => ({
@@ -974,10 +970,18 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 	});
 	return outcomes;
 }
-async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1) {
+async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1, onProgress) {
 	const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
 	const outputs = Array(config.samples.length);
 	let cursor = 0, collapseMilliseconds = 0;
+	const sampleProgress = Array(config.samples.length).fill(0);
+	const report = (sampleIndex, fraction, detail) => {
+		sampleProgress[sampleIndex] = Math.max(sampleProgress[sampleIndex], Math.max(0, Math.min(1, fraction)));
+		onProgress?.({
+			fraction: sampleProgress.reduce((sum, value) => sum + value, 0) / Math.max(1, sampleProgress.length),
+			detail
+		});
+	};
 	await Promise.all(Array.from({ length: Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
 		while (true) {
 			const sampleIndex = cursor++;
@@ -985,6 +989,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			const sample = config.samples[sampleIndex], records = [], summaries = [], alignments = {};
 			const referenceAlignments = {}, collapseGroups = {};
 			if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
+			report(sampleIndex, .03, `Preparing filters for sample ${sample.name}`);
 			const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
 			const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile) * (sample.artefactFractionOverride ?? config.parameters.artefactFraction));
 			const agreementThreshold = sample.agreementOverride ?? config.parameters.agreementThreshold;
@@ -994,6 +999,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			})).filter(({ record }) => record.familySize >= artefactCutoff && record.minimumAgreement >= agreementThreshold && !discarded.has(record.id));
 			const scores = Array(source.length).fill(0), panelPass = Array(source.length).fill(true), extracted = /* @__PURE__ */ new Map();
 			if (preliminary.length && sample.panelSequences.length) {
+				report(sampleIndex, .18, `Screening candidate sequences against the reference panel for sample ${sample.name}`);
 				const panelResult = extractAndScorePanel(preliminary.length > 1 ? await runScalableMsa(preliminary.map(({ record }) => degap(record.sequence)), runMsa, signal, 3, "nucleotide") : preliminary.map(({ record }) => degap(record.sequence)), sample.panelSequences.map((record) => record.sequence));
 				preliminary.forEach(({ index }, candidate) => {
 					extracted.set(index, degap(panelResult.sequences[candidate]));
@@ -1001,10 +1007,12 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 					panelPass[index] = scores[index] < config.parameters.panelThreshold;
 				});
 			} else preliminary.forEach(({ record, index }) => extracted.set(index, degap(record.sequence)));
+			report(sampleIndex, .4, `Reference-panel screening complete for sample ${sample.name}`);
 			const accepted = preliminary.filter(({ index }) => panelPass[index]);
 			const displayReference = sample.functionalReferenceSequence?.sequence ?? sample.panelSequences[0]?.sequence;
 			let acceptedAlignment = [], alignedReference = "";
 			if (accepted.length) {
+				report(sampleIndex, .48, `Building the retained-sequence alignment for sample ${sample.name}`);
 				const inputs = [...displayReference ? [degap(displayReference)] : [], ...accepted.map(({ index }) => extracted.get(index))];
 				const aligned = inputs.length > 1 ? await runScalableMsa(inputs, runMsa, signal, 3, "nucleotide") : inputs;
 				if (displayReference) {
@@ -1015,13 +1023,16 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 					alignedReference = alignmentConsensus(aligned);
 				}
 			}
+			report(sampleIndex, .66, `Retained-sequence alignment complete for sample ${sample.name}`);
 			const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
 			const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows = [];
 			const functionalByIndex = /* @__PURE__ */ new Map();
 			if (sample.functionalReferenceSequence && accepted.length) {
+				report(sampleIndex, .72, `Checking coding-frame and functional-reference requirements for sample ${sample.name}`);
 				const outcomes = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, accepted.map(({ index }) => extracted.get(index)), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
 				accepted.forEach(({ index }, position) => functionalByIndex.set(index, outcomes[position]));
 			}
+			report(sampleIndex, .84, `Calculating sequence annotations and filter decisions for sample ${sample.name}`);
 			let functionalPassed = 0;
 			source.forEach((record, index) => {
 				const artefactPass = record.familySize >= artefactCutoff, agreementPass = record.minimumAgreement >= agreementThreshold;
@@ -1065,7 +1076,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			});
 			let collapsedCount = 0;
 			if (nucleotideRows.length) {
-				const uncollapsed = fasta$1(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name, records);
+				const uncollapsed = fasta$1(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name);
 				collapseMilliseconds += performance.now() - collapseStarted;
 				collapsedCount = collapsed.groups.length;
 				alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
@@ -1107,6 +1118,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				collapseGroups,
 				collapseSeconds: 0
 			};
+			report(sampleIndex, 1, `Downstream processing complete for sample ${sample.name}`);
 		}
 	}));
 	return {
@@ -3266,7 +3278,7 @@ function validateResult(value) {
 				if (!metadata || metadata.sample !== sample || metadata.alignedNt == null) throw new Error("A collapse member is not a retained UMI-family consensus.");
 				agreements.push(metadata.minimumAgreement);
 			}
-			if (numeric(group.minimumAgreement, "collapse minimum agreement") !== Math.min(...agreements)) throw new Error("A collapse group has inconsistent minimum-agreement metadata.");
+			if (group.minimumAgreement != null && numeric(group.minimumAgreement, "legacy collapse minimum agreement") !== Math.min(...agreements)) throw new Error("A legacy collapse group has inconsistent family-agreement metadata.");
 		});
 		if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length) throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
 		const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
@@ -3286,7 +3298,11 @@ function validateResult(value) {
 		text(mapping.uploadedName, "uploaded filename");
 		count(mapping.uploadedSize, "uploaded size");
 	});
-	if (bundle.runOptions != null) bool(object(bundle.runOptions, "runOptions").deferPhylogeny, "runOptions.deferPhylogeny");
+	if (bundle.runOptions != null) {
+		const options = object(bundle.runOptions, "runOptions");
+		bool(options.deferPhylogeny, "runOptions.deferPhylogeny");
+		if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage"))) throw new Error("runOptions.spoolStorage is not recognized.");
+	}
 	if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
 		const sample = name.split("/", 1)[0];
 		knownSample(sample, `alignmentEdits.${name}`);
@@ -3535,13 +3551,11 @@ function exportComponent(bundle, kind, sample) {
 					"sample",
 					"representative_id",
 					"family_count",
-					"minimum_agreement",
 					"member_ids"
 				], (bundle.collapseGroups?.[selected] ?? []).map((group) => [
 					selected,
 					group.representativeId,
 					group.familyCount,
-					group.minimumAgreement,
 					group.memberIds.join(";")
 				]))
 			};
@@ -3636,7 +3650,7 @@ function concatenateSpoolRecords(records) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.1";
+const VERSION = "0.3.4";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

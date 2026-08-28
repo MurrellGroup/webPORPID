@@ -1,6 +1,7 @@
-import { useMemo, useRef, useState, type DragEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent } from "react";
 import { blankConfig, parseConfigYaml, resolveReferenceFiles, serializeConfigYaml } from "./config";
 import { nameMatchingSlot, referenceFileMap, referenceMappingRecords, referenceSlots, type ReferenceSlot } from "./input-mapping";
+import type { ExternalScratchDirectoryHandle } from "./partition-store";
 import { decodeResult, encodeResult, safeDatasetName } from "./result-file";
 import type { InputFileMapping, PipelineConfig, PipelineProgress, ResultBundle } from "./types";
 import { ResultsExplorer } from "./components/results-explorer";
@@ -15,6 +16,8 @@ function download(name: string, data: string | Uint8Array, mime: string) {
 }
 
 interface SlotConflict { file: File; target: ReferenceSlot; matching: ReferenceSlot }
+type SpoolStorage = "automatic" | "external-directory";
+type DirectoryPickerWindow = Window & { showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite" }) => Promise<ExternalScratchDirectoryHandle> };
 
 const fileKey = (file: File) => `${file.name}\0${file.size}\0${file.lastModified}`;
 const isYaml = (file: File) => /\.ya?ml$/i.test(file.name);
@@ -22,11 +25,29 @@ const isFastq = (file: File) => /\.(?:fastq|fq)(?:\.gz)?$/i.test(file.name);
 const isResult = (file: File) => /\.webporpid$/i.test(file.name);
 
 function StageProgress({ value }: { value: PipelineProgress }) {
+  const [clock, setClock] = useState(() => Date.now()), started = useRef(Date.now()), lastChange = useRef(Date.now());
+  const signature = `${value.stage}\0${value.fraction}\0${value.detail}`;
+  useEffect(() => { lastChange.current = Date.now(); }, [signature]);
+  useEffect(() => { const timer = window.setInterval(() => setClock(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
   const percent = Math.max(0, Math.min(100, Math.round(value.fraction * 100)));
+  const stageLabels: Record<PipelineProgress["stage"], string> = {
+    preprocessing: "Read filtering and sample assignment", umi: "UMI family grouping", consensus: "Consensus calling",
+    contamination: "Contamination checks", postprocessing: "Alignment and downstream filtering", collapse: "Haplotype collapse",
+    tree: "Phylogeny inference", complete: "Analysis complete",
+  };
+  const elapsed = Math.max(0, Math.floor((clock - started.current) / 1000)), quiet = Math.max(0, Math.floor((clock - lastChange.current) / 1000));
+  const assignments = value.sampleAssignments ?? [], maximum = Math.max(1, ...assignments.map((row) => row.reads));
   return <section className="run-progress" aria-live="polite">
-    <div><span>{value.stage}</span><strong>{percent}%</strong></div>
+    <div><span>{stageLabels[value.stage]}</span><strong>{percent}%</strong></div>
     <progress max="100" value={percent} />
     <p>{value.detail}</p>
+    <div className="working-heartbeat"><i /><span>{quiet >= 3 ? `Still working · last pipeline update ${quiet.toLocaleString()} s ago` : "Working"}</span><em>Elapsed {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}</em></div>
+    {value.stage === "preprocessing" && assignments.length > 0 && <section className="demux-live" aria-label="Live reads assigned to each sample">
+      <header><strong>Live sample assignments</strong><span>{assignments.reduce((sum, row) => sum + row.reads, 0).toLocaleString()} reads assigned</span></header>
+      <div className="demux-bars">{assignments.map((row) => <div className="demux-row" key={row.sample}>
+        <span title={row.sample}>{row.sample}</span><div><i style={{ width: `${row.reads / maximum * 100}%` }} /></div><strong>{row.reads.toLocaleString()}</strong>
+      </div>)}</div>
+    </section>}
   </section>;
 }
 
@@ -43,14 +64,55 @@ export default function App() {
   const [slotConflict, setSlotConflict] = useState<SlotConflict>();
   const [workers, setWorkers] = useState(defaultWorkers);
   const [deferPhylogeny, setDeferPhylogeny] = useState(false);
+  const [spoolStorage, setSpoolStorage] = useState<SpoolStorage>("automatic");
+  const [scratchDirectory, setScratchDirectory] = useState<ExternalScratchDirectoryHandle>();
   const [progress, setProgress] = useState<PipelineProgress>();
   const [result, setResult] = useState<ResultBundle>();
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [navigationBlocked, setNavigationBlocked] = useState(false);
   const workerRef = useRef<Worker | undefined>(undefined);
+  const protectWorkRef = useRef(false), historyGuardRef = useRef(false), confirmedLeaveRef = useRef(false);
   const maxWorkers = useMemo(() => Math.max(1, navigator.hardwareConcurrency || 1), []);
+  const externalScratchSupported = typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function";
+  const noDownsampling = draftConfig.parameters.maxReadsPerSample === 0;
   const slots = useMemo(() => referenceSlots(draftConfig), [draftConfig]);
+  const hasWorkToProtect = running || Boolean(result || fastq || configFile || configName !== "new configuration"
+    || Object.keys(referenceAssignments).length || unassignedReferences.length);
+
+  useEffect(() => { protectWorkRef.current = hasWorkToProtect; }, [hasWorkToProtect]);
+
+  useEffect(() => {
+    if (!hasWorkToProtect) return;
+    const warnBeforeLeaving = (event: BeforeUnloadEvent) => {
+      if (confirmedLeaveRef.current) return;
+      event.preventDefault(); event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warnBeforeLeaving);
+    return () => window.removeEventListener("beforeunload", warnBeforeLeaving);
+  }, [hasWorkToProtect]);
+
+  useEffect(() => {
+    const interceptHistoryDeparture = () => {
+      if (confirmedLeaveRef.current || !protectWorkRef.current) return;
+      const previous = window.history.state && typeof window.history.state === "object" ? window.history.state : {};
+      window.history.pushState({ ...previous, webporpidNavigationGuard: true }, "", window.location.href);
+      historyGuardRef.current = true; setNavigationBlocked(true);
+    };
+    window.addEventListener("popstate", interceptHistoryDeparture);
+    return () => window.removeEventListener("popstate", interceptHistoryDeparture);
+  }, []);
+
+  useEffect(() => {
+    if (hasWorkToProtect && !historyGuardRef.current) {
+      const previous = window.history.state && typeof window.history.state === "object" ? window.history.state : {};
+      window.history.pushState({ ...previous, webporpidNavigationGuard: true }, "", window.location.href);
+      historyGuardRef.current = true;
+    } else if (!hasWorkToProtect && historyGuardRef.current) {
+      historyGuardRef.current = false; window.history.back();
+    }
+  }, [hasWorkToProtect]);
 
   function reconcileReferences(config: PipelineConfig, extras: File[] = []) {
     const nextSlots = referenceSlots(config), valid = new Set(nextSlots.map((slot) => slot.id));
@@ -148,11 +210,33 @@ export default function App() {
     setReferenceAssignments(next); setUnassignedReferences(loose); setSlotConflict(undefined);
   }
 
+  async function chooseScratchDirectory() {
+    setError("");
+    try {
+      const pickerWindow = window as DirectoryPickerWindow;
+      if (!pickerWindow.showDirectoryPicker) throw new Error("Direct external scratch directories are not supported by this browser. Use current Chrome/Edge or porpid-cli.");
+      const directory = await pickerWindow.showDirectoryPicker({ id: "webporpid-scratch", mode: "readwrite" });
+      const permission = directory.requestPermission ? await directory.requestPermission({ mode: "readwrite" }) : "granted";
+      if (permission !== "granted") throw new Error("Write access to the selected scratch directory was not granted.");
+      setScratchDirectory(directory); setSpoolStorage("external-directory");
+    } catch (cause) {
+      if (cause instanceof DOMException && cause.name === "AbortError") return;
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  }
+
   async function run() {
     if (!fastq) { setError("Choose a FASTQ or FASTQ.GZ input file."); return; }
     if (!configText.trim()) { setError("Choose or paste a PORPID YAML configuration."); return; }
     setError(""); setResult(undefined); setRunning(true); setCancelling(false);
+    setProgress({ stage: "preprocessing", fraction: 0, detail: "Checking the configuration and preparing local workers",
+      sampleAssignments: draftConfig.samples.map((sample) => ({ sample: sample.name, reads: 0 })) });
     try {
+      if (spoolStorage === "external-directory") {
+        if (!scratchDirectory) throw new Error("Choose a writable scratch directory before starting the external-disk run.");
+        const permission = scratchDirectory.queryPermission ? await scratchDirectory.queryPermission({ mode: "readwrite" }) : "granted";
+        if (permission !== "granted") throw new Error("The selected scratch directory is no longer writable. Choose it again to restore permission.");
+      }
       const missing = slots.filter((slot) => !referenceAssignments[slot.id]);
       if (missing.length) throw new Error(`Assign a file to every required reference slot: ${missing.map((slot) => slot.expectedName).join(", ")}.`);
       const config = await resolveReferenceFiles(parseConfigYaml(configText), referenceFileMap(referenceAssignments));
@@ -169,14 +253,20 @@ export default function App() {
         if (event.data.type === "error") { setError(event.data.message); setRunning(false); setCancelling(false); worker.terminate(); workerRef.current = undefined; }
       };
       worker.onerror = (event) => { setError(event.message || "The pipeline worker failed."); setRunning(false); setCancelling(false); worker.terminate(); workerRef.current = undefined; };
-      worker.postMessage({ type: "run", file: fastq, config, workers, deferPhylogeny, inputMappings });
+      worker.postMessage({ type: "run", file: fastq, config, workers, deferPhylogeny, inputMappings, spoolStorage,
+        scratchDirectory: spoolStorage === "external-directory" ? scratchDirectory : undefined });
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); setRunning(false); setCancelling(false); }
   }
 
   function cancel() {
     workerRef.current?.postMessage({ type: "cancel" });
     setCancelling(true); setError("");
-    setProgress((current) => current ? { ...current, detail: "Cancelling safely and removing temporary partitions…" } : current);
+    setProgress((current) => current ? { ...current, detail: "Cancelling safely and removing temporary read files…" } : current);
+  }
+
+  function confirmPageDeparture() {
+    confirmedLeaveRef.current = true; setNavigationBlocked(false); window.history.go(-2);
+    window.setTimeout(() => { confirmedLeaveRef.current = false; }, 1200);
   }
 
   async function loadResults(file?: File) {
@@ -217,6 +307,25 @@ export default function App() {
           <ConfigForm config={draftConfig} onChange={changeConfig} onReset={startFromScratch} onDownload={saveConfig} />
           <details className="config-editor"><summary><span>Raw YAML</span><small>{configIssue ? "Needs attention" : "Synchronized with the form"}</small></summary><textarea value={configText} onChange={(event) => changeRawYaml(event.target.value)} spellCheck={false} placeholder="dataset:\n  samples:\n    ..." /></details>
           {configIssue && <div className="config-warning" role="status"><strong>Configuration is not ready</strong><span>{configIssue}</span><small>Continue editing in the form or raw YAML. The analysis will not start until the YAML is valid.</small></div>}
+          <section className={`scratch-storage${noDownsampling ? " no-downsampling" : ""}`}>
+            <header><div><span className="section-kicker">Temporary read storage</span><h3>Choose where raw-read partitions live</h3></div>{noDownsampling && <strong>External scratch recommended</strong>}</header>
+            <div className="scratch-options">
+              <label className={spoolStorage === "automatic" ? "selected" : ""}>
+                <input type="radio" name="spool-storage" checked={spoolStorage === "automatic"} onChange={() => setSpoolStorage("automatic")} />
+                <span><strong>Automatic browser storage</strong><small>Fast OPFS with adaptive compaction. Best when Maximum reads / sample is positive.</small></span>
+              </label>
+              <label className={spoolStorage === "external-directory" ? "selected recommended" : ""}>
+                <input type="radio" name="spool-storage" checked={spoolStorage === "external-directory"} disabled={!externalScratchSupported}
+                  onChange={() => setSpoolStorage("external-directory")} />
+                <span><strong>External scratch directory{noDownsampling ? " · recommended" : ""}</strong><small>Streams partitions directly to a directory you choose, outside browser-origin quota. Temporary files are deleted after consensus; after a browser crash, remove any webporpid-scratch-* folder manually.</small></span>
+              </label>
+            </div>
+            <div className="scratch-directory-row">
+              <button type="button" className="secondary" disabled={!externalScratchSupported || running} onClick={() => void chooseScratchDirectory()}>{scratchDirectory ? "Change scratch directory" : "Choose scratch directory"}</button>
+              <span>{scratchDirectory ? `${scratchDirectory.name} selected` : externalScratchSupported ? "No external directory selected" : "Unavailable in this browser; use current Chrome/Edge or porpid-cli"}</span>
+            </div>
+            {noDownsampling && <p className="scratch-recommendation"><strong>No downsampling is enabled.</strong> Every demultiplexed sequence and quality string must survive until the global UMI model and consensus pass. Use an external scratch disk with ample free space; 256 spool partitions is recommended for bounded per-worker memory on very large runs.</p>}
+          </section>
           <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><label className="defer-tree"><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span><small>Store collapsed alignments now and infer trees later from the results explorer.</small></label><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}</div></div>
           {progress && running && <StageProgress value={progress} />}
           {error && <div className="error-box" role="alert">{error}</div>}
@@ -226,6 +335,7 @@ export default function App() {
     </> : <ResultsExplorer bundle={result} onSaveResults={saveResults} onBundleChange={setResult} />}
     {result && <button className="new-analysis" type="button" onClick={() => { setResult(undefined); setProgress(undefined); }}>← New or load another analysis</button>}
     {slotConflict && <div className="modal-backdrop" role="presentation"><section className="slot-conflict" role="dialog" aria-modal="true" aria-labelledby="slot-conflict-title"><span className="section-kicker">Filename conflict</span><h3 id="slot-conflict-title">This file matches a different YAML slot</h3><p><strong>{slotConflict.file.name}</strong> was dropped onto <strong>{slotConflict.target.expectedName}</strong>, but its filename matches <strong>{slotConflict.matching.expectedName}</strong>.</p><div><button type="button" className="primary" onClick={() => resolveSlotConflict("swap")}>Swap into filename-matching slot</button><button type="button" onClick={() => resolveSlotConflict("matching")}>Use matching slot</button><button type="button" onClick={() => resolveSlotConflict("chosen")}>Keep chosen slot</button><button type="button" onClick={() => setSlotConflict(undefined)}>Cancel</button></div></section></div>}
+    {navigationBlocked && <div className="modal-backdrop" role="presentation"><section className="slot-conflict navigation-warning" role="dialog" aria-modal="true" aria-labelledby="navigation-warning-title"><span className="section-kicker">Unsaved local work</span><h3 id="navigation-warning-title">Leave webPORPID?</h3><p>The Back action was paused because leaving now would discard the active analysis, selected input files, or loaded results. Save the results file first if you need to return to this work.</p><div><button type="button" className="primary" autoFocus onClick={() => setNavigationBlocked(false)}>Stay on this page</button><button type="button" className="danger" onClick={confirmPageDeparture}>Leave anyway</button></div></section></div>}
     <footer className="site-footer"><span>webPORPID · standalone local analysis</span><span>Deterministic, inspectable processing and session files</span></footer>
   </div>;
 }

@@ -194,7 +194,12 @@ export interface CollapseGroup {
   memberIds: string[];
   /** One count per retained UMI family; deliberately not a read count. */
   familyCount: number;
-  minimumAgreement: number;
+  /**
+   * Legacy (<=0.3.2) conservative summary: the lowest minimumAgreement among
+   * member UMI families. New results omit it because agreement is a family
+   * property, not a collapsed-haplotype property.
+   */
+  minimumAgreement?: number;
 }
 
 export interface InputFileMapping {
@@ -207,6 +212,8 @@ export interface InputFileMapping {
 
 export interface RunOptions {
   deferPhylogeny: boolean;
+  /** Browser read-spool location; absent in older results and CLI runs. */
+  spoolStorage?: "automatic" | "external-directory";
 }
 
 export interface ResultBundle {
@@ -240,4 +247,6 @@ export interface PipelineProgress {
   fraction: number;
   detail: string;
   reads?: number;
+  /** Live demultiplexed-read counts in configuration sample order. */
+  sampleAssignments?: Array<{ sample: string; reads: number }>;
 }

@@ -19,18 +19,43 @@ function decodeBrowserFrames(bytes: Uint8Array): Array<{ partition: number; reco
 }
 
 interface PartitionBackend {
+  readonly compactable: boolean;
   append(partition: number, chunks: Uint8Array[]): Promise<void>;
   compact(cutoffs: readonly bigint[]): Promise<number>;
+  seal(): Promise<void>;
   readSelected(partition: number, cutoffs: readonly bigint[]): Promise<Uint8Array>;
   sizes(): number[];
   close(): Promise<void>;
 }
+
+export interface ExternalScratchWritable {
+  write(data: Uint8Array): Promise<void>;
+  close(): Promise<void>;
+  abort(reason?: unknown): Promise<void>;
+}
+
+export interface ExternalScratchFileHandle {
+  createWritable(options?: { keepExistingData?: boolean }): Promise<ExternalScratchWritable>;
+  getFile(): Promise<Blob>;
+}
+
+export interface ExternalScratchDirectoryHandle {
+  readonly name: string;
+  getDirectoryHandle(name: string, options?: { create?: boolean }): Promise<ExternalScratchDirectoryHandle>;
+  getFileHandle(name: string, options?: { create?: boolean }): Promise<ExternalScratchFileHandle>;
+  removeEntry(name: string, options?: { recursive?: boolean }): Promise<void>;
+  queryPermission?(descriptor: { mode: "readwrite" }): Promise<PermissionState>;
+  requestPermission?(descriptor: { mode: "readwrite" }): Promise<PermissionState>;
+}
+
+export type PartitionStorageMode = "opfs" | "memory" | "external-directory";
 
 export interface PartitionStoreOptions {
   sampleCount?: number;
   maximumReadsPerSample?: number;
   compactionIntervalBytes?: number;
   requestPersistence?: boolean;
+  externalDirectory?: ExternalScratchDirectoryHandle;
 }
 
 export interface BrowserStorageInformation {
@@ -114,6 +139,7 @@ async function opfsWriteFailure(cause: unknown, currentBytes: number) {
 }
 
 class MemoryBackend implements PartitionBackend {
+  readonly compactable = true;
   private parts: Uint8Array[][];
   private lengths: number[];
   private maximumBytes: number;
@@ -135,12 +161,14 @@ class MemoryBackend implements PartitionBackend {
     }
     return reclaimed;
   }
+  async seal() { /* memory is immediately readable */ }
   async readSelected(partition: number, cutoffs: readonly bigint[]) { return selectSpoolChunks(this.parts[partition], cutoffs); }
   sizes() { return [...this.lengths]; }
   async close() { this.parts = []; this.lengths = []; }
 }
 
 class OpfsBackend implements PartitionBackend {
+  readonly compactable = true;
   private closed = false;
   private root: FileSystemDirectoryHandle;
   private directoryName: string;
@@ -211,6 +239,7 @@ class OpfsBackend implements PartitionBackend {
     }
     return reclaimed;
   }
+  async seal() { for (const handle of this.handles) handle.flush(); }
   async readSelected(partition: number, cutoffs: readonly bigint[]) {
     const handle = this.handles[partition], records: Uint8Array[] = [], headerBytes = new Uint8Array(SPOOL_HEADER_BYTES);
     let offset = 0;
@@ -240,9 +269,134 @@ class OpfsBackend implements PartitionBackend {
   }
 }
 
+function concatenateChunks(chunks: readonly Uint8Array[]) {
+  if (chunks.length === 1) return chunks[0];
+  const length = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0), output = new Uint8Array(length);
+  let offset = 0; for (const chunk of chunks) { output.set(chunk, offset); offset += chunk.byteLength; }
+  return output;
+}
+
+function selectSpoolBuffer(bytes: Uint8Array, cutoffs: readonly bigint[]) {
+  const selected: Uint8Array[] = []; let offset = 0;
+  while (offset < bytes.byteLength) {
+    const header = parseSpoolRecordHeader(bytes.subarray(offset));
+    if (offset + header.recordLength > bytes.byteLength) throw new Error("An external scratch partition contains a truncated spool record.");
+    if (selectedSpoolRecord(header, cutoffs)) selected.push(bytes.subarray(offset, offset + header.recordLength));
+    offset += header.recordLength;
+  }
+  if (offset !== bytes.byteLength) throw new Error("An external scratch partition contains trailing spool bytes.");
+  return selected.length === 1 && selected[0].byteLength === bytes.byteLength ? bytes : concatenateSpoolRecords(selected);
+}
+
+class ExternalDirectoryBackend implements PartitionBackend {
+  readonly compactable = false;
+  private readonly root: ExternalScratchDirectoryHandle;
+  private readonly directoryName: string;
+  private readonly directory: ExternalScratchDirectoryHandle;
+  private readonly fileHandles: Array<ExternalScratchFileHandle | undefined>;
+  private readonly writers: Array<ExternalScratchWritable | undefined>;
+  private readonly lengths: number[];
+  private readonly pending: Uint8Array[][];
+  private readonly pendingBytes: number[];
+  private readonly flushThreshold: number;
+  private sealed = false;
+  private closed = false;
+
+  private constructor(
+    root: ExternalScratchDirectoryHandle,
+    directoryName: string,
+    directory: ExternalScratchDirectoryHandle,
+    count: number,
+  ) {
+    this.root = root; this.directoryName = directoryName; this.directory = directory;
+    this.fileHandles = Array(count); this.writers = Array(count); this.lengths = Array(count).fill(0);
+    this.pending = Array.from({ length: count }, () => []); this.pendingBytes = Array(count).fill(0);
+    this.flushThreshold = Math.max(256 * 1024, Math.min(4 * 1024 * 1024, Math.floor((64 * 1024 * 1024) / count)));
+  }
+
+  static async create(count: number, root: ExternalScratchDirectoryHandle) {
+    const directoryName = `webporpid-scratch-${Date.now()}-${crypto.randomUUID()}`;
+    try {
+      const directory = await root.getDirectoryHandle(directoryName, { create: true });
+      return new ExternalDirectoryBackend(root, directoryName, directory, count);
+    } catch (cause) {
+      throw new Error(`The selected scratch directory could not be prepared. ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    }
+  }
+
+  private async writer(partition: number) {
+    if (this.sealed) throw new Error("The external scratch spool is already sealed for reading.");
+    let writer = this.writers[partition];
+    if (!writer) {
+      const file = await this.directory.getFileHandle(`partition-${partition}.bin`, { create: true });
+      writer = await file.createWritable({ keepExistingData: false });
+      this.fileHandles[partition] = file; this.writers[partition] = writer;
+    }
+    return writer;
+  }
+
+  private async flush(partition: number) {
+    const chunks = this.pending[partition]; if (!chunks.length) return;
+    const bytes = concatenateChunks(chunks); this.pending[partition] = []; this.pendingBytes[partition] = 0;
+    await (await this.writer(partition)).write(bytes);
+  }
+
+  async append(partition: number, chunks: Uint8Array[]) {
+    if (!chunks.length) return;
+    try {
+      const added = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+      this.pending[partition].push(...chunks); this.pendingBytes[partition] += added;
+      this.lengths[partition] += added;
+      if (this.pendingBytes[partition] >= this.flushThreshold) await this.flush(partition);
+    } catch (cause) {
+      throw new Error(
+        `The selected scratch disk could not continue writing after ${formatBytes(this.lengths.reduce((sum, value) => sum + value, 0))}. `
+        + `Check its free space and write permission. ${cause instanceof Error ? cause.message : String(cause)}`,
+        { cause },
+      );
+    }
+  }
+
+  async compact(_cutoffs: readonly bigint[]) { return 0; }
+
+  async seal() {
+    if (this.sealed) return;
+    const flushes = await Promise.allSettled(this.pending.map((_, partition) => this.flush(partition)));
+    const flushFailure = flushes.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (flushFailure) throw new Error(`The external scratch spool could not flush its final blocks. ${flushFailure.reason instanceof Error ? flushFailure.reason.message : String(flushFailure.reason)}`, { cause: flushFailure.reason });
+    const active = this.writers.map((writer, index) => ({ writer, index })).filter((entry): entry is { writer: ExternalScratchWritable; index: number } => Boolean(entry.writer));
+    const results = await Promise.allSettled(active.map((entry) => entry.writer.close()));
+    results.forEach((result, index) => { if (result.status === "fulfilled") this.writers[active[index].index] = undefined; });
+    const failed = results.find((result): result is PromiseRejectedResult => result.status === "rejected");
+    if (failed) throw new Error(`The external scratch spool could not be finalized for reading. ${failed.reason instanceof Error ? failed.reason.message : String(failed.reason)}`, { cause: failed.reason });
+    this.sealed = true;
+  }
+
+  async readSelected(partition: number, cutoffs: readonly bigint[]) {
+    if (!this.sealed) throw new Error("The external scratch spool must be sealed before it can be read.");
+    const handle = this.fileHandles[partition]; if (!handle) return new Uint8Array();
+    const file = await handle.getFile();
+    if (file.size !== this.lengths[partition]) throw new Error("An external scratch partition has an unexpected size.");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    return cutoffs.every((cutoff) => cutoff === MAX_SAMPLING_HASH) ? bytes : selectSpoolBuffer(bytes, cutoffs);
+  }
+
+  sizes() { return [...this.lengths]; }
+
+  async close() {
+    if (this.closed) return; this.closed = true;
+    const writers = this.writers.filter((writer): writer is ExternalScratchWritable => Boolean(writer));
+    this.pending.forEach((chunks) => { chunks.length = 0; }); this.pendingBytes.fill(0);
+    if (!this.sealed) await Promise.allSettled(writers.map((writer) => writer.abort("webPORPID analysis finished or stopped")));
+    try { await this.root.removeEntry(this.directoryName, { recursive: true }); }
+    catch (cause) { throw new Error(`The temporary webPORPID scratch directory could not be removed automatically. Remove “${this.directoryName}” manually. ${cause instanceof Error ? cause.message : String(cause)}`, { cause }); }
+  }
+}
+
 export class PartitionStore {
   private backend: PartitionBackend;
   readonly persistent: boolean;
+  readonly mode: PartitionStorageMode;
   readonly storage: BrowserStorageInformation;
   private tail: Promise<void> = Promise.resolve();
   private closed = false;
@@ -260,11 +414,11 @@ export class PartitionStore {
 
   private constructor(
     backend: PartitionBackend,
-    persistent: boolean,
+    mode: PartitionStorageMode,
     storage: BrowserStorageInformation,
     options: PartitionStoreOptions,
   ) {
-    this.backend = backend; this.persistent = persistent; this.storage = storage;
+    this.backend = backend; this.mode = mode; this.persistent = mode === "opfs"; this.storage = storage;
     this.seen = Array.from({ length: options.sampleCount ?? 0 }, () => 0n);
     this.partitionCount = backend.sizes().length;
     this.maximumReadsPerSample = Math.max(0, Math.floor(options.maximumReadsPerSample ?? 0));
@@ -272,14 +426,16 @@ export class PartitionStore {
   }
 
   static async create(count: number, options: PartitionStoreOptions = {}) {
+    if (options.externalDirectory)
+      return new PartitionStore(await ExternalDirectoryBackend.create(count, options.externalDirectory), "external-directory", {}, options);
     const storage = typeof navigator === "undefined" ? undefined : navigator.storage as StorageManager & { getDirectory?: () => Promise<FileSystemDirectoryHandle> };
     if (options.requestPersistence && storage) try { await storage.persist(); } catch { /* best effort */ }
     const information = await browserStorageInformation(storage);
     try {
       if (typeof storage?.getDirectory === "function" && typeof FileSystemFileHandle !== "undefined" && "createSyncAccessHandle" in FileSystemFileHandle.prototype)
-        return new PartitionStore(await OpfsBackend.create(count), true, information, options);
+        return new PartitionStore(await OpfsBackend.create(count), "opfs", information, options);
     } catch { /* quota/security failure falls back to a bounded in-memory spool */ }
-    return new PartitionStore(new MemoryBackend(count), false, information, options);
+    return new PartitionStore(new MemoryBackend(count), "memory", information, options);
   }
 
   private enqueue(operation: () => Promise<void>) {
@@ -304,7 +460,7 @@ export class PartitionStore {
       }
       await Promise.all([...grouped].map(([partition, chunks]) => this.backend.append(partition, chunks)));
       this.writtenBytes += addedBytes; this.bytesSinceCompaction += addedBytes;
-      if (this.maximumReadsPerSample > 0 && this.bytesSinceCompaction >= this.compactionIntervalBytes
+      if (this.backend.compactable && this.maximumReadsPerSample > 0 && this.bytesSinceCompaction >= this.compactionIntervalBytes
           && this.seen.some((count) => count > BigInt(this.maximumReadsPerSample))) {
         const reclaimed = await this.backend.compact(this.provisionalCutoffs());
         this.reclaimedBytes += reclaimed; this.compactions++; this.bytesSinceCompaction = 0;
@@ -314,10 +470,13 @@ export class PartitionStore {
 
   async compact(cutoffs: readonly bigint[]) {
     return this.enqueue(async () => {
+      if (!this.backend.compactable) return;
       const reclaimed = await this.backend.compact(cutoffs);
       this.reclaimedBytes += reclaimed; this.compactions++; this.bytesSinceCompaction = 0;
     });
   }
+
+  async seal() { return this.enqueue(() => this.backend.seal()); }
 
   async readSelected(partition: number, cutoffs: readonly bigint[]) { await this.tail; return this.backend.readSelected(partition, cutoffs); }
   sizes() { return this.backend.sizes(); }

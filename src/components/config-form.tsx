@@ -18,7 +18,7 @@ const PREPROCESSING: NumericSetting[] = [
   { key: "primerTolerance", label: "Primer tolerance", help: "Allowed primer mismatches.", min: 0, step: 1 },
   { key: "primerWindow", label: "Primer search window", help: "Bases searched at each read end.", min: 16, step: 1 },
   { key: "primerChop", label: "Primer chop", help: "Additional bases removed beside primers.", min: 0, step: 1 },
-  { key: "maxReadsPerSample", label: "Maximum reads / sample", help: "Deterministic cap after demultiplexing; zero keeps all reads.", min: 0, step: 1 },
+  { key: "maxReadsPerSample", label: "Maximum reads / sample", help: "Deterministic cap after demultiplexing; zero keeps all reads and should use an external scratch directory for massive inputs.", min: 0, step: 1 },
 ];
 
 const UMI_CONSENSUS: NumericSetting[] = [

@@ -163,8 +163,11 @@ function validateResult(value: unknown): asserts value is ResultBundle {
         if (!metadata || metadata.sample !== sample || metadata.alignedNt == null) throw new Error("A collapse member is not a retained UMI-family consensus.");
         agreements.push(metadata.minimumAgreement);
       }
-      if (numeric(group.minimumAgreement, "collapse minimum agreement") !== Math.min(...agreements))
-        throw new Error("A collapse group has inconsistent minimum-agreement metadata.");
+      // Results through 0.3.2 stored a conservative, but ambiguously named,
+      // minimum across the member-family minima. Keep accepting and checking
+      // that legacy field without treating it as a haplotype property.
+      if (group.minimumAgreement != null && numeric(group.minimumAgreement, "legacy collapse minimum agreement") !== Math.min(...agreements))
+        throw new Error("A legacy collapse group has inconsistent family-agreement metadata.");
     });
     if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length)
       throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
@@ -180,7 +183,11 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     optionalText(mapping.expectedName, "expected filename");
     text(mapping.uploadedName, "uploaded filename"); count(mapping.uploadedSize, "uploaded size");
   });
-  if (bundle.runOptions != null) bool(object(bundle.runOptions, "runOptions").deferPhylogeny, "runOptions.deferPhylogeny");
+  if (bundle.runOptions != null) {
+    const options = object(bundle.runOptions, "runOptions"); bool(options.deferPhylogeny, "runOptions.deferPhylogeny");
+    if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage")))
+      throw new Error("runOptions.spoolStorage is not recognized.");
+  }
   if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
     const sample = name.split("/", 1)[0]; knownSample(sample, `alignmentEdits.${name}`);
     if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide`) throw new Error("Edited alignment keys must identify a stored nucleotide view.");
@@ -283,8 +290,8 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
     case "collapse-csv": {
       const selected = alignmentSample(bundle, sample);
       return { extension: "collapsed-families.csv", mime: "text/csv", text: csv(
-        ["sample", "representative_id", "family_count", "minimum_agreement", "member_ids"],
-        (bundle.collapseGroups?.[selected] ?? []).map((group) => [selected, group.representativeId, group.familyCount, group.minimumAgreement, group.memberIds.join(";")]),
+        ["sample", "representative_id", "family_count", "member_ids"],
+        (bundle.collapseGroups?.[selected] ?? []).map((group) => [selected, group.representativeId, group.familyCount, group.memberIds.join(";")]),
       ) };
     }
     case "nucleotide-alignment": {

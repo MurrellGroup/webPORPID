@@ -7,6 +7,7 @@ import { runAlivibeMsa } from "../alivibe-msa-runtime";
 import { alignmentKey, effectiveAlignment, inspectAlignment, validateCorrectedAlignment, type AlignmentFrameOffset, type AlignmentVariant } from "../alignment-utils";
 import { runFastTree } from "../biowasm";
 import { parseFasta } from "../config";
+import { buildExportArchive } from "../export-archive";
 import { exportComponent, type ExportKind, safeDatasetName } from "../result-file";
 import type { CollapseGroup, ContaminationCall, PostprocRecord, ResultBundle, UmiFamily } from "../types";
 import { AgreementPositionPlot, ArtefactDecisionPlot, DinucleotideHeatmaps, MdsApobecPlot, UmiDecisionPlot } from "./charts";
@@ -27,8 +28,9 @@ interface AlivibeSession {
   frameOffset: AlignmentFrameOffset;
   timer?: number;
 }
-function downloadText(name: string, text: string, mime: string) {
-  const url = URL.createObjectURL(new Blob([text], { type: mime })), anchor = document.createElement("a");
+function downloadData(name: string, data: string | Uint8Array, mime: string) {
+  const body: BlobPart = typeof data === "string" ? data : data.slice().buffer as ArrayBuffer;
+  const url = URL.createObjectURL(new Blob([body], { type: mime })), anchor = document.createElement("a");
   anchor.href = url; anchor.download = name; anchor.click(); setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
@@ -68,7 +70,7 @@ function Filters({ bundle, sample }: { bundle: ResultBundle; sample: string }) {
 }
 
 function ExportMenu({ bundle, sample }: { bundle: ResultBundle; sample: string }) {
-  const [kind, setKind] = useState<ExportKind>("consensus-fasta");
+  const [kind, setKind] = useState<ExportKind>("consensus-fasta"), [exportingAll, setExportingAll] = useState(false);
   const labels: Array<[ExportKind, string]> = [["consensus-fasta", "Consensus FASTA"], ["passed-consensus-fasta", "Passed consensus FASTA"],
     ["rejected-consensus-fasta", "Rejected consensus FASTA"], ["trimmed-nt-fasta", "Trimmed nucleotide FASTA"], ["trimmed-aa-fasta", "Trimmed amino-acid FASTA"],
     ["family-csv", "UMI family CSV"], ["low-agreement-csv", "Low-agreement CSV"], ["contamination-csv", "Contamination CSV"],
@@ -76,7 +78,15 @@ function ExportMenu({ bundle, sample }: { bundle: ResultBundle; sample: string }
     ["nucleotide-alignment", "Collapsed nucleotide alignment"], ["protein-alignment", "Collapsed protein alignment"], ["newick", "Collapsed Newick tree"],
     ["uncollapsed-nucleotide-alignment", "Uncollapsed nucleotide alignment"], ["uncollapsed-protein-alignment", "Uncollapsed protein alignment"], ["uncollapsed-newick", "Uncollapsed Newick tree"], ["log", "Run log"]];
   return <div className="export-menu"><select value={kind} onChange={(event) => setKind(event.target.value as ExportKind)}>{labels.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>
-    <button type="button" onClick={() => { const result = exportComponent(bundle, kind, sample); downloadText(`${safeDatasetName(bundle.config.dataset)}-${safeDatasetName(sample)}.${result.extension}`, result.text, result.mime); }}>Export</button></div>;
+    <button type="button" onClick={() => { const result = exportComponent(bundle, kind, sample); downloadData(`${safeDatasetName(bundle.config.dataset)}-${safeDatasetName(sample)}.${result.extension}`, result.text, result.mime); }}>Export</button>
+    <button type="button" disabled={exportingAll} onClick={() => {
+      setExportingAll(true);
+      window.requestAnimationFrame(() => {
+        try { downloadData(`${safeDatasetName(bundle.config.dataset)}-all-outputs.tar.gz`, buildExportArchive(bundle), "application/gzip"); }
+        catch (cause) { window.alert(`The export bundle could not be created. ${cause instanceof Error ? cause.message : String(cause)}`); }
+        finally { setExportingAll(false); }
+      });
+    }}>{exportingAll ? "Bundling…" : "Export all (.tar.gz)"}</button></div>;
 }
 
 function TimingSummary({ bundle }: { bundle: ResultBundle }) {
@@ -101,7 +111,7 @@ function referenceSequence(bundle: ResultBundle, sample: string): string | undef
 }
 
 function collapsedMetadata(groups: CollapseGroup[] | undefined): Record<string, LeafMetadata> {
-  return Object.fromEntries((groups ?? []).map((group) => [group.representativeId, { familyCount: group.familyCount, minimumAgreement: group.minimumAgreement }]));
+  return Object.fromEntries((groups ?? []).map((group) => [group.representativeId, { familyCount: group.familyCount }]));
 }
 
 function uncollapsedMetadata(records: PostprocRecord[]): Record<string, LeafMetadata> {
@@ -216,7 +226,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const targetSample = sampleRef.current, current = effectiveAlignment(bundleRef.current, targetSample, variant); if (!current.fasta) return;
     setAlignmentError(""); setAlignmentStatus("Opening the bundled Alivibe editor…");
     const applicationBase = new URL(import.meta.env.BASE_URL, document.baseURI), editorUrl = new URL("tools/alivibe.html", applicationBase);
-    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.1");
+    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.4");
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const popup = window.open(editorUrl.href, `webporpid-alivibe-${token}`, "popup,width=1500,height=920") as AlivibeEditorWindow | null;
     if (!popup) { setAlignmentError("The browser blocked the Alivibe window. Allow pop-ups for this site and try again."); return; }
@@ -257,7 +267,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const metadata = variant === "collapsed" ? collapsedTips : uncollapsedTips, busy = alignmentBusy === `${sample}/${variant}`;
     if (!current.fasta) return <div className="empty-state">No {variant} nucleotide alignment is available for this sample.</div>;
     const stale = Boolean(current.edit?.treeStale || (current.edit?.treeFingerprint && current.edit.treeFingerprint !== current.edit.editedFingerprint));
-    return <section className="phylogeny-block" key={variant}><header><div><span className="section-kicker">{variant === "collapsed" ? "Default phylogeny" : "Optional family-level phylogeny"}</span><h3>{variant === "collapsed" ? "Collapsed haplotypes" : "Uncollapsed consensus sequences"}</h3><p>{variant === "collapsed" ? "Identical retained consensuses are collapsed; bubble area represents UMI-family count, never read count." : "Every retained UMI-family consensus is shown separately and can be colored by minimum agreement."}</p></div><div><button type="button" className={tree ? "" : "primary"} disabled={busy} onClick={() => void inferTree(variant)}>{busy ? "Running FastTree…" : tree ? "Recalculate tree" : "Infer tree"}</button></div></header>
+    return <section className="phylogeny-block" key={variant}><header><div><span className="section-kicker">{variant === "collapsed" ? "Default phylogeny" : "Optional family-level phylogeny"}</span><h3>{variant === "collapsed" ? "Collapsed haplotypes" : "Uncollapsed consensus sequences"}</h3><p>{variant === "collapsed" ? "Identical retained consensuses are collapsed; bubble area represents UMI-family count, never read count. Minimum agreement remains a per-family property and is available in the uncollapsed view." : "Every retained UMI-family consensus is shown separately and can be colored by its family minimum agreement."}</p></div><div><button type="button" className={tree ? "" : "primary"} disabled={busy} onClick={() => void inferTree(variant)}>{busy ? "Running FastTree…" : tree ? "Recalculate tree" : "Infer tree"}</button></div></header>
       <div className="alignment-edit-bar"><button type="button" disabled={busy} onClick={() => openAlivibe(variant)}>Open in Alivibe ↗</button><label className="button-like">Import edited FASTA<input type="file" accept=".fasta,.fa,.fas,.fna,text/plain" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; void importCorrected(variant, file); }} /></label><label><span>Protein frame</span><select value={current.frameOffset} onChange={(event) => setFrameOffset(variant, Number(event.target.value) as AlignmentFrameOffset)}><option value="0">Start at nucleotide column 1</option><option value="1">Start at nucleotide column 2</option><option value="2">Start at nucleotide column 3</option></select></label>{current.edit && <button type="button" onClick={() => resetCorrection(variant)}>Discard edit</button>}<span>{current.edit ? `Edited copy · ${current.edit.source}` : "Pipeline alignment · original preserved"}</span></div>
       {current.edit && <div className="alignment-edited-notice"><strong>Alignment edited</strong><span>This separate copy is stored in the session file. The pipeline-generated alignment has not been overwritten.{stale ? " Recalculate the tree when the alignment is ready." : ""}</span></div>}
       <AlignmentTreeViewer fasta={current.fasta} newick={tree} alphabet={alphabet} frameOffset={current.frameOffset} referenceSequence={refSequence} leafMetadata={metadata} collapsed={variant === "collapsed"} treeStale={stale} name={`${safeDatasetName(bundle.config.dataset)}-${safeDatasetName(sample)}-${variant}`} />

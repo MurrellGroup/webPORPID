@@ -13,10 +13,13 @@ The repository contains a neutral simulated demo only. Raw reads are processed l
 - Run-aware contamination clustering and filtering.
 - Artefact, agreement, panel-profile, and functional filters, plus APOBEC summaries.
 - Post-filter haplotype collapse with one multiplicity per retained UMI family, collapsed-tree abundance bubbles, and optional on-demand family-level trees.
+- Live, scrollable per-sample demultiplexing counts and phase-specific feedback with an independent working heartbeat for long operations.
+- Browser-history protection and unload warnings while selected inputs, an active run, or loaded results would otherwise be lost.
+- One-click `.tar.gz` export containing the editable project and every donor-specific component under its sample-ID directory.
 - Direct frame-selectable translation plus a Swig-derived linked tree/alignment viewer with modal highlighting, reference-coordinate regions, mutation mapping, and hideable names.
 - A bundled Alivibe pop-out editor with permissive biological-edit warnings, validated return, explicit tree recalculation, and separately persisted alignment/frame/tree edits.
 - Interactive UMI, artefact, agreement, MDS/APOBEC, and dinucleotide figures with labelled axes and SVG export.
-- A single compressed `.webporpid` result file and eighteen component export types.
+- A single compressed `.webporpid` result file, eighteen component export types, and a complete gzip-compressed tar bundle.
 
 ## Browser application
 
@@ -27,7 +30,7 @@ npm ci
 npm run build
 ```
 
-The static site is written to `dist/`. `.github/workflows/deploy-pages.yml` rebuilds, tests, and deploys it to GitHub Pages. The application accepts either the original single-dataset PORPID YAML shape or webPORPID's editable `dataset`/`samples`/`parameters` shape. Uploads accumulate across selections and drag/drop operations. Once YAML is present, its panel, contamination, and functional-reference paths become labelled slots; renamed files can be assigned explicitly and the exact mapping is stored in the run log and result file.
+The static site is written to `dist/`. `.github/workflows/deploy-pages.yml` rebuilds, tests, and deploys it to GitHub Pages. The application accepts either the original single-dataset PORPID YAML shape or webPORPID's editable `dataset`/`samples`/`parameters` shape. Uploads accumulate across selections and drag/drop operations. Once YAML is present, its panel, contamination, and functional-reference paths become labelled slots; renamed files can be assigned explicitly and the exact mapping is stored in the run log and result file. Current Chromium browsers can also stream temporary partitions directly to a user-selected scratch directory; this is recommended for massive runs with `maxReadsPerSample: 0` and bypasses browser-origin storage quota.
 
 To rebuild both SIMD WASM cores from source, install WASI SDK 25 or newer and run:
 
@@ -65,7 +68,7 @@ The supplied demo has one accepted UMI family and exercises indel-tolerant conse
 
 ## Scale and memory model
 
-Input is decoded in bounded batches. Demultiplexed reads are hashed into disk/OPFS partitions; the count and consensus passes scan fixed-size record headers and materialize only deterministically selected records from one partition per active worker. In the browser, a monotone deterministic cutoff bypasses records that cannot survive `maxReadsPerSample`, and periodic in-place compaction removes stale early candidates without changing the final selected set. OPFS short writes are retried to completion and genuine quota failures include actionable storage information. The CLI always uses temporary files. The browser uses Origin Private File System storage when available and otherwise has an explicit 512 MiB fallback limit.
+Input is decoded in bounded batches. Demultiplexed reads are hashed into disk partitions; the count and consensus passes scan fixed-size record headers and materialize one partition per active worker. In automatic browser mode, a monotone deterministic cutoff bypasses records that cannot survive `maxReadsPerSample`, and periodic OPFS compaction removes stale early candidates without changing the final selected set. External-scratch mode instead opens sequential partition streams on a user-selected disk, bypassing origin quota and cleaning its temporary subdirectory after consensus. Count/consensus concurrency is bounded from measured partition sizes. The CLI always uses an ordinary temporary directory; the automatic browser fallback has an explicit 512 MiB in-memory limit if OPFS is unavailable.
 
 Downstream MSA runs monolithically up to 8,000 rows and 128 MiB of input bases. Larger jobs use deterministic 2,000-row shared-anchor batches, retaining only the final alignment rather than a single enormous aligner workspace.
 

@@ -25,7 +25,7 @@ The browser and CLI share the same encoder/decoder. The current decoder caps com
 - **Post-processing records:** consensus/aligned/trimmed sequences, every filter decision, panel score, functional rejection reasons, and optional APOBEC posterior summary.
 - **Per-sample products:** collapsed and uncollapsed nucleotide FASTA alignments, directly translated protein views, optional nucleotide Newick trees, and the aligned reference row used for coordinate display.
 - **Collapse membership:** representative, member identifiers, conservative minimum agreement, and a multiplicity that counts UMI families rather than reads.
-- **Input mapping/run options:** exact uploaded-file to YAML-slot assignments and whether automatic phylogeny inference was deferred.
+- **Input mapping/run options:** exact uploaded-file to YAML-slot assignments, whether automatic phylogeny inference was deferred, and automatic versus external scratch-spool selection. Scratch directory handles and paths are never serialized.
 - **Optional alignment edits:** exact corrected nucleotide FASTA, translation frame, baseline/edited/tree fingerprints, warning summary, edit source/time, stale-tree state, and optional recalculated Newick tree. The original alignment remains untouched.
 - **Run timing/log:** per-stage wall times plus persistent stage counts, input mappings, interactive tree runs, execution/storage choices, and fallbacks.
 
@@ -45,7 +45,7 @@ Validation requires unique sample, family, consensus, and post-processing identi
 | `contamination-csv` | Primary and wider-suspect contamination calls |
 | `postproc-csv` | All filter flags, panel score, functional flag, and rejection reasons |
 | `apobec-csv` | Stored APOBEC posterior summaries |
-| `collapse-csv` | Collapsed representatives, UMI-family multiplicities, minimum agreement, and member identifiers |
+| `collapse-csv` | Collapsed representatives, UMI-family multiplicities, and member identifiers; per-family agreement remains in the post-processing export |
 | `nucleotide-alignment` | Selected sample collapsed nucleotide FASTA alignment |
 | `protein-alignment` | Direct translation of the selected sample's active collapsed nucleotide alignment and saved frame |
 | `newick` | Selected sample active collapsed nucleotide tree, including a recalculated edited tree when present |
@@ -55,6 +55,8 @@ Validation requires unique sample, family, consensus, and post-processing identi
 | `log` | Persistent plain-text run log |
 
 Browser exports always use the sample currently selected in the explorer. If Alivibe or an imported FASTA changed the alignment, alignment/protein/tree exports use that persisted edit. CLI FASTA/CSV exports accept optional `--sample`; alignment and tree exports require it when a result contains multiple samples.
+
+The browser's **Export all (.tar.gz)** control stores the complete editable `.webporpid` project and global run log at the archive root. Every sample-specific component in the table above is placed below a directory named from that sample ID. Empty alignment or Newick members explicitly represent unavailable or deferred components.
 
 ```bash
 node cli/porpid-cli.mjs export results.webporpid \
