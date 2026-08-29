@@ -17,15 +17,15 @@ The browser and CLI share the same encoder/decoder. The current decoder caps com
 ## Stored components
 
 - **Provenance:** webPORPID version, creation time, engine, worker count, input name and SHA-256, compiled-configuration SHA-256, deterministic seed, and supplied PORPID branch/commit identifier.
-- **Configuration:** dataset, sample primers, reference filenames, overrides, and every pipeline parameter. The external contamination-panel records are stored separately so a joint reference/donor contamination phylogeny can be built after reload; raw reads and the larger preprocessing spool are never retained.
+- **Configuration and resumable references:** dataset, sample primers, reference filenames, overrides, every pipeline parameter, the contamination panel, and the small per-sample panel/functional-reference records required to resume downstream work. Raw reads and the preprocessing spool are never retained.
 - **Quality summary:** total, expected-error, length, primer, sample-ID, BPB, malformed, demultiplexed, downsampled, and per-sample counters, including exact selected/subsampled reads for each sample.
 - **UMI family table:** observed UMI, size, most likely parent, posterior/log-offspring probability, disposition, and consensus minimum agreement where available.
 - **Consensus records:** identifiers, sample, UMI, family size, nucleotide sequence, minimum agreement, and low-agreement site details.
 - **Contamination calls:** one decision per consensus family, with nearest non-self label/distance and primary-discard versus wider-suspect status. A primary decision takes precedence over the wider suspect pass.
 - **Post-processing records:** consensus/aligned/trimmed sequences, every filter decision, panel score, functional rejection reasons, and optional APOBEC posterior summary.
-- **Per-sample products:** collapsed and uncollapsed nucleotide FASTA alignments, directly translated protein views, optional nucleotide Newick trees, and the aligned reference row used for coordinate display.
+- **Per-sample products:** collapsed and uncollapsed nucleotide FASTA alignments, reference-clipped codon-aware functional-pass nucleotide/protein alignments, directly translated protein views, optional Newick trees, and the aligned reference rows used for coordinate display.
 - **Collapse membership:** representative, member identifiers, and a multiplicity that counts UMI families rather than reads. Minimum agreement remains exclusively attached to the member UMI families.
-- **Input mapping/run options:** exact uploaded-file to YAML-slot assignments, whether automatic phylogeny inference was deferred, and automatic versus external scratch-spool selection. Scratch directory handles and paths are never serialized.
+- **Input mapping/run options/stage state:** exact uploaded-file to YAML-slot assignments, every requested defer option, automatic versus external scratch selection, and an explicit completed/deferred/skipped record for contamination, post-processing, collapse, and tree stages. Scratch directory handles and paths are never serialized. A consensus-only project is valid; missing post-processing records are not interpreted as passes.
 - **Optional alignment edits:** exact corrected nucleotide FASTA, translation frame, baseline/edited/tree fingerprints, row/column dimensions, exact added/deleted/changed row identifiers, deterministic minimum-edit per-row and aggregate substitution/insertion/deletion counts, explicit shared-row reorder state, gap-only change flags, warning summary, edit source/time, stale-tree state, and optional recalculated Newick tree. An append-only action history records edits, frame changes, resets, and tree recalculations. The original alignment remains untouched.
 - **Run timing/log:** per-stage wall times plus persistent stage counts, input mappings, interactive tree runs, execution/storage choices, and fallbacks.
 
@@ -52,11 +52,14 @@ Validation requires unique sample, family, consensus, and post-processing identi
 | `uncollapsed-nucleotide-alignment` | Every retained UMI-family consensus in its active alignment |
 | `uncollapsed-protein-alignment` | Direct translation of the active uncollapsed alignment and saved frame |
 | `uncollapsed-newick` | Optional on-demand family-level tree |
+| `functional-nucleotide-alignment` | Every functional-filter pass in the codon-aware alignment, clipped to the first/last functional-reference nucleotide |
+| `functional-protein-alignment` | Direct translation of the active functional nucleotide alignment and saved frame |
+| `functional-newick` | Optional on-demand functional-sequence tree |
 | `log` | Persistent plain-text run log |
 
 Browser exports always use the sample currently selected in the explorer. If Alivibe or an imported FASTA changed the alignment, alignment/protein/tree exports use that persisted edit. CLI FASTA/CSV exports accept optional `--sample`; alignment and tree exports require it when a result contains multiple samples.
 
-The browser's **Export all (.tar.gz)** control stores the complete editable `.webporpid` project and global run log at the archive root. Every sample-specific component in the table above is placed below a directory named from that sample ID. Empty alignment or Newick members explicitly represent unavailable or deferred components.
+The browser's **Export all (.tar.gz)** control stores the complete editable `.webporpid` project and global run log at the archive root. Every sample-specific component in the table above is placed below a directory named from that sample ID. `cross-sample-overview/` contains sample summary, input filtering, all effective parameters, optional-stage status, timings, file mappings, and provenance tables. Empty alignment or Newick members explicitly represent unavailable or deferred components.
 
 ```bash
 node cli/porpid-cli.mjs export results.webporpid \

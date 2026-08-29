@@ -2,25 +2,30 @@
 
 import { bytesToHex } from "@noble/hashes/utils.js";
 import coreWasmUrl from "/webporpid.wasm?url";
-import { classifyContamination } from "./contamination";
+import { classifyContaminationAsync } from "./contamination";
 import { runAlivibeMsa } from "./alivibe-msa-runtime";
 import { compileConfig, resultConfig } from "./config";
 import { finishStreamingHash, createStreamingHash, streamFastq } from "./fastq-stream";
 import { PartitionStore, type ExternalScratchDirectoryHandle } from "./partition-store";
-import { postprocess } from "./postprocess";
+import { collapsePostprocess, postprocess, type PostprocessOutput } from "./postprocess";
 import { runFastTreeIsolated } from "./biowasm";
+import { downstreamResources, statusRecord } from "./optional-stages";
 import { treeTipNames } from "./tree-names";
-import type { InputFileMapping, PipelineConfig, PipelineProgress, QualityStats, ResultBundle } from "./types";
+import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, QualityStats, ResultBundle, SampleSummary } from "./types";
 import { CoreWorkerPool } from "./worker-pool";
 import {
   decodeConsensusOutput, decodeFamilyCounts, decodeFamilyModel, makeCutoffs, makeCutoffValues, mergeFamilyCounts,
   mergeStats,
 } from "./wasm-runtime";
 
-type RunRequest = { type: "run"; file: File; config: PipelineConfig; workers: number; deferPhylogeny?: boolean; inputMappings?: InputFileMapping[];
+type RunRequest = { type: "run"; file: File; config: PipelineConfig; workers: number; deferPhylogeny?: boolean; deferContamination?: boolean;
+  deferPostprocessing?: boolean; deferCollapse?: boolean; inputMappings?: InputFileMapping[];
   spoolStorage?: "automatic" | "external-directory"; scratchDirectory?: ExternalScratchDirectoryHandle };
 type CancelRequest = { type: "cancel" };
+type SkipStageRequest = { type: "skip-stage"; stage: OptionalStageName };
 let cancellation: AbortController | undefined;
+let activeOptionalStage: OptionalStageName | undefined, optionalStageCancellation: AbortController | undefined;
+let requestedSkip: OptionalStageName | undefined;
 
 function progress(value: PipelineProgress) { self.postMessage({ type: "progress", progress: value }); }
 const now = () => new Date().toISOString();
@@ -47,6 +52,25 @@ function starTree(fasta: string) {
   return `(${names.map((name) => `${name}:0.0`).join(",")});`;
 }
 
+async function optionalStage<T>(stage: OptionalStageName, runSignal: AbortSignal,
+  operation: (signal: AbortSignal) => Promise<T>): Promise<{ skipped: false; value: T } | { skipped: true }> {
+  activeOptionalStage = stage; requestedSkip = undefined; optionalStageCancellation = new AbortController();
+  const controller = optionalStageCancellation;
+  const cancelWithRun = () => controller.abort();
+  runSignal.addEventListener("abort", cancelWithRun, { once: true });
+  try {
+    return { skipped: false, value: await operation(controller.signal) };
+  } catch (cause) {
+    if (runSignal.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
+    if (!runSignal.aborted && controller.signal.aborted && requestedSkip === stage) return { skipped: true };
+    throw cause;
+  } finally {
+    runSignal.removeEventListener("abort", cancelWithRun);
+    if (activeOptionalStage === stage) activeOptionalStage = undefined;
+    if (optionalStageCancellation === controller) optionalStageCancellation = undefined;
+  }
+}
+
 async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBundle> {
   const runStarted = performance.now(), timings: NonNullable<ResultBundle["timings"]> = [];
   const workers = Math.max(1, Math.floor(request.workers)), compiledConfig = compileConfig(request.config);
@@ -66,7 +90,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   } catch (cause) { pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.5 started`,
+  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.6 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}`];
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
@@ -199,72 +223,187 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "consensus", fraction: 1, detail: `Consensus calling complete: ${consensuses.length.toLocaleString()} sequences retained for downstream checks` });
     stageStarted = recordTiming("consensus", stageStarted, consensuses.length);
 
-    progress({ stage: "contamination", fraction: 0, detail: "Comparing consensus sequences across samples for possible contamination" });
-    const contamination = classifyContamination(consensuses, request.config);
-    progress({ stage: "contamination", fraction: 1, detail: `Contamination comparison complete: ${contamination.filter((call) => call.discarded).length.toLocaleString()} sequences excluded` });
-    log.push(`${now()} contamination: ${contamination.filter((call) => call.discarded).length} discarded; ${contamination.filter((call) => call.suspectOnly).length} suspect calls`);
-    stageStarted = recordTiming("contamination", stageStarted, consensuses.length);
-    progress({ stage: "postprocessing", fraction: 0, detail: "Starting panel screening, retained-sequence alignment, functional checks, and sequence annotation" });
-    const downstreamStarted = performance.now();
-    const downstream = await postprocess(consensuses, contamination, request.config, signal, runAlivibeMsa, workers,
-      (state) => progress({ stage: "postprocessing", fraction: state.fraction, detail: state.detail }));
-    downstream.summaries.forEach((summary, index) => {
-      summary.demultiplexedReads = quality.perSample[index] ?? 0;
-      summary.selectedReads = selectedReadsBySample[index] ?? 0;
-      summary.downsampledReads = Math.max(0, summary.demultiplexedReads - summary.selectedReads);
-      summary.observedUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length;
-      summary.likelyRealUmis = umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length;
-    });
-    const downstreamFinished = performance.now(), downstreamSeconds = (downstreamFinished - downstreamStarted) / 1000;
-    const collapseSeconds = Math.max(0, Math.min(downstreamSeconds, downstream.collapseSeconds));
-    storeTiming("postprocessing", downstreamSeconds - collapseSeconds, downstream.records.length);
-    const collapsedHaplotypes = Object.values(downstream.collapseGroups).reduce((sum, groups) => sum + groups.length, 0);
-    progress({ stage: "collapse", fraction: 1, detail: `Collapsed identical retained sequences into ${collapsedHaplotypes.toLocaleString()} distinct haplotypes; counts represent UMI families` });
-    storeTiming("collapse", collapseSeconds, collapsedHaplotypes); stageStarted = downstreamFinished;
-    log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; multiplicities count families, not reads`);
-
-    const trees: Record<string, string> = {}, treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
-    let treeCursor = 0, treesFinished = 0;
-    if (!request.deferPhylogeny) await Promise.all(Array.from({ length: Math.min(workers, Math.max(1, treeInputs.length)) }, async () => {
-      while (true) {
-        const index = treeCursor++; if (index >= treeInputs.length) return;
-        const [name, alignment] = treeInputs[index];
-        progress({ stage: "tree", fraction: treesFinished / Math.max(1, treeInputs.length), detail: `Inferring the collapsed phylogeny for ${name.split("/")[0]} (${treesFinished} of ${treeInputs.length} complete)` });
-        try { trees[name] = await runFastTreeIsolated(alignment); }
-        catch (cause) { trees[name] = starTree(alignment); log.push(`${now()} FastTree warning for ${name}: ${cause instanceof Error ? cause.message : String(cause)}; stored a zero-branch star fallback`); }
-        treesFinished++;
-        progress({ stage: "tree", fraction: treesFinished / Math.max(1, treeInputs.length), detail: `Finished ${treesFinished} of ${treeInputs.length} collapsed phylogenies` });
-      }
+    const baseSummaries: SampleSummary[] = request.config.samples.map((sample, index) => ({
+      sample: sample.name, demultiplexedReads: quality.perSample[index] ?? 0,
+      selectedReads: selectedReadsBySample[index] ?? 0,
+      downsampledReads: Math.max(0, (quality.perSample[index] ?? 0) - (selectedReadsBySample[index] ?? 0)),
+      observedUmis: umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length,
+      likelyRealUmis: umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length,
+      consensusSequences: consensuses.filter((record) => record.sampleIndex === index).length,
     }));
-    else {
-      progress({ stage: "tree", fraction: 1, detail: "Phylogeny inference was deferred; retained alignments are ready for on-demand tree building" });
-      log.push(`${now()} phylogeny: deferred by user; collapsed alignments are stored and trees can be inferred in the results explorer`);
+    const optionalStages: NonNullable<ResultBundle["optionalStages"]> = {
+      contamination: statusRecord("deferred", "Waiting after consensus."),
+      postprocessing: statusRecord("deferred", "Waiting for contamination checks."),
+      collapse: statusRecord("deferred", "Waiting for downstream filtering."),
+      tree: statusRecord("deferred", "Waiting for haplotype collapse."),
+    };
+    let contamination: ResultBundle["contamination"] = [];
+    let downstream: PostprocessOutput = { records: [], summaries: baseSummaries, alignments: {}, referenceAlignments: {}, collapseGroups: {}, collapseSeconds: 0 };
+    const trees: Record<string, string> = {};
+
+    if (request.deferContamination && request.config.parameters.contaminationFilter) {
+      const detail = "Deferred by user after consensus; no contamination decision has been assigned.";
+      optionalStages.contamination = statusRecord("deferred", detail);
+      optionalStages.postprocessing = statusRecord("deferred", "Waiting for deferred contamination checks.");
+      optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
+      optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
+      progress({ stage: "contamination", fraction: 1, detail: "Contamination checks deferred; the results explorer can compute this stage and every required downstream prerequisite" });
+      log.push(`${now()} contamination: deferred by user; downstream stages remain explicitly uncomputed`);
+    } else {
+      progress({ stage: "contamination", fraction: 0, detail: "Preparing run-wide sequence signatures for contamination checks" });
+      const started = performance.now(), result = await optionalStage("contamination", signal, (stageSignal) =>
+        classifyContaminationAsync(consensuses, request.config, stageSignal, (state) => progress({ stage: "contamination",
+          fraction: state.fraction, detail: state.detail })));
+      storeTiming("contamination", (performance.now() - started) / 1000, consensuses.length);
+      if (result.skipped) {
+        optionalStages.contamination = statusRecord("skipped", "Skipped by user while contamination checks were running; no decisions were retained.");
+        optionalStages.postprocessing = statusRecord("deferred", "Waiting for contamination checks after the earlier run was skipped.");
+        optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
+        optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
+        progress({ stage: "contamination", fraction: 1, detail: "Contamination checks skipped; downstream stages were left uncomputed" });
+        log.push(`${now()} contamination: skipped by user; downstream stages left uncomputed`);
+      } else {
+        contamination = result.value;
+        optionalStages.contamination = statusRecord("completed", request.config.parameters.contaminationFilter
+          ? `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`
+          : "Contamination filtering was disabled in the run configuration.");
+        baseSummaries.forEach((summary) => { summary.contaminationPassed = summary.consensusSequences
+          - contamination.filter((call) => call.sample === summary.sample && call.discarded).length; });
+        progress({ stage: "contamination", fraction: 1, detail: `Contamination checks complete: ${contamination.filter((call) => call.discarded).length.toLocaleString()} sequences excluded` });
+        log.push(`${now()} contamination: ${contamination.filter((call) => call.discarded).length} discarded; ${contamination.filter((call) => call.suspectOnly).length} suspect calls`);
+      }
     }
-    if (!treeInputs.length) progress({ stage: "tree", fraction: 1, detail: "No retained alignments required phylogeny inference" });
-    recordTiming("tree", stageStarted, Object.keys(trees).length);
+
+    if (optionalStages.contamination.state === "completed") {
+      if (request.deferPostprocessing) {
+        optionalStages.postprocessing = statusRecord("deferred", "Deferred by user; panel screening, functional checks, and annotations have not run.");
+        optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
+        optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
+        progress({ stage: "postprocessing", fraction: 1, detail: "Alignment and downstream filtering deferred; it can be computed from the stored consensus calls" });
+        log.push(`${now()} postprocessing: deferred by user`);
+      } else {
+        progress({ stage: "postprocessing", fraction: 0, detail: "Starting panel screening, retained-sequence alignment, functional checks, and sequence annotation" });
+        const started = performance.now(), result = await optionalStage("postprocessing", signal, (stageSignal) =>
+          postprocess(consensuses, contamination, request.config, stageSignal, runAlivibeMsa, workers,
+            (state) => progress({ stage: "postprocessing", fraction: state.fraction, detail: state.detail }), { collapse: false }));
+        storeTiming("postprocessing", (performance.now() - started) / 1000, result.skipped ? undefined : result.value.records.length);
+        if (result.skipped) {
+          optionalStages.postprocessing = statusRecord("skipped", "Skipped by user while downstream filtering was running; partial decisions were discarded.");
+          optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
+          optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
+          progress({ stage: "postprocessing", fraction: 1, detail: "Alignment and downstream filtering skipped; partial outputs were not retained" });
+          log.push(`${now()} postprocessing: skipped by user; partial outputs discarded`);
+        } else {
+          downstream = result.value;
+          downstream.summaries.forEach((summary, index) => {
+            const base = baseSummaries[index]; summary.demultiplexedReads = base.demultiplexedReads;
+            summary.selectedReads = base.selectedReads; summary.downsampledReads = base.downsampledReads;
+            summary.observedUmis = base.observedUmis; summary.likelyRealUmis = base.likelyRealUmis;
+          });
+          optionalStages.postprocessing = statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`);
+          progress({ stage: "postprocessing", fraction: 1, detail: "Panel screening, functional checks, retained-sequence alignment, and annotations complete" });
+          log.push(`${now()} postprocessing: ${downstream.records.filter((record) => record.artefactPass && record.agreementPass && record.contaminationPass && record.panelPass).length} sequences passed all non-functional filters`);
+        }
+      }
+    }
+
+    if (optionalStages.postprocessing.state === "completed") {
+      if (request.deferCollapse) {
+        optionalStages.collapse = statusRecord("deferred", "Deferred by user; uncollapsed retained-family alignments are stored.");
+        optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
+        progress({ stage: "collapse", fraction: 1, detail: "Haplotype collapse deferred; uncollapsed alignments are ready for later computation" });
+        log.push(`${now()} collapse: deferred by user`);
+      } else {
+        progress({ stage: "collapse", fraction: 0, detail: "Starting identical-haplotype collapse; multiplicities will count UMI families, not reads" });
+        const started = performance.now(), result = await optionalStage("collapse", signal, (stageSignal) =>
+          collapsePostprocess(downstream, request.config, stageSignal,
+            (state) => progress({ stage: "collapse", fraction: state.fraction, detail: state.detail })));
+        storeTiming("collapse", (performance.now() - started) / 1000,
+          result.skipped ? undefined : Object.values(result.value.collapseGroups).reduce((sum, groups) => sum + groups.length, 0));
+        if (result.skipped) {
+          optionalStages.collapse = statusRecord("skipped", "Skipped by user; uncollapsed retained-family alignments remain available.");
+          optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
+          progress({ stage: "collapse", fraction: 1, detail: "Haplotype collapse skipped; uncollapsed alignments remain available" });
+          log.push(`${now()} collapse: skipped by user`);
+        } else {
+          downstream = result.value;
+          const collapsedHaplotypes = Object.values(downstream.collapseGroups).reduce((sum, groups) => sum + groups.length, 0);
+          optionalStages.collapse = statusRecord("completed", `${collapsedHaplotypes} haplotypes; multiplicities count UMI families.`);
+          progress({ stage: "collapse", fraction: 1, detail: `Collapsed identical retained sequences into ${collapsedHaplotypes.toLocaleString()} distinct haplotypes; counts represent UMI families` });
+          log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; multiplicities count families, not reads`);
+        }
+      }
+    }
+
+    if (optionalStages.collapse.state === "completed") {
+      const treeInputs = request.config.samples.flatMap((sample) => {
+        const key = `${sample.name}/nucleotide`, alignment = downstream.alignments[key]; return alignment ? [[key, alignment] as const] : [];
+      });
+      if (request.deferPhylogeny) {
+        optionalStages.tree = statusRecord("deferred", "Deferred by user; collapsed alignments are stored for on-demand inference.");
+        progress({ stage: "tree", fraction: 1, detail: "Phylogeny inference deferred; collapsed alignments are ready for on-demand tree building" });
+        log.push(`${now()} phylogeny: deferred by user; collapsed alignments are stored and trees can be inferred in the results explorer`);
+      } else if (!treeInputs.length) {
+        optionalStages.tree = statusRecord("completed", "No retained collapsed alignments required a tree.");
+        progress({ stage: "tree", fraction: 1, detail: "No retained alignments required phylogeny inference" });
+      } else {
+        let treeCursor = 0, treesFinished = 0;
+        const started = performance.now(), result = await optionalStage("tree", signal, async (stageSignal) => {
+          await Promise.all(Array.from({ length: Math.min(workers, treeInputs.length) }, async () => {
+            while (true) {
+              if (stageSignal.aborted) throw new DOMException("Phylogeny inference skipped.", "AbortError");
+              const index = treeCursor++; if (index >= treeInputs.length) return;
+              const [name, alignment] = treeInputs[index];
+              progress({ stage: "tree", fraction: treesFinished / treeInputs.length, detail: `Inferring the collapsed phylogeny for ${name.split("/")[0]} (${treesFinished} of ${treeInputs.length} complete)` });
+              try { trees[name] = await runFastTreeIsolated(alignment, stageSignal); }
+              catch (cause) {
+                if (stageSignal.aborted) throw cause;
+                trees[name] = starTree(alignment); log.push(`${now()} FastTree warning for ${name}: ${cause instanceof Error ? cause.message : String(cause)}; stored a zero-branch star fallback`);
+              }
+              treesFinished++;
+              progress({ stage: "tree", fraction: treesFinished / treeInputs.length, detail: `Finished ${treesFinished} of ${treeInputs.length} collapsed phylogenies` });
+            }
+          }));
+        });
+        storeTiming("tree", (performance.now() - started) / 1000, Object.keys(trees).length);
+        if (result.skipped) {
+          optionalStages.tree = statusRecord("skipped", `Skipped by user after ${Object.keys(trees).length} of ${treeInputs.length} trees completed.`);
+          progress({ stage: "tree", fraction: 1, detail: `Phylogeny inference skipped; ${Object.keys(trees).length} completed trees were retained` });
+          log.push(`${now()} phylogeny: skipped by user after ${Object.keys(trees).length}/${treeInputs.length} trees`);
+        } else optionalStages.tree = statusRecord("completed", `${Object.keys(trees).length} collapsed phylogenies inferred.`);
+      }
+    }
+
     timings.push({ stage: "analysis-total", seconds: (performance.now() - runStarted) / 1000 });
-    log.push(`${now()} postprocessing: ${downstream.records.filter((record) => record.artefactPass && record.agreementPass && record.contaminationPass && record.panelPass).length} sequences passed all non-functional filters`);
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.5", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.6", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
       config: resultConfig(request.config), quality, summaries: downstream.summaries, umiFamilies,
       consensuses, contamination, contaminationReferences: request.config.contaminationPanelSequences,
+      downstreamResources: downstreamResources(request.config),
       records: downstream.records, alignments: downstream.alignments, trees,
       referenceAlignments: downstream.referenceAlignments, collapseGroups: downstream.collapseGroups,
       inputMappings: request.inputMappings, runOptions: { deferPhylogeny: Boolean(request.deferPhylogeny),
-        spoolStorage: request.spoolStorage === "external-directory" ? "external-directory" : "automatic" }, timings, log,
+        deferContamination: Boolean(request.deferContamination), deferPostprocessing: Boolean(request.deferPostprocessing),
+        deferCollapse: Boolean(request.deferCollapse),
+        spoolStorage: request.spoolStorage === "external-directory" ? "external-directory" : "automatic" },
+      optionalStages, timings, log,
     };
   } finally {
     pool.close(); try { await store.close(); } catch { /* already closed or best-effort cleanup */ }
   }
 }
 
-self.addEventListener("message", (event: MessageEvent<RunRequest | CancelRequest>) => {
-  if (event.data.type === "cancel") { cancellation?.abort(); return; }
+self.addEventListener("message", (event: MessageEvent<RunRequest | CancelRequest | SkipStageRequest>) => {
+  if (event.data.type === "cancel") { cancellation?.abort(); optionalStageCancellation?.abort(); return; }
+  if (event.data.type === "skip-stage") {
+    if (event.data.stage === activeOptionalStage) { requestedSkip = event.data.stage; optionalStageCancellation?.abort(); }
+    return;
+  }
   cancellation?.abort(); cancellation = new AbortController();
   void run(event.data, cancellation.signal).then((result) => self.postMessage({ type: "result", result }))
     .catch((cause) => self.postMessage({ type: "error", message: cause instanceof Error ? cause.message : String(cause) }));

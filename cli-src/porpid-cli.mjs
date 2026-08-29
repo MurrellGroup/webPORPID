@@ -11,6 +11,7 @@ import { bytesToHex } from "@noble/hashes/utils.js";
 import { classifyContamination } from "../src/contamination.ts";
 import { compileConfig, parseConfigYaml, resolveReferenceFiles, resultConfig } from "../src/config.ts";
 import { postprocess } from "../src/postprocess.ts";
+import { downstreamResources, statusRecord } from "../src/optional-stages.ts";
 import { decodeResult, encodeResult, exportComponent, safeDatasetName } from "../src/result-file.ts";
 import { concatenateSpoolRecords, parseSpoolRecordHeader, selectedSpoolRecord, SPOOL_HEADER_BYTES } from "../src/spool-record.ts";
 import {
@@ -19,7 +20,7 @@ import {
 import { createFastTreeRunner } from "./direct-fasttree.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 
-const VERSION = "0.3.5";
+const VERSION = "0.3.6";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
@@ -42,7 +43,8 @@ function usage() {
     `Components: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n` +
     `            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n` +
     `            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n` +
-    `            uncollapsed-protein-alignment, uncollapsed-newick, log`;
+    `            uncollapsed-protein-alignment, uncollapsed-newick, functional-nucleotide-alignment,\n` +
+    `            functional-protein-alignment, functional-newick, log`;
 }
 
 function option(args, name) {
@@ -310,9 +312,14 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
       workers, inputName: basename(input), inputSha256: inputHash.digest("hex"), configSha256: configHash,
       deterministicSeed: config.parameters.deterministicSeed.toString(), upstreamBranch: "nanopore", upstreamCommit: UPSTREAM_COMMIT },
       config: resultConfig(config), quality, summaries: downstream.summaries, umiFamilies, consensuses, contamination,
-      contaminationReferences: config.contaminationPanelSequences,
+      contaminationReferences: config.contaminationPanelSequences, downstreamResources: downstreamResources(config),
       records: downstream.records, alignments: downstream.alignments, trees, referenceAlignments: downstream.referenceAlignments,
-      collapseGroups: downstream.collapseGroups, inputMappings, runOptions: { deferPhylogeny }, timings, log };
+      collapseGroups: downstream.collapseGroups, inputMappings, runOptions: { deferPhylogeny, deferContamination: false, deferPostprocessing: false, deferCollapse: false },
+      optionalStages: { contamination: statusRecord("completed", `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`),
+        postprocessing: statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`),
+        collapse: statusRecord("completed", `${collapsedHaplotypes} haplotypes; multiplicities count UMI families.`),
+        tree: statusRecord(deferPhylogeny ? "deferred" : "completed", deferPhylogeny ? "Deferred by user; collapsed alignments are stored for on-demand inference." : `${Object.keys(trees).length} collapsed phylogenies inferred.`) },
+      timings, log };
     await mkdir(dirname(resolve(outputPath)), { recursive: true }); await writeFile(outputPath, encodeResult(result));
     status(`wrote ${outputPath}`); return result;
   } finally { await pool.close(); await store.close(); }

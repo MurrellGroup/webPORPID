@@ -193,10 +193,11 @@ export function translateAlignmentFasta(fasta: string, frameOffset: AlignmentFra
   return exactFasta(inspected.records.map((record) => ({ ...record, sequence: translateAlignedNucleotides(record.sequence, frameOffset) })));
 }
 
-export type AlignmentVariant = "collapsed" | "uncollapsed";
+export type AlignmentVariant = "collapsed" | "uncollapsed" | "functional";
 
 export function alignmentKey(sample: string, variant: AlignmentVariant = "collapsed"): string {
-  return variant === "collapsed" ? `${sample}/nucleotide` : `${sample}/uncollapsed-nucleotide`;
+  return variant === "collapsed" ? `${sample}/nucleotide`
+    : variant === "uncollapsed" ? `${sample}/uncollapsed-nucleotide` : `${sample}/functional-nucleotide`;
 }
 
 export function effectiveAlignment(bundle: ResultBundle, sample: string, variant: AlignmentVariant = "collapsed"): { fasta?: string; edit?: AlignmentEdit; frameOffset: AlignmentFrameOffset; key: string } {

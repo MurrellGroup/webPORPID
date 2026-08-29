@@ -63,8 +63,10 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   array(bundle.summaries, "summaries").forEach((entry, index) => {
     const row = object(entry, `summaries[${index}]`), sample = text(row.sample, `summaries[${index}].sample`);
     if (!sampleSet.has(sample) || summarySamples.has(sample)) throw new Error("Result summaries contain an unknown or duplicate sample."); summarySamples.add(sample);
-    for (const key of ["demultiplexedReads", "observedUmis", "likelyRealUmis", "consensusSequences", "contaminationPassed", "postprocPassed", "artefactCutoff"])
+    for (const key of ["demultiplexedReads", "observedUmis", "likelyRealUmis", "consensusSequences"])
       count(row[key], `summaries[${index}].${key}`);
+    for (const key of ["contaminationPassed", "postprocPassed", "artefactCutoff"])
+      if (row[key] != null) count(row[key], `summaries[${index}].${key}`);
     if (row.selectedReads != null) count(row.selectedReads, `summaries[${index}].selectedReads`);
     if (row.downsampledReads != null) count(row.downsampledReads, `summaries[${index}].downsampledReads`);
     if (row.selectedReads != null && row.downsampledReads != null
@@ -121,6 +123,26 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       text(record.sequence, `contaminationReferences[${index}].sequence`);
     });
   }
+  if (bundle.downstreamResources != null) {
+    const resources = object(bundle.downstreamResources, "downstreamResources"), resourceSamples = new Set<string>();
+    array(resources.samples, "downstreamResources.samples").forEach((rawSample, index) => {
+      const resource = object(rawSample, `downstreamResources.samples[${index}]`), name = text(resource.name, "downstream resource sample");
+      knownSample(name, `downstreamResources.samples[${index}]`); if (resourceSamples.has(name)) throw new Error("Downstream resource sample names must be unique.");
+      resourceSamples.add(name);
+      array(resource.panelSequences, "downstream panel sequences").forEach((rawRecord) => {
+        const record = object(rawRecord, "downstream panel record"); text(record.name, "downstream panel name"); text(record.sequence, "downstream panel sequence");
+      });
+      if (resource.functionalReferenceSequence != null) {
+        const record = object(resource.functionalReferenceSequence, "downstream functional reference");
+        text(record.name, "downstream functional reference name"); text(record.sequence, "downstream functional reference sequence");
+      }
+    });
+    if (resourceSamples.size !== samples.length) throw new Error("Downstream resources are missing a configured sample.");
+  }
+
+  const rawStageStatuses = bundle.optionalStages == null ? undefined : object(bundle.optionalStages, "optionalStages");
+  const postprocessingComplete = rawStageStatuses == null
+    || object(rawStageStatuses.postprocessing, "optionalStages.postprocessing").state === "completed";
 
   const recordIds = new Set<string>(), recordMetadata = new Map<string, { sample: string; alignedNt?: string; minimumAgreement: number }>();
   array(bundle.records, "records").forEach((entry, index) => {
@@ -139,8 +161,9 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     if (row.apobec != null) { const model = object(row.apobec, "postproc APOBEC"); for (const key of ["posteriorMeanGaMultiplier", "posteriorGaInflated", "posteriorMeanMutationRate", "gaMutations", "totalMutations"]) numeric(model[key], `APOBEC ${key}`); }
     recordMetadata.set(id, { sample, alignedNt, minimumAgreement });
   });
-  if (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id)))
+  if (postprocessingComplete && (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id))))
     throw new Error("Consensus and post-processing records are inconsistent.");
+  if (!postprocessingComplete && recordIds.size) throw new Error("An uncomputed post-processing stage cannot contain partial post-processing records.");
 
   for (const [label, entries] of [["alignments", object(bundle.alignments, "alignments")], ["trees", object(bundle.trees, "trees")]] as const)
     for (const [name, contents] of Object.entries(entries)) {
@@ -203,12 +226,25 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   });
   if (bundle.runOptions != null) {
     const options = object(bundle.runOptions, "runOptions"); bool(options.deferPhylogeny, "runOptions.deferPhylogeny");
+    for (const key of ["deferContamination", "deferPostprocessing", "deferCollapse"])
+      if (options[key] != null) bool(options[key], `runOptions.${key}`);
     if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage")))
       throw new Error("runOptions.spoolStorage is not recognized.");
   }
+  if (rawStageStatuses != null) {
+    let prerequisiteIncomplete = false;
+    for (const stage of ["contamination", "postprocessing", "collapse", "tree"] as const) {
+      const status = object(rawStageStatuses[stage], `optionalStages.${stage}`), state = text(status.state, `optionalStages.${stage}.state`);
+      if (!["completed", "deferred", "skipped"].includes(state)) throw new Error(`optionalStages.${stage}.state is not recognized.`);
+      text(status.detail, `optionalStages.${stage}.detail`); text(status.updatedUtc, `optionalStages.${stage}.updatedUtc`);
+      if (prerequisiteIncomplete && state === "completed") throw new Error(`optionalStages.${stage} cannot be completed before its prerequisite.`);
+      if (state !== "completed") prerequisiteIncomplete = true;
+    }
+  }
   if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
     const sample = name.split("/", 1)[0]; knownSample(sample, `alignmentEdits.${name}`);
-    if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide`) throw new Error("Edited alignment keys must identify a stored nucleotide view.");
+    if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide` && name !== `${sample}/functional-nucleotide`)
+      throw new Error("Edited alignment keys must identify a stored nucleotide view.");
     const edit = object(rawEdit, `alignmentEdits.${name}`), fasta = text(edit.fasta, `alignmentEdits.${name}.fasta`);
     const frameOffset = count(edit.frameOffset, `alignmentEdits.${name}.frameOffset`);
     if (frameOffset > 2) throw new Error("Edited alignment frame offsets must be 0, 1, or 2.");
@@ -251,7 +287,8 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   if (bundle.alignmentEditHistory != null) array(bundle.alignmentEditHistory, "alignmentEditHistory").forEach((rawEntry, index) => {
     const entry = object(rawEntry, `alignmentEditHistory[${index}]`), key = text(entry.alignmentKey, `alignmentEditHistory[${index}].alignmentKey`);
     const sample = key.split("/", 1)[0]; knownSample(sample, `alignmentEditHistory[${index}]`);
-    if (key !== `${sample}/nucleotide` && key !== `${sample}/uncollapsed-nucleotide`) throw new Error("Alignment audit keys must identify a nucleotide view.");
+    if (key !== `${sample}/nucleotide` && key !== `${sample}/uncollapsed-nucleotide` && key !== `${sample}/functional-nucleotide`)
+      throw new Error("Alignment audit keys must identify a nucleotide view.");
     if (!["alignment-edit", "frame-change", "tree-recalculation", "edit-reset"].includes(text(entry.action, `alignmentEditHistory[${index}].action`)))
       throw new Error("Alignment audit action is not recognized.");
     text(entry.timestamp, `alignmentEditHistory[${index}].timestamp`); text(entry.source, `alignmentEditHistory[${index}].source`);
@@ -301,7 +338,8 @@ const passed = (record: ResultBundle["records"][number]) => record.artefactPass 
 export type ExportKind = "consensus-fasta" | "passed-consensus-fasta" | "rejected-consensus-fasta" | "trimmed-nt-fasta" | "trimmed-aa-fasta"
   | "family-csv" | "low-agreement-csv" | "contamination-csv" | "postproc-csv" | "apobec-csv"
   | "collapse-csv" | "nucleotide-alignment" | "protein-alignment" | "newick"
-  | "uncollapsed-nucleotide-alignment" | "uncollapsed-protein-alignment" | "uncollapsed-newick" | "log";
+  | "uncollapsed-nucleotide-alignment" | "uncollapsed-protein-alignment" | "uncollapsed-newick"
+  | "functional-nucleotide-alignment" | "functional-protein-alignment" | "functional-newick" | "log";
 
 function alignmentSample(bundle: ResultBundle, sample?: string) {
   if (sample) return sample;
@@ -367,6 +405,20 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
     case "uncollapsed-newick": {
       const selected = alignmentSample(bundle, sample), key = `${selected}/uncollapsed-nucleotide`, edit = bundle.alignmentEdits?.[key];
       return { extension: "uncollapsed-tree.newick", mime: "text/plain", text: edit?.treeNewick ?? bundle.trees[key] ?? "" };
+    }
+    case "functional-nucleotide-alignment": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/functional-nucleotide`, edit = bundle.alignmentEdits?.[key];
+      return { extension: "functional-nucleotide-alignment.fasta", mime: "text/x-fasta", text: edit?.fasta ?? bundle.alignments[key] ?? "" };
+    }
+    case "functional-protein-alignment": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/functional-nucleotide`, edit = bundle.alignmentEdits?.[key];
+      const nucleotide = edit?.fasta ?? bundle.alignments[key];
+      return { extension: "functional-protein-alignment.fasta", mime: "text/x-fasta",
+        text: nucleotide ? translateAlignmentFasta(nucleotide, edit?.frameOffset ?? 0) : bundle.alignments[`${selected}/functional-protein`] ?? "" };
+    }
+    case "functional-newick": {
+      const selected = alignmentSample(bundle, sample), key = `${selected}/functional-nucleotide`, edit = bundle.alignmentEdits?.[key];
+      return { extension: "functional-tree.newick", mime: "text/plain", text: edit?.treeNewick ?? bundle.trees[key] ?? "" };
     }
     case "log": return { extension: "log.txt", mime: "text/plain", text: bundle.log.join("\n") + "\n" };
   }

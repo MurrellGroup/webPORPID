@@ -43,6 +43,13 @@ export interface SampleOverviewStat {
   functionalReadPercent: number;
 }
 
+export interface ParameterSettingRow {
+  scope: "run" | "sample";
+  sample: string;
+  parameter: string;
+  value: string;
+}
+
 export const FAMILY_CALLS: ReadonlyArray<{ disposition: FamilyDisposition; label: string; note: string }> = [
   { disposition: "likely_real", label: "Accepted UMI families", note: "Final UMI-family call after all PORPID family-level checks." },
   { disposition: "BPB-rejects", label: "BPB rejects", note: "Reads for which the barcode/primer boundary could not be accepted." },
@@ -141,6 +148,8 @@ export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] 
   return bundle.config.samples.map((configured) => {
     const sample = configured.name, summary = bundle.summaries.find((row) => row.sample === sample);
     const families = bundle.umiFamilies.filter((row) => row.sample === sample), records = bundle.records.filter((row) => row.sample === sample);
+    const consensuses = bundle.consensuses.filter((row) => row.sample === sample);
+    const contaminantIds = new Set(bundle.contamination.filter((row) => row.sample === sample && row.discarded).map((row) => row.sequenceId));
     const demultiplexedReads = summary?.demultiplexedReads ?? 0, selectedReads = selectedReadCount(bundle, sample);
     const downsampledReads = summary?.downsampledReads ?? Math.max(0, demultiplexedReads - selectedReads);
     const evaluated = records.filter(functionalWasEvaluated), functionalConfigured = Boolean(configured.functionalReference);
@@ -148,7 +157,7 @@ export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] 
       sample, demultiplexedReads, selectedReads, downsampledReads,
       downsampledPercent: percent(downsampledReads, demultiplexedReads),
       observedFamilies: families.filter((row) => row.disposition !== "BPB-rejects").length,
-      consensusFamilies: records.length,
+      consensusFamilies: summary?.consensusSequences ?? consensuses.length,
       retainedFamilies: records.filter(passedPostproc).length,
       functionalConfigured,
       functionalEvaluatedFamilies: evaluated.length,
@@ -161,7 +170,8 @@ export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] 
       heteroduplexReadPercent: dispositionReadPercent(families, "heteroduplex"),
       artefactReadPercent: rejectionReadPercent(records, (row) => !row.artefactPass),
       agreementReadPercent: rejectionReadPercent(records, (row) => !row.agreementPass),
-      contaminationReadPercent: rejectionReadPercent(records, (row) => !row.contaminationPass),
+      contaminationReadPercent: records.length ? rejectionReadPercent(records, (row) => !row.contaminationPass)
+        : percent(readCount(consensuses.filter((row) => contaminantIds.has(row.id))), readCount(consensuses)),
       panelReadPercent: rejectionReadPercent(records, (row) => !row.panelPass),
       functionalReadPercent: percent(readCount(evaluated.filter((row) => row.functionalPass === false)), readCount(records)),
     };
@@ -185,4 +195,25 @@ export function inputFilterStats(bundle: ResultBundle): CountStat[] {
     row("unassigned", "Not assigned after preprocessing", Math.max(0, total - quality.demultiplexedReads), "Aggregate outcome; it overlaps malformed and specific upstream rejection rows above."),
     row("subsampled", "Demultiplexed reads omitted by subsampling", quality.downsampledReads),
   ];
+}
+
+export function parameterSettings(bundle: ResultBundle): ParameterSettingRow[] {
+  const rows: ParameterSettingRow[] = [];
+  const addRun = (parameter: string, value: unknown) => rows.push({ scope: "run", sample: "—", parameter, value: String(value ?? "—") });
+  addRun("dataset", bundle.config.dataset); addRun("contaminationPanel", bundle.config.contaminationPanel);
+  for (const [parameter, value] of Object.entries(bundle.config.parameters)) addRun(parameter, value);
+  addRun("workers", bundle.provenance.workers); addRun("engine", bundle.provenance.engine);
+  addRun("temporaryReadStorage", bundle.runOptions?.spoolStorage ?? "not recorded");
+  for (const [parameter, value] of Object.entries(bundle.runOptions ?? {})) if (parameter !== "spoolStorage") addRun(parameter, value);
+  for (const sample of bundle.config.samples) {
+    const add = (parameter: string, value: unknown) => rows.push({ scope: "sample", sample: sample.name, parameter, value: String(value ?? "—") });
+    add("cDNA primer", sample.cdnaPrimer); add("second-strand primer", sample.secondStrandPrimer);
+    add("panel", sample.panel); add("functional reference", sample.functionalReference ?? "not configured");
+    add("familySizeThreshold (effective)", sample.familySizeOverride ?? bundle.config.parameters.familySizeThreshold);
+    add("artefactFraction (effective)", sample.artefactFractionOverride ?? bundle.config.parameters.artefactFraction);
+    add("outlierQuantile (effective)", sample.outlierQuantileOverride ?? bundle.config.parameters.outlierQuantile);
+    add("agreementThreshold (effective)", sample.agreementOverride ?? bundle.config.parameters.agreementThreshold);
+    add("functionalMatchThreshold (effective)", sample.functionalMatchOverride ?? bundle.config.parameters.functionalMatchThreshold);
+  }
+  return rows;
 }

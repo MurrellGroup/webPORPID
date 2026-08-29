@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-0FV66vte.mjs";
-import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
-import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-izZLhWZ1.mjs";
+import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-BVyb7bUx.mjs";
+import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DfCxIVAW.mjs";
+import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-Dm9J7url.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -1044,8 +1044,12 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 			sequence: longestOrf(sequence)
 		});
 	});
-	if (!coding.length) return outcomes;
 	const referenceCoding = degap(reference).slice(0, Math.floor(degap(reference).length / 3) * 3);
+	if (!coding.length) return {
+		outcomes,
+		referenceNt: referenceCoding,
+		referenceAa: translate(referenceCoding)
+	};
 	const nucleotideAlignment = (await runScalableMsa([translate(referenceCoding), ...coding.map((row) => translate(row.sequence))], runMsa, signal, 3, "amino-acid")).map((row, index) => backtranslate(row, index ? coding[index - 1].sequence : referenceCoding));
 	const alignedReference = nucleotideAlignment[0], first = alignedReference.search(/[^-]/);
 	let last = alignedReference.length - 1;
@@ -1065,15 +1069,21 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 			passed: !reasons.length,
 			reasons,
 			nt: trimmed,
-			aa
+			aa,
+			alignedNt: queryRegion,
+			alignedAa: translateAlignedNucleotides(queryRegion, 0)
 		};
 	});
-	return outcomes;
+	return {
+		outcomes,
+		referenceNt: referenceRegion,
+		referenceAa: translateAlignedNucleotides(referenceRegion, 0)
+	};
 }
-async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1, onProgress) {
+async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1, onProgress, options = {}) {
 	const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
 	const outputs = Array(config.samples.length);
-	let cursor = 0, collapseMilliseconds = 0;
+	let cursor = 0;
 	const sampleProgress = Array(config.samples.length).fill(0);
 	const report = (sampleIndex, fraction, detail) => {
 		sampleProgress[sampleIndex] = Math.max(sampleProgress[sampleIndex], Math.max(0, Math.min(1, fraction)));
@@ -1126,15 +1136,21 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			report(sampleIndex, .66, `Retained-sequence alignment complete for sample ${sample.name}`);
 			const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
 			const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows = [];
+			const functionalNucleotideRows = [];
+			const functionalProteinRows = [];
 			const functionalByIndex = /* @__PURE__ */ new Map();
+			let functionalReferenceNt = "";
 			if (sample.functionalReferenceSequence && accepted.length) {
 				report(sampleIndex, .72, `Checking coding-frame and functional-reference requirements for sample ${sample.name}`);
-				const outcomes = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, accepted.map(({ index }) => extracted.get(index)), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
-				accepted.forEach(({ index }, position) => functionalByIndex.set(index, outcomes[position]));
+				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, accepted.map(({ index }) => extracted.get(index)), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+				functionalReferenceNt = batch.referenceNt;
+				batch.referenceAa;
+				accepted.forEach(({ index }, position) => functionalByIndex.set(index, batch.outcomes[position]));
 			}
 			report(sampleIndex, .84, `Calculating sequence annotations and filter decisions for sample ${sample.name}`);
 			let functionalPassed = 0;
-			source.forEach((record, index) => {
+			for (const [index, record] of source.entries()) {
+				if (signal?.aborted) throw new DOMException("Downstream filtering skipped.", "AbortError");
 				const artefactPass = record.familySize >= artefactCutoff, agreementPass = record.minimumAgreement >= agreementThreshold;
 				const contaminationPass = !discarded.has(record.id), acceptedRow = alignmentByIndex.get(index), rejectionReasons = [];
 				if (!artefactPass) rejectionReasons.push(`ccs_count < artefact cutoff (${artefactCutoff})`);
@@ -1149,7 +1165,19 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 						trimmedNt = outcome.nt;
 						trimmedAa = outcome.aa;
 						rejectionReasons.push(...outcome.reasons);
-						if (outcome.passed) functionalPassed++;
+						if (outcome.passed) {
+							functionalPassed++;
+							if (outcome.alignedNt && outcome.alignedAa) {
+								functionalNucleotideRows.push({
+									name: record.id,
+									sequence: outcome.alignedNt
+								});
+								functionalProteinRows.push({
+									name: record.id,
+									sequence: outcome.alignedAa
+								});
+							}
+						}
 					}
 				}
 				if (acceptedRow) nucleotideRows.push({
@@ -1175,30 +1203,30 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 					rejectionReasons,
 					apobec: acceptedRow ? apobec(consensus, acceptedRow) : void 0
 				});
-			});
-			let collapsedCount = 0;
+				if ((index & 7) === 7 || index + 1 === source.length) {
+					report(sampleIndex, .84 + .12 * (index + 1) / Math.max(1, source.length), `Annotated ${index + 1} of ${source.length} consensus-family records for ${sample.name}`);
+					await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+				}
+			}
 			if (nucleotideRows.length) {
-				const uncollapsed = fasta$1(nucleotideRows), collapseStarted = performance.now(), collapsed = collapseAlignment(uncollapsed, sample.name);
-				collapseMilliseconds += performance.now() - collapseStarted;
-				collapsedCount = collapsed.groups.length;
-				alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
+				const uncollapsed = fasta$1(nucleotideRows);
 				alignments[`${sample.name}/uncollapsed-nucleotide`] = uncollapsed;
-				alignments[`${sample.name}/protein`] = fasta$1(collapsed.groups.map((group) => {
-					const row = nucleotideRows.find((candidate) => candidate.name === group.representativeId);
-					return {
-						...row,
-						sequence: translateAlignedNucleotides(row.sequence, 0)
-					};
-				}));
 				alignments[`${sample.name}/uncollapsed-protein`] = fasta$1(nucleotideRows.map((row) => ({
 					...row,
 					sequence: translateAlignedNucleotides(row.sequence, 0)
 				})));
-				referenceAlignments[`${sample.name}/nucleotide`] = fasta$1([{
+				referenceAlignments[`${sample.name}/uncollapsed-nucleotide`] = fasta$1([{
 					name: "reference",
 					sequence: alignedReference
 				}]);
-				collapseGroups[sample.name] = collapsed.groups;
+			}
+			if (functionalNucleotideRows.length) {
+				alignments[`${sample.name}/functional-nucleotide`] = fasta$1(functionalNucleotideRows);
+				alignments[`${sample.name}/functional-protein`] = fasta$1(functionalProteinRows);
+				referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta$1([{
+					name: "functional_reference",
+					sequence: functionalReferenceNt
+				}]);
 			}
 			summaries.push({
 				sample: sample.name,
@@ -1208,7 +1236,6 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				consensusSequences: source.length,
 				contaminationPassed: source.filter((record) => !discarded.has(record.id)).length,
 				postprocPassed: accepted.length,
-				collapsedSequences: collapsedCount,
 				functionalPassed: sample.functionalReferenceSequence ? functionalPassed : void 0,
 				artefactCutoff
 			});
@@ -1223,17 +1250,79 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			report(sampleIndex, 1, `Downstream processing complete for sample ${sample.name}`);
 		}
 	}));
-	return {
+	const combined = {
 		records: outputs.flatMap((output) => output.records),
 		summaries: outputs.flatMap((output) => output.summaries),
 		alignments: Object.assign({}, ...outputs.map((output) => output.alignments)),
 		referenceAlignments: Object.assign({}, ...outputs.map((output) => output.referenceAlignments)),
 		collapseGroups: Object.assign({}, ...outputs.map((output) => output.collapseGroups)),
-		collapseSeconds: collapseMilliseconds / 1e3
+		collapseSeconds: 0
+	};
+	return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress);
+}
+/** Run family-count-preserving haplotype collapse as its own resumable stage. */
+async function collapsePostprocess(output, config, signal, onProgress) {
+	const started = performance.now(), alignments = { ...output.alignments }, referenceAlignments = { ...output.referenceAlignments };
+	const collapseGroups = { ...output.collapseGroups }, summaries = output.summaries.map((summary) => ({ ...summary }));
+	for (const [index, sample] of config.samples.entries()) {
+		if (signal?.aborted) throw new DOMException("Haplotype collapse skipped.", "AbortError");
+		onProgress?.({
+			fraction: index / Math.max(1, config.samples.length),
+			detail: `Collapsing identical retained UMI-family sequences for ${sample.name}`
+		});
+		await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
+		const uncollapsed = alignments[`${sample.name}/uncollapsed-nucleotide`];
+		let collapsedCount = 0;
+		if (uncollapsed) {
+			const collapsed = collapseAlignment(uncollapsed, sample.name);
+			collapsedCount = collapsed.groups.length;
+			alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
+			collapseGroups[sample.name] = collapsed.groups;
+			const rows = new Map(uncollapsed.split(/^>/m).filter(Boolean).map((block) => {
+				const [name, ...sequence] = block.trimEnd().split(/\r?\n/);
+				return [name, sequence.join("")];
+			}));
+			alignments[`${sample.name}/protein`] = fasta$1(collapsed.groups.map((group) => ({
+				name: group.representativeId,
+				sequence: translateAlignedNucleotides(rows.get(group.representativeId) ?? "", 0)
+			})));
+			const reference = referenceAlignments[`${sample.name}/uncollapsed-nucleotide`];
+			if (reference) referenceAlignments[`${sample.name}/nucleotide`] = reference;
+		}
+		const summary = summaries.find((row) => row.sample === sample.name);
+		if (summary) summary.collapsedSequences = collapsedCount;
+		onProgress?.({
+			fraction: (index + 1) / Math.max(1, config.samples.length),
+			detail: `Collapsed ${sample.name} into ${collapsedCount.toLocaleString()} haplotypes; counts represent UMI families`
+		});
+	}
+	return {
+		...output,
+		summaries,
+		alignments,
+		referenceAlignments,
+		collapseGroups,
+		collapseSeconds: output.collapseSeconds + (performance.now() - started) / 1e3
 	};
 }
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/utils/utf8.mjs
+//#region src/optional-stages.ts
+function downstreamResources(config) {
+	return { samples: config.samples.map((sample) => ({
+		name: sample.name,
+		panelSequences: sample.panelSequences.map((record) => ({ ...record })),
+		functionalReferenceSequence: sample.functionalReferenceSequence ? { ...sample.functionalReferenceSequence } : void 0
+	})) };
+}
+function statusRecord(state, detail, updatedUtc = (/* @__PURE__ */ new Date()).toISOString()) {
+	return {
+		state,
+		detail,
+		updatedUtc
+	};
+}
+//#endregion
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/utils/utf8.mjs
 function utf8Count(str) {
 	const strLength = str.length;
 	let byteLength = 0;
@@ -1348,7 +1437,7 @@ function utf8Decode(bytes, inputOffset, byteLength) {
 	else return utf8DecodeJs(bytes, inputOffset, byteLength);
 }
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/ExtData.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/ExtData.mjs
 /**
 * ExtData is used to handle Extension Types that are not registered to ExtensionCodec.
 */
@@ -1359,7 +1448,7 @@ var ExtData = class {
 	}
 };
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/DecodeError.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/DecodeError.mjs
 var DecodeError = class DecodeError extends Error {
 	constructor(message) {
 		super(message);
@@ -1464,7 +1553,7 @@ const timestampExtension = {
 	decode: decodeTimestampExtension
 };
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/ExtensionCodec.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/ExtensionCodec.mjs
 var ExtensionCodec = class {
 	constructor() {
 		this.builtInEncoders = [];
@@ -1509,7 +1598,7 @@ var ExtensionCodec = class {
 };
 ExtensionCodec.defaultCodec = new ExtensionCodec();
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/utils/typedArrays.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/utils/typedArrays.mjs
 function isArrayBufferLike(buffer) {
 	return buffer instanceof ArrayBuffer || typeof SharedArrayBuffer !== "undefined" && buffer instanceof SharedArrayBuffer;
 }
@@ -1838,7 +1927,7 @@ var Encoder = class Encoder {
 	}
 };
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/encode.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/encode.mjs
 /**
 * It encodes `value` in the MessagePack format and
 * returns a byte buffer.
@@ -1849,12 +1938,12 @@ function encode(value, options) {
 	return new Encoder(options).encodeSharedRef(value);
 }
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/utils/prettyByte.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/utils/prettyByte.mjs
 function prettyByte(byte) {
 	return `${byte < 0 ? "-" : ""}0x${Math.abs(byte).toString(16).padStart(2, "0")}`;
 }
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/CachedKeyDecoder.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/CachedKeyDecoder.mjs
 const DEFAULT_MAX_KEY_LENGTH = 16;
 const DEFAULT_MAX_LENGTH_PER_KEY = 16;
 var CachedKeyDecoder = class {
@@ -1901,7 +1990,7 @@ var CachedKeyDecoder = class {
 	}
 };
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/Decoder.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/Decoder.mjs
 const STATE_ARRAY = "array";
 const STATE_MAP_KEY = "map_key";
 const STATE_MAP_VALUE = "map_value";
@@ -2407,7 +2496,7 @@ var Decoder = class Decoder {
 	}
 };
 //#endregion
-//#region node_modules/@msgpack/msgpack/dist.esm/decode.mjs
+//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/decode.mjs
 /**
 * It decodes a single MessagePack object in a buffer.
 *
@@ -2421,7 +2510,7 @@ function decode(buffer, options) {
 	return new Decoder(options).decode(buffer);
 }
 //#endregion
-//#region node_modules/fflate/esm/browser.js
+//#region ../../work/webPORPID/node_modules/fflate/esm/browser.js
 var u8 = Uint8Array, u16 = Uint16Array, i32 = Int32Array;
 var fleb = new u8([
 	0,
@@ -3244,11 +3333,13 @@ function validateResult(value) {
 			"demultiplexedReads",
 			"observedUmis",
 			"likelyRealUmis",
-			"consensusSequences",
+			"consensusSequences"
+		]) count(row[key], `summaries[${index}].${key}`);
+		for (const key of [
 			"contaminationPassed",
 			"postprocPassed",
 			"artefactCutoff"
-		]) count(row[key], `summaries[${index}].${key}`);
+		]) if (row[key] != null) count(row[key], `summaries[${index}].${key}`);
 		if (row.selectedReads != null) count(row.selectedReads, `summaries[${index}].selectedReads`);
 		if (row.downsampledReads != null) count(row.downsampledReads, `summaries[${index}].downsampledReads`);
 		if (row.selectedReads != null && row.downsampledReads != null && count(row.selectedReads, `summaries[${index}].selectedReads`) + count(row.downsampledReads, `summaries[${index}].downsampledReads`) !== count(row.demultiplexedReads, `summaries[${index}].demultiplexedReads`)) throw new Error("A sample summary has inconsistent selected and subsampled read counts.");
@@ -3313,6 +3404,28 @@ function validateResult(value) {
 		text(record.name, `contaminationReferences[${index}].name`);
 		text(record.sequence, `contaminationReferences[${index}].sequence`);
 	});
+	if (bundle.downstreamResources != null) {
+		const resources = object(bundle.downstreamResources, "downstreamResources"), resourceSamples = /* @__PURE__ */ new Set();
+		array(resources.samples, "downstreamResources.samples").forEach((rawSample, index) => {
+			const resource = object(rawSample, `downstreamResources.samples[${index}]`), name = text(resource.name, "downstream resource sample");
+			knownSample(name, `downstreamResources.samples[${index}]`);
+			if (resourceSamples.has(name)) throw new Error("Downstream resource sample names must be unique.");
+			resourceSamples.add(name);
+			array(resource.panelSequences, "downstream panel sequences").forEach((rawRecord) => {
+				const record = object(rawRecord, "downstream panel record");
+				text(record.name, "downstream panel name");
+				text(record.sequence, "downstream panel sequence");
+			});
+			if (resource.functionalReferenceSequence != null) {
+				const record = object(resource.functionalReferenceSequence, "downstream functional reference");
+				text(record.name, "downstream functional reference name");
+				text(record.sequence, "downstream functional reference sequence");
+			}
+		});
+		if (resourceSamples.size !== samples.length) throw new Error("Downstream resources are missing a configured sample.");
+	}
+	const rawStageStatuses = bundle.optionalStages == null ? void 0 : object(bundle.optionalStages, "optionalStages");
+	const postprocessingComplete = rawStageStatuses == null || object(rawStageStatuses.postprocessing, "optionalStages.postprocessing").state === "completed";
 	const recordIds = /* @__PURE__ */ new Set(), recordMetadata = /* @__PURE__ */ new Map();
 	array(bundle.records, "records").forEach((entry, index) => {
 		const row = object(entry, `records[${index}]`), id = text(row.id, `records[${index}].id`);
@@ -3352,7 +3465,8 @@ function validateResult(value) {
 			minimumAgreement
 		});
 	});
-	if (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id))) throw new Error("Consensus and post-processing records are inconsistent.");
+	if (postprocessingComplete && (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id)))) throw new Error("Consensus and post-processing records are inconsistent.");
+	if (!postprocessingComplete && recordIds.size) throw new Error("An uncomputed post-processing stage cannot contain partial post-processing records.");
 	for (const [label, entries] of [["alignments", object(bundle.alignments, "alignments")], ["trees", object(bundle.trees, "trees")]]) for (const [name, contents] of Object.entries(entries)) {
 		text(name, `${label} name`);
 		text(contents, `${label}.${name}`);
@@ -3416,12 +3530,37 @@ function validateResult(value) {
 	if (bundle.runOptions != null) {
 		const options = object(bundle.runOptions, "runOptions");
 		bool(options.deferPhylogeny, "runOptions.deferPhylogeny");
+		for (const key of [
+			"deferContamination",
+			"deferPostprocessing",
+			"deferCollapse"
+		]) if (options[key] != null) bool(options[key], `runOptions.${key}`);
 		if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage"))) throw new Error("runOptions.spoolStorage is not recognized.");
+	}
+	if (rawStageStatuses != null) {
+		let prerequisiteIncomplete = false;
+		for (const stage of [
+			"contamination",
+			"postprocessing",
+			"collapse",
+			"tree"
+		]) {
+			const status = object(rawStageStatuses[stage], `optionalStages.${stage}`), state = text(status.state, `optionalStages.${stage}.state`);
+			if (![
+				"completed",
+				"deferred",
+				"skipped"
+			].includes(state)) throw new Error(`optionalStages.${stage}.state is not recognized.`);
+			text(status.detail, `optionalStages.${stage}.detail`);
+			text(status.updatedUtc, `optionalStages.${stage}.updatedUtc`);
+			if (prerequisiteIncomplete && state === "completed") throw new Error(`optionalStages.${stage} cannot be completed before its prerequisite.`);
+			if (state !== "completed") prerequisiteIncomplete = true;
+		}
 	}
 	if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
 		const sample = name.split("/", 1)[0];
 		knownSample(sample, `alignmentEdits.${name}`);
-		if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide`) throw new Error("Edited alignment keys must identify a stored nucleotide view.");
+		if (name !== `${sample}/nucleotide` && name !== `${sample}/uncollapsed-nucleotide` && name !== `${sample}/functional-nucleotide`) throw new Error("Edited alignment keys must identify a stored nucleotide view.");
 		const edit = object(rawEdit, `alignmentEdits.${name}`), fasta = text(edit.fasta, `alignmentEdits.${name}.fasta`);
 		if (count(edit.frameOffset, `alignmentEdits.${name}.frameOffset`) > 2) throw new Error("Edited alignment frame offsets must be 0, 1, or 2.");
 		const baselineFingerprint = text(edit.baselineFingerprint, `alignmentEdits.${name}.baselineFingerprint`);
@@ -3493,7 +3632,7 @@ function validateResult(value) {
 		const entry = object(rawEntry, `alignmentEditHistory[${index}]`), key = text(entry.alignmentKey, `alignmentEditHistory[${index}].alignmentKey`);
 		const sample = key.split("/", 1)[0];
 		knownSample(sample, `alignmentEditHistory[${index}]`);
-		if (key !== `${sample}/nucleotide` && key !== `${sample}/uncollapsed-nucleotide`) throw new Error("Alignment audit keys must identify a nucleotide view.");
+		if (key !== `${sample}/nucleotide` && key !== `${sample}/uncollapsed-nucleotide` && key !== `${sample}/functional-nucleotide`) throw new Error("Alignment audit keys must identify a nucleotide view.");
 		if (![
 			"alignment-edit",
 			"frame-change",
@@ -3793,6 +3932,31 @@ function exportComponent(bundle, kind, sample) {
 				text: (bundle.alignmentEdits?.[key])?.treeNewick ?? bundle.trees[key] ?? ""
 			};
 		}
+		case "functional-nucleotide-alignment": {
+			const key = `${alignmentSample(bundle, sample)}/functional-nucleotide`;
+			return {
+				extension: "functional-nucleotide-alignment.fasta",
+				mime: "text/x-fasta",
+				text: (bundle.alignmentEdits?.[key])?.fasta ?? bundle.alignments[key] ?? ""
+			};
+		}
+		case "functional-protein-alignment": {
+			const selected = alignmentSample(bundle, sample), key = `${selected}/functional-nucleotide`, edit = bundle.alignmentEdits?.[key];
+			const nucleotide = edit?.fasta ?? bundle.alignments[key];
+			return {
+				extension: "functional-protein-alignment.fasta",
+				mime: "text/x-fasta",
+				text: nucleotide ? translateAlignmentFasta(nucleotide, edit?.frameOffset ?? 0) : bundle.alignments[`${selected}/functional-protein`] ?? ""
+			};
+		}
+		case "functional-newick": {
+			const key = `${alignmentSample(bundle, sample)}/functional-nucleotide`;
+			return {
+				extension: "functional-tree.newick",
+				mime: "text/plain",
+				text: (bundle.alignmentEdits?.[key])?.treeNewick ?? bundle.trees[key] ?? ""
+			};
+		}
 		case "log": return {
 			extension: "log.txt",
 			mime: "text/plain",
@@ -3833,7 +3997,7 @@ function concatenateSpoolRecords(records) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.5";
+const VERSION = "0.3.6";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -3848,7 +4012,7 @@ function defaultCliAssets() {
 	};
 }
 function usage() {
-	return `porpid-cli ${VERSION}\n\nRun the complete nanopore/PacBio pipeline:\n  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--defer-phylogeny]\n\nInspect or export a saved analysis:\n  porpid-cli inspect results.webporpid\n  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\nWorkers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\nComponents: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n            uncollapsed-protein-alignment, uncollapsed-newick, log`;
+	return `porpid-cli ${VERSION}\n\nRun the complete nanopore/PacBio pipeline:\n  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--defer-phylogeny]\n\nInspect or export a saved analysis:\n  porpid-cli inspect results.webporpid\n  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\nWorkers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\nComponents: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n            uncollapsed-protein-alignment, uncollapsed-newick, functional-nucleotide-alignment,\n            functional-protein-alignment, functional-newick, log`;
 }
 function option(args, name) {
 	const index = args.indexOf(name);
@@ -4295,13 +4459,25 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 			consensuses,
 			contamination,
 			contaminationReferences: config.contaminationPanelSequences,
+			downstreamResources: downstreamResources(config),
 			records: downstream.records,
 			alignments: downstream.alignments,
 			trees,
 			referenceAlignments: downstream.referenceAlignments,
 			collapseGroups: downstream.collapseGroups,
 			inputMappings,
-			runOptions: { deferPhylogeny },
+			runOptions: {
+				deferPhylogeny,
+				deferContamination: false,
+				deferPostprocessing: false,
+				deferCollapse: false
+			},
+			optionalStages: {
+				contamination: statusRecord("completed", `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`),
+				postprocessing: statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`),
+				collapse: statusRecord("completed", `${collapsedHaplotypes} haplotypes; multiplicities count UMI families.`),
+				tree: statusRecord(deferPhylogeny ? "deferred" : "completed", deferPhylogeny ? "Deferred by user; collapsed alignments are stored for on-demand inference." : `${Object.keys(trees).length} collapsed phylogenies inferred.`)
+			},
 			timings,
 			log
 		};

@@ -1,4 +1,4 @@
-import { t as createDirectFastTreeRunner } from "./chunks/direct-fasttree-0FV66vte.mjs";
+import { t as createDirectFastTreeRunner } from "./chunks/direct-fasttree-BVyb7bUx.mjs";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/porpid-fasttree-worker.mjs
 let javascriptPath, wasmPath, runner;

@@ -15,11 +15,12 @@ import {
   loadAlivibeNucleotideFasta, readAlivibeNucleotideFasta,
 } from "../src/alivibe-roundtrip.ts";
 import { decodeResult, encodeResult, exportComponent } from "../src/result-file.ts";
-import { deduplicateContaminationCalls } from "../src/contamination.ts";
+import { classifyContamination, classifyContaminationAsync, deduplicateContaminationCalls } from "../src/contamination.ts";
 import { collapseAlignment } from "../src/collapse.ts";
 import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
+import { postprocess } from "../src/postprocess.ts";
 import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
 import { adaptiveSpoolCutoff, PartitionStore, writeAllSync } from "../src/partition-store.ts";
 import { runScalableMsa } from "../src/scalable-msa.ts";
@@ -375,6 +376,39 @@ test("contamination calls are unique per family with the primary decision taking
   assert.equal(calls.find((row) => row.sequenceId === "x").discarded, true);
 });
 
+test("chunked contamination checks preserve synchronous decisions and emit live progress", async () => {
+  const base = resultBundle(), parameters = { ...base.config.parameters, deterministicSeed: 1n, contaminationFilter: true,
+    contaminationDistanceThreshold: 1 };
+  const samples = ["s1", "s2"].map((name) => ({ name, cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG",
+    panel: "panel.fa", panelSequences: [] }));
+  const config = { dataset: "progress", samples, contaminationPanel: "contam.fa", contaminationPanelSequences: [], parameters };
+  const consensuses = [
+    { ...base.consensuses[0], id: "s1-a", sample: "s1", sampleIndex: 0, sequence: "ACGTACGTACGT" },
+    { ...base.consensuses[0], id: "s2-a", sample: "s2", sampleIndex: 1, sequence: "ACGTACGTACGA" },
+  ];
+  const updates = [], synchronous = classifyContamination(consensuses, config);
+  const asynchronous = await classifyContaminationAsync(consensuses, config, undefined, (state) => updates.push(state));
+  assert.deepEqual(asynchronous, synchronous); assert(updates.length >= 4); assert.equal(updates.at(-1).fraction, 1);
+  assert(updates.some((state) => state.phase === "clustering")); assert(updates.some((state) => state.phase === "classification"));
+});
+
+test("functional alignment is codon-aware and clipped to the reference endpoints", async () => {
+  const base = resultBundle(), reference = "ATGAAAAAATAA", query = "ATGAAAAAAGCTGCTTAA";
+  const config = { dataset: "functional-trim", contaminationPanel: "contam.fa", contaminationPanelSequences: [],
+    parameters: { ...base.config.parameters, deterministicSeed: 1n, functionalMatchThreshold: 0 },
+    samples: [{ name: "sample_1", cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa",
+      panelSequences: [], functionalReference: "functional.fa", functionalReferenceSequence: { name: "ref", sequence: reference } }] };
+  const consensus = [{ ...base.consensuses[0], sequence: query }];
+  const runner = async (sequences, _signal, _iterations, mode) => mode === "amino-acid"
+    ? ["MKK*--", "MKKAA*"] : [`${sequences[0]}------`, sequences[1]];
+  const output = await postprocess(consensus, [], config, undefined, runner, 1, undefined, { collapse: false });
+  const functional = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1);
+  const functionalReference = inspectAlignment(output.referenceAlignments["sample_1/functional-nucleotide"], 1);
+  assert.equal(functional.columns, reference.length); assert.equal(functionalReference.columns, reference.length);
+  assert.equal(functional.records[0].sequence, query.slice(0, reference.length));
+  assert.equal(output.records[0].functionalPass, true);
+});
+
 test("reference regions and mutation mapping follow the active alignment", () => {
   assert.deepEqual(referenceDisplayColumns("ATG---GCTAAC", "1;3;7-9", "nt", "nt", 0, 12), [0, 2, 9, 10, 11]);
   assert.deepEqual(referenceDisplayColumns("ATG---GCTAAC", "1;3", "aa", "nt", 0, 12), [0, 1, 2, 9, 10, 11]);
@@ -421,15 +455,20 @@ function resultBundle() {
     consensuses: [{ id: "c1", sample: "sample_1", sampleIndex: 0, umi: "AACCGGTT", familySize: 3, minimumAgreement: 0.67,
       sequence: "ATGTAA", lowAgreementSites: [{ position: 2, agreement: 0.67, modalReadBase: "A", modalRunLength: 1 }] }],
     contamination: [], contaminationReferences: [{ name: "contam_ref", sequence: "ATGTAA" }],
+    downstreamResources: { samples: [{ name: "sample_1", panelSequences: [{ name: "panel_ref", sequence: "ATGTAA" }], functionalReferenceSequence: { name: "functional_ref", sequence: "ATGTAA" } }] },
     records: [{ id: "c1", sample: "sample_1", umi: "AACCGGTT", familySize: 3, minimumAgreement: 0.67, consensusNt: "ATGTAA",
       alignedNt: "ATGTAA", trimmedNt: "ATGTAA", trimmedAa: "M*", panelScore: 0, artefactPass: true, agreementPass: true,
       contaminationPass: true, panelPass: true, functionalPass: true, rejectionReasons: [] }],
     alignments: { "sample_1/nucleotide": ">c1\nATGTAA\n", "sample_1/uncollapsed-nucleotide": ">c1\nATGTAA\n",
-      "sample_1/protein": ">c1\nM*\n", "sample_1/uncollapsed-protein": ">c1\nM*\n" },
-    referenceAlignments: { "sample_1/nucleotide": ">reference\nATGTAA\n" },
+      "sample_1/protein": ">c1\nM*\n", "sample_1/uncollapsed-protein": ">c1\nM*\n",
+      "sample_1/functional-nucleotide": ">c1\nATGTAA\n", "sample_1/functional-protein": ">c1\nM*\n" },
+    referenceAlignments: { "sample_1/nucleotide": ">reference\nATGTAA\n", "sample_1/uncollapsed-nucleotide": ">reference\nATGTAA\n",
+      "sample_1/functional-nucleotide": ">functional_reference\nATGTAA\n" },
     collapseGroups: { sample_1: [{ sample: "sample_1", representativeId: "c1", memberIds: ["c1"], familyCount: 1 }] },
     inputMappings: [{ slot: "panel.fa", role: "panel", expectedName: "panel.fa", uploadedName: "renamed.fasta", uploadedSize: 12 }],
-    runOptions: { deferPhylogeny: false, spoolStorage: "external-directory" }, trees: { "sample_1/nucleotide": "(c1:0.0);" }, log: ["complete"],
+    runOptions: { deferPhylogeny: false, deferContamination: false, deferPostprocessing: false, deferCollapse: false, spoolStorage: "external-directory" },
+    optionalStages: Object.fromEntries(["contamination", "postprocessing", "collapse", "tree"].map((stage) => [stage, { state: "completed", detail: "test complete", updatedUtc: "2026-08-27T00:00:00.000Z" }])),
+    trees: { "sample_1/nucleotide": "(c1:0.0);" }, log: ["complete"],
   };
 }
 
@@ -439,6 +478,8 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   assert.equal(exportComponent(decoded, "trimmed-aa-fasta", "sample_1").text, ">c1\nM*\n");
   assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /representative_id,family_count,member_ids\nsample_1,c1,1,c1/);
   assert.equal(exportComponent(decoded, "uncollapsed-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
+  assert.equal(exportComponent(decoded, "functional-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
+  assert.equal(exportComponent(decoded, "functional-protein-alignment", "sample_1").text, ">c1\nM*\n");
   decoded.alignments["sample_1/protein"] = ">c1\nWRONG\n";
   assert.equal(exportComponent(decoded, "protein-alignment", "sample_1").text, ">c1\nM*\n", "protein export must translate the nucleotide alignment directly");
   const baselineFingerprint = inspectAlignment(decoded.alignments["sample_1/nucleotide"], 1).fingerprint;
@@ -465,16 +506,27 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   assert.doesNotThrow(() => encodeResult(legacyCollapse), "results through 0.3.2 must remain loadable");
   legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .5;
   assert.throws(() => encodeResult(legacyCollapse), /legacy collapse group has inconsistent family-agreement metadata/);
-  const pre035 = structuredClone(bundle); delete pre035.summaries[0].selectedReads; delete pre035.summaries[0].downsampledReads; delete pre035.contaminationReferences;
+  const partial = structuredClone(bundle); partial.contamination = []; partial.records = []; partial.alignments = {}; partial.referenceAlignments = {};
+  partial.collapseGroups = {}; partial.trees = {}; delete partial.summaries[0].contaminationPassed; delete partial.summaries[0].postprocPassed;
+  delete partial.summaries[0].collapsedSequences; delete partial.summaries[0].functionalPassed; delete partial.summaries[0].artefactCutoff;
+  partial.optionalStages = Object.fromEntries(["contamination", "postprocessing", "collapse", "tree"].map((stage) => [stage,
+    { state: "deferred", detail: "not computed", updatedUtc: "2026-08-27T00:00:00.000Z" }]));
+  assert.deepEqual(decodeResult(encodeResult(partial)), partial, "consensus-only projects must remain valid and resumable");
+  const impossibleStages = structuredClone(bundle); impossibleStages.optionalStages.contamination.state = "deferred";
+  assert.throws(() => encodeResult(impossibleStages), /cannot be completed before its prerequisite/);
+  const pre035 = structuredClone(bundle); delete pre035.summaries[0].selectedReads; delete pre035.summaries[0].downsampledReads;
+  delete pre035.contaminationReferences; delete pre035.downstreamResources; delete pre035.optionalStages;
   assert.doesNotThrow(() => decodeResult(encodeResult(pre035)), "pre-0.3.5 results must remain loadable without new optional statistics and references");
 });
 
 test("export all is one gzip-compressed tar with every sample output in its sample directory", () => {
   const bundle = resultBundle(), entries = tarEntries(buildExportArchive(bundle)), decoder = new TextDecoder();
-  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 3);
+  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 11);
   assert(entries.has("README.txt")); assert(entries.has("test.webporpid")); assert(entries.has("run.log.txt"));
   assert.equal(decoder.decode(entries.get("sample_1/trimmed-aa.fasta")), exportComponent(bundle, "trimmed-aa-fasta", "sample_1").text);
   assert.equal(decoder.decode(entries.get("sample_1/families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
+  assert.match(decoder.decode(entries.get("cross-sample-overview/parameters.csv")), /maxReadsPerSample/);
+  assert.match(decoder.decode(entries.get("cross-sample-overview/sample-summary.csv")), /sample_1/);
   assert.deepEqual(decodeResult(entries.get("test.webporpid")), bundle);
 });
 
@@ -487,6 +539,8 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(app, /addEventListener\("beforeunload", warnBeforeLeaving\)/);
   assert.match(app, /addEventListener\("popstate", interceptHistoryDeparture\)/);
   assert.match(app, /Leave anyway/); assert.match(app, /history\.go\(-2\)/);
+  assert.match(app, /showDirectoryPicker === "function" \? "external-directory" : "automatic"/);
+  assert.match(app, /Defer contamination checks/); assert.match(app, /Skip this step/); assert.match(pipeline, /type === "skip-stage"/);
   assert.match(styles, /overscroll-behavior-x:\s*none/);
   assert.match(app, /className="app-version"/); assert.match(app, /packageInformation\.version/);
   assert.match(styles, /\.app-version/);

@@ -1,4 +1,4 @@
-import type { MsaRunner } from "./postprocess";
+import type { MsaRunner } from "./postprocess.ts";
 
 const MONOLITHIC_ROWS = 8_000;
 const MONOLITHIC_BASES = 128 * 1024 * 1024;

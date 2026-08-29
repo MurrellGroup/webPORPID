@@ -3,7 +3,7 @@ import { blankConfig, parseConfigYaml, resolveReferenceFiles, serializeConfigYam
 import { nameMatchingSlot, referenceFileMap, referenceMappingRecords, referenceSlots, type ReferenceSlot } from "./input-mapping";
 import type { ExternalScratchDirectoryHandle } from "./partition-store";
 import { decodeResult, encodeResult, safeDatasetName } from "./result-file";
-import type { InputFileMapping, PipelineConfig, PipelineProgress, ResultBundle } from "./types";
+import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, ResultBundle } from "./types";
 import { ResultsExplorer } from "./components/results-explorer";
 import { ConfigForm } from "./components/config-form";
 import packageInformation from "../package.json";
@@ -27,7 +27,7 @@ const isYaml = (file: File) => /\.ya?ml$/i.test(file.name);
 const isFastq = (file: File) => /\.(?:fastq|fq)(?:\.gz)?$/i.test(file.name);
 const isResult = (file: File) => /\.webporpid$/i.test(file.name);
 
-function StageProgress({ value }: { value: PipelineProgress }) {
+function StageProgress({ value, onSkip, skipping }: { value: PipelineProgress; onSkip?(stage: OptionalStageName): void; skipping?: boolean }) {
   const [clock, setClock] = useState(() => Date.now()), started = useRef(Date.now()), lastChange = useRef(Date.now());
   const signature = `${value.stage}\0${value.fraction}\0${value.detail}`;
   useEffect(() => { lastChange.current = Date.now(); }, [signature]);
@@ -40,8 +40,10 @@ function StageProgress({ value }: { value: PipelineProgress }) {
   };
   const elapsed = Math.max(0, Math.floor((clock - started.current) / 1000)), quiet = Math.max(0, Math.floor((clock - lastChange.current) / 1000));
   const assignments = value.sampleAssignments ?? [], maximum = Math.max(1, ...assignments.map((row) => row.reads));
+  const optional = (["contamination", "postprocessing", "collapse", "tree"] as const).includes(value.stage as OptionalStageName)
+    ? value.stage as OptionalStageName : undefined;
   return <section className="run-progress" aria-live="polite">
-    <div><span>{stageLabels[value.stage]}</span><strong>{percent}%</strong></div>
+    <div><span>{stageLabels[value.stage]}</span><span className="progress-actions"><strong>{percent}%</strong>{optional && value.fraction < 1 && onSkip && <button type="button" className="skip-stage" disabled={skipping} onClick={() => onSkip(optional)}>{skipping ? "Skipping…" : "Skip this step"}</button>}</span></div>
     <progress max="100" value={percent} />
     <p>{value.detail}</p>
     <div className="working-heartbeat"><i /><span>{quiet >= 3 ? `Still working · last pipeline update ${quiet.toLocaleString()} s ago` : "Working"}</span><em>Elapsed {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}</em></div>
@@ -66,14 +68,19 @@ export default function App() {
   const [unassignedReferences, setUnassignedReferences] = useState<File[]>([]);
   const [slotConflict, setSlotConflict] = useState<SlotConflict>();
   const [workers, setWorkers] = useState(defaultWorkers);
+  const [deferContamination, setDeferContamination] = useState(false);
+  const [deferPostprocessing, setDeferPostprocessing] = useState(false);
+  const [deferCollapse, setDeferCollapse] = useState(false);
   const [deferPhylogeny, setDeferPhylogeny] = useState(false);
-  const [spoolStorage, setSpoolStorage] = useState<SpoolStorage>("automatic");
+  const [spoolStorage, setSpoolStorage] = useState<SpoolStorage>(() =>
+    typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function" ? "external-directory" : "automatic");
   const [scratchDirectory, setScratchDirectory] = useState<ExternalScratchDirectoryHandle>();
   const [progress, setProgress] = useState<PipelineProgress>();
   const [result, setResult] = useState<ResultBundle>();
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
+  const [skippingStage, setSkippingStage] = useState<OptionalStageName>();
   const [navigationBlocked, setNavigationBlocked] = useState(false);
   const workerRef = useRef<Worker | undefined>(undefined);
   const protectWorkRef = useRef(false), historyGuardRef = useRef(false), confirmedLeaveRef = useRef(false);
@@ -231,7 +238,7 @@ export default function App() {
   async function run() {
     if (!fastq) { setError("Choose a FASTQ or FASTQ.GZ input file."); return; }
     if (!configText.trim()) { setError("Choose or paste a PORPID YAML configuration."); return; }
-    setError(""); setResult(undefined); setRunning(true); setCancelling(false);
+    setError(""); setResult(undefined); setRunning(true); setCancelling(false); setSkippingStage(undefined);
     setProgress({ stage: "preprocessing", fraction: 0, detail: "Checking the configuration and preparing local workers",
       sampleAssignments: draftConfig.samples.map((sample) => ({ sample: sample.name, reads: 0 })) });
     try {
@@ -251,12 +258,15 @@ export default function App() {
       const worker = new Worker(new URL("./pipeline-worker.ts", import.meta.url), { type: "module" });
       workerRef.current = worker;
       worker.onmessage = (event: MessageEvent<{ type: "progress"; progress: PipelineProgress } | { type: "result"; result: ResultBundle } | { type: "error"; message: string }>) => {
-        if (event.data.type === "progress") setProgress(event.data.progress);
-        if (event.data.type === "result") { setResult(event.data.result); setRunning(false); setCancelling(false); worker.terminate(); workerRef.current = undefined; }
-        if (event.data.type === "error") { setError(event.data.message); setRunning(false); setCancelling(false); worker.terminate(); workerRef.current = undefined; }
+        if (event.data.type === "progress") {
+          const nextProgress = event.data.progress; setProgress(nextProgress);
+          setSkippingStage((current) => current && (nextProgress.stage !== current || nextProgress.fraction >= 1) ? undefined : current);
+        }
+        if (event.data.type === "result") { setResult(event.data.result); setRunning(false); setCancelling(false); setSkippingStage(undefined); worker.terminate(); workerRef.current = undefined; }
+        if (event.data.type === "error") { setError(event.data.message); setRunning(false); setCancelling(false); setSkippingStage(undefined); worker.terminate(); workerRef.current = undefined; }
       };
       worker.onerror = (event) => { setError(event.message || "The pipeline worker failed."); setRunning(false); setCancelling(false); worker.terminate(); workerRef.current = undefined; };
-      worker.postMessage({ type: "run", file: fastq, config, workers, deferPhylogeny, inputMappings, spoolStorage,
+      worker.postMessage({ type: "run", file: fastq, config, workers, deferContamination, deferPostprocessing, deferCollapse, deferPhylogeny, inputMappings, spoolStorage,
         scratchDirectory: spoolStorage === "external-directory" ? scratchDirectory : undefined });
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); setRunning(false); setCancelling(false); }
   }
@@ -265,6 +275,11 @@ export default function App() {
     workerRef.current?.postMessage({ type: "cancel" });
     setCancelling(true); setError("");
     setProgress((current) => current ? { ...current, detail: "Cancelling safely and removing temporary read files…" } : current);
+  }
+
+  function skipOptionalStage(stage: OptionalStageName) {
+    workerRef.current?.postMessage({ type: "skip-stage", stage }); setSkippingStage(stage); setError("");
+    setProgress((current) => current ? { ...current, detail: `Skipping ${stage.replaceAll("-", " ")} safely; completed upstream results will be retained…` } : current);
   }
 
   function confirmPageDeparture() {
@@ -329,8 +344,8 @@ export default function App() {
             </div>
             {noDownsampling && <p className="scratch-recommendation"><strong>No downsampling is enabled.</strong> Every demultiplexed sequence and quality string must survive until the global UMI model and consensus pass. Use an external scratch disk with ample free space; 256 spool partitions is recommended for bounded per-worker memory on very large runs.</p>}
           </section>
-          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><label className="defer-tree"><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span><small>Store collapsed alignments now and infer trees later from the results explorer.</small></label><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}</div></div>
-          {progress && running && <StageProgress value={progress} />}
+          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Optional stages after consensus</strong><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Deferring an upstream stage also leaves dependent stages uncomputed. The saved project offers “compute through” actions that run every missing prerequisite.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}</div></div>
+          {progress && running && <StageProgress value={progress} onSkip={skipOptionalStage} skipping={skippingStage === progress.stage} />}
           {error && <div className="error-box" role="alert">{error}</div>}
         </section>
         <section className="method-strip" id="about"><article><span>01</span><h3>Stream &amp; demultiplex</h3><p>Gzip chunks are decoded incrementally. Read-quality, primer, orientation, sample-ID and BPB logic follows the nanopore branch.</p></article><article><span>02</span><h3>Group &amp; call consensus</h3><p>Sparse two-error offspring likelihoods, LDA decisions, heteroduplex QC, seeded alignment and minimum-agreement counting.</p></article><article><span>03</span><h3>Filter &amp; explore</h3><p>Run-aware contamination, panel and functional filters, APOBEC model, aligned variants, phylogeny and component exports.</p></article></section>

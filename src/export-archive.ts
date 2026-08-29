@@ -1,12 +1,14 @@
 import { gzipSync } from "fflate";
 import { encodeResult, exportComponent, safeDatasetName, type ExportKind } from "./result-file.ts";
+import { buildOverviewExports } from "./overview-export.ts";
 import type { ResultBundle } from "./types";
 
 export const SAMPLE_EXPORT_KINDS: readonly ExportKind[] = [
   "consensus-fasta", "passed-consensus-fasta", "rejected-consensus-fasta", "trimmed-nt-fasta", "trimmed-aa-fasta",
   "family-csv", "low-agreement-csv", "contamination-csv", "postproc-csv", "apobec-csv", "collapse-csv",
   "nucleotide-alignment", "protein-alignment", "newick", "uncollapsed-nucleotide-alignment",
-  "uncollapsed-protein-alignment", "uncollapsed-newick",
+  "uncollapsed-protein-alignment", "uncollapsed-newick", "functional-nucleotide-alignment",
+  "functional-protein-alignment", "functional-newick",
 ];
 
 interface TarEntry { path: string; bytes: Uint8Array }
@@ -75,6 +77,7 @@ export function buildExportArchive(bundle: ResultBundle): Uint8Array {
     "",
     "Each sample directory contains the same sample-filtered components offered by the individual Export control.",
     "The complete editable .webporpid project and run log are stored at the archive root.",
+    "cross-sample-overview/ contains the overview, parameter, provenance, stage-status, timing, and input-mapping tables.",
     "An empty alignment or Newick file means that component was unavailable or phylogeny inference was deferred.",
     "",
     ...samples.map((sample, index) => `${directories[index]}/\t${sample}`),
@@ -83,6 +86,8 @@ export function buildExportArchive(bundle: ResultBundle): Uint8Array {
   entries.push({ path: "README.txt", bytes: encoder.encode(manifest) });
   entries.push({ path: `${dataset}.webporpid`, bytes: encodeResult(bundle) });
   entries.push({ path: "run.log.txt", bytes: encoder.encode(exportComponent(bundle, "log").text) });
+  for (const overview of buildOverviewExports(bundle))
+    entries.push({ path: `cross-sample-overview/${overview.name}`, bytes: encoder.encode(overview.text) });
   samples.forEach((sample, index) => {
     for (const kind of SAMPLE_EXPORT_KINDS) {
       const component = exportComponent(bundle, kind, sample);

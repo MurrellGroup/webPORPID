@@ -1,5 +1,5 @@
 import { n as BinaryWriter, t as BinaryReader } from "./binary-68r8u1WT.mjs";
-import { t as WASI } from "./dist-BFrMSSwW.mjs";
+import { t as WASI } from "./dist-DmN76WoC.mjs";
 //#region src/wasm-runtime.ts
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();

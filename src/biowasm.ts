@@ -41,14 +41,18 @@ export async function runFastTree(alignedFasta: string, alphabet: "nt" | "aa" = 
 }
 
 /** Isolate FastTree so independent samples can use separate CPU cores safely. */
-export function runFastTreeIsolated(alignedFasta: string): Promise<string> {
+export function runFastTreeIsolated(alignedFasta: string, signal?: AbortSignal): Promise<string> {
   const worker = new Worker(new URL("./fasttree-worker.ts", import.meta.url), { type: "module" });
   return new Promise((resolve, reject) => {
-    const finish = () => worker.terminate();
+    let settled = false;
+    const finish = () => { if (settled) return false; settled = true; signal?.removeEventListener("abort", abort); worker.terminate(); return true; };
+    const abort = () => { if (finish()) reject(new DOMException("Phylogeny inference skipped.", "AbortError")); };
     worker.onmessage = (event: MessageEvent<{ result?: string; error?: string }>) => {
-      finish(); event.data.error ? reject(new Error(event.data.error)) : resolve(event.data.result ?? "");
+      if (!finish()) return; event.data.error ? reject(new Error(event.data.error)) : resolve(event.data.result ?? "");
     };
-    worker.onerror = (event) => { finish(); reject(new Error(event.message || "FastTree worker failed.")); };
+    worker.onerror = (event) => { if (finish()) reject(new Error(event.message || "FastTree worker failed.")); };
+    if (signal?.aborted) { abort(); return; }
+    signal?.addEventListener("abort", abort, { once: true });
     worker.postMessage({ fasta: alignedFasta });
   });
 }

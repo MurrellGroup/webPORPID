@@ -143,12 +143,15 @@ export interface SampleSummary {
   observedUmis: number;
   likelyRealUmis: number;
   consensusSequences: number;
-  contaminationPassed: number;
-  postprocPassed: number;
+  /** Absent when contamination checks have not been computed. */
+  contaminationPassed?: number;
+  /** Absent when downstream filtering has not been computed. */
+  postprocPassed?: number;
   /** Number of distinct retained nucleotide haplotypes after family-level collapse. */
   collapsedSequences?: number;
   functionalPassed?: number;
-  artefactCutoff: number;
+  /** Absent when downstream filtering has not been computed. */
+  artefactCutoff?: number;
 }
 
 export interface Provenance {
@@ -251,8 +254,33 @@ export interface InputFileMapping {
   uploadedSize: number;
 }
 
+export type OptionalStageName = "contamination" | "postprocessing" | "collapse" | "tree";
+export type OptionalStageState = "completed" | "deferred" | "skipped";
+
+export interface OptionalStageStatus {
+  state: OptionalStageState;
+  detail: string;
+  updatedUtc: string;
+}
+
+/**
+ * Reference data required to resume optional work from a consensus-only
+ * project. These inputs are small compared with the FASTQ and are therefore
+ * retained in the project without retaining raw reads.
+ */
+export interface DownstreamResources {
+  samples: Array<{
+    name: string;
+    panelSequences: NamedSequence[];
+    functionalReferenceSequence?: NamedSequence;
+  }>;
+}
+
 export interface RunOptions {
   deferPhylogeny: boolean;
+  deferContamination?: boolean;
+  deferPostprocessing?: boolean;
+  deferCollapse?: boolean;
   /** Browser read-spool location; absent in older results and CLI runs. */
   spoolStorage?: "automatic" | "external-directory";
 }
@@ -268,6 +296,8 @@ export interface ResultBundle {
   contamination: ContaminationCall[];
   /** External contamination-panel records retained for on-demand reference/donor phylogenies. */
   contaminationReferences?: NamedSequence[];
+  /** Small panel/reference inputs needed to resume deferred downstream stages. */
+  downstreamResources?: DownstreamResources;
   records: PostprocRecord[];
   alignments: Record<string, string>;
   trees: Record<string, string>;
@@ -278,6 +308,8 @@ export interface ResultBundle {
   /** Exact user-file to configuration-slot assignments used for this run. */
   inputMappings?: InputFileMapping[];
   runOptions?: RunOptions;
+  /** Explicit state for every optional stage; absent in results through 0.3.5. */
+  optionalStages?: Record<OptionalStageName, OptionalStageStatus>;
   /** Manual Alivibe/import corrections, keyed like `sample/nucleotide`. */
   alignmentEdits?: Record<string, AlignmentEdit>;
   /** Append-only record of interactive alignment and tree operations. */

@@ -1,4 +1,4 @@
-import { assertAlivibeMsaResult, decodeAlivibeMsaSequences, encodeAlivibeMsaSequences } from "./alivibe-msa-codec";
+import { assertAlivibeMsaResult, decodeAlivibeMsaSequences, encodeAlivibeMsaSequences } from "./alivibe-msa-codec.ts";
 
 export async function runAlivibeMsa(
   sequences: readonly string[],
