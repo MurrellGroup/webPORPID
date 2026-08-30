@@ -90,7 +90,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   } catch (cause) { pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.6 started`,
+  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.7 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}`];
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
@@ -233,22 +233,20 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     }));
     const optionalStages: NonNullable<ResultBundle["optionalStages"]> = {
       contamination: statusRecord("deferred", "Waiting after consensus."),
-      postprocessing: statusRecord("deferred", "Waiting for contamination checks."),
+      postprocessing: statusRecord("deferred", "Waiting after consensus."),
       collapse: statusRecord("deferred", "Waiting for downstream filtering."),
       tree: statusRecord("deferred", "Waiting for haplotype collapse."),
     };
     let contamination: ResultBundle["contamination"] = [];
+    let postprocessingContaminationMode: ResultBundle["postprocessingContaminationMode"];
     let downstream: PostprocessOutput = { records: [], summaries: baseSummaries, alignments: {}, referenceAlignments: {}, collapseGroups: {}, collapseSeconds: 0 };
     const trees: Record<string, string> = {};
 
     if (request.deferContamination && request.config.parameters.contaminationFilter) {
-      const detail = "Deferred by user after consensus; no contamination decision has been assigned.";
+      const detail = "Deferred by user after consensus; no contamination decision has been assigned. Other requested stages continue without applying this filter.";
       optionalStages.contamination = statusRecord("deferred", detail);
-      optionalStages.postprocessing = statusRecord("deferred", "Waiting for deferred contamination checks.");
-      optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
-      optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
-      progress({ stage: "contamination", fraction: 1, detail: "Contamination checks deferred; the results explorer can compute this stage and every required downstream prerequisite" });
-      log.push(`${now()} contamination: deferred by user; downstream stages remain explicitly uncomputed`);
+      progress({ stage: "contamination", fraction: 1, detail: "Contamination checks deferred; continuing without excluding any sequence as contamination" });
+      log.push(`${now()} contamination: deferred by user; contamination gate bypassed for downstream work`);
     } else {
       progress({ stage: "contamination", fraction: 0, detail: "Preparing run-wide sequence signatures for contamination checks" });
       const started = performance.now(), result = await optionalStage("contamination", signal, (stageSignal) =>
@@ -256,12 +254,9 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
           fraction: state.fraction, detail: state.detail })));
       storeTiming("contamination", (performance.now() - started) / 1000, consensuses.length);
       if (result.skipped) {
-        optionalStages.contamination = statusRecord("skipped", "Skipped by user while contamination checks were running; no decisions were retained.");
-        optionalStages.postprocessing = statusRecord("deferred", "Waiting for contamination checks after the earlier run was skipped.");
-        optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
-        optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
-        progress({ stage: "contamination", fraction: 1, detail: "Contamination checks skipped; downstream stages were left uncomputed" });
-        log.push(`${now()} contamination: skipped by user; downstream stages left uncomputed`);
+        optionalStages.contamination = statusRecord("skipped", "Skipped by user while contamination checks were running; no decisions were retained and no sequence is excluded at this gate.");
+        progress({ stage: "contamination", fraction: 1, detail: "Contamination checks skipped; continuing without excluding any sequence as contamination" });
+        log.push(`${now()} contamination: skipped by user; contamination gate bypassed for downstream work`);
       } else {
         contamination = result.value;
         optionalStages.contamination = statusRecord("completed", request.config.parameters.contaminationFilter
@@ -274,17 +269,18 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       }
     }
 
-    if (optionalStages.contamination.state === "completed") {
-      if (request.deferPostprocessing) {
+    const contaminationApplied = optionalStages.contamination.state === "completed" && request.config.parameters.contaminationFilter;
+    if (request.deferPostprocessing) {
         optionalStages.postprocessing = statusRecord("deferred", "Deferred by user; panel screening, functional checks, and annotations have not run.");
         optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
         optionalStages.tree = statusRecord("deferred", "Waiting for haplotype collapse.");
         progress({ stage: "postprocessing", fraction: 1, detail: "Alignment and downstream filtering deferred; it can be computed from the stored consensus calls" });
         log.push(`${now()} postprocessing: deferred by user`);
-      } else {
-        progress({ stage: "postprocessing", fraction: 0, detail: "Starting panel screening, retained-sequence alignment, functional checks, and sequence annotation" });
+    } else {
+        const contaminationNote = contaminationApplied ? "Computed contamination decisions will be applied." : "The contamination gate is bypassed; every consensus remains eligible.";
+        progress({ stage: "postprocessing", fraction: 0, detail: `Starting panel screening, retained-sequence alignment, functional checks, and sequence annotation. ${contaminationNote}` });
         const started = performance.now(), result = await optionalStage("postprocessing", signal, (stageSignal) =>
-          postprocess(consensuses, contamination, request.config, stageSignal, runAlivibeMsa, workers,
+          postprocess(consensuses, contaminationApplied ? contamination : [], request.config, stageSignal, runAlivibeMsa, workers,
             (state) => progress({ stage: "postprocessing", fraction: state.fraction, detail: state.detail }), { collapse: false }));
         storeTiming("postprocessing", (performance.now() - started) / 1000, result.skipped ? undefined : result.value.records.length);
         if (result.skipped) {
@@ -295,16 +291,17 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
           log.push(`${now()} postprocessing: skipped by user; partial outputs discarded`);
         } else {
           downstream = result.value;
+          postprocessingContaminationMode = contaminationApplied ? "applied" : "bypassed";
           downstream.summaries.forEach((summary, index) => {
             const base = baseSummaries[index]; summary.demultiplexedReads = base.demultiplexedReads;
             summary.selectedReads = base.selectedReads; summary.downsampledReads = base.downsampledReads;
             summary.observedUmis = base.observedUmis; summary.likelyRealUmis = base.likelyRealUmis;
+            if (!contaminationApplied) delete summary.contaminationPassed;
           });
-          optionalStages.postprocessing = statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`);
-          progress({ stage: "postprocessing", fraction: 1, detail: "Panel screening, functional checks, retained-sequence alignment, and annotations complete" });
-          log.push(`${now()} postprocessing: ${downstream.records.filter((record) => record.artefactPass && record.agreementPass && record.contaminationPass && record.panelPass).length} sequences passed all non-functional filters`);
+          optionalStages.postprocessing = statusRecord("completed", `${downstream.records.length} consensus-family records evaluated${contaminationApplied ? " with contamination decisions applied" : "; contamination was bypassed and excluded zero sequences"}.`);
+          progress({ stage: "postprocessing", fraction: 1, detail: `Panel screening, functional checks, retained-sequence alignment, and annotations complete${contaminationApplied ? "" : "; contamination was not applied"}` });
+          log.push(`${now()} postprocessing: ${downstream.records.filter((record) => record.artefactPass && record.agreementPass && record.contaminationPass && record.panelPass).length} sequences passed all non-functional filters; contamination=${contaminationApplied ? "applied" : "bypassed"}`);
         }
-      }
     }
 
     if (optionalStages.postprocessing.state === "completed") {
@@ -378,7 +375,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.6", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.7", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
@@ -391,7 +388,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
         deferContamination: Boolean(request.deferContamination), deferPostprocessing: Boolean(request.deferPostprocessing),
         deferCollapse: Boolean(request.deferCollapse),
         spoolStorage: request.spoolStorage === "external-directory" ? "external-directory" : "automatic" },
-      optionalStages, timings, log,
+      optionalStages, postprocessingContaminationMode, timings, log,
     };
   } finally {
     pool.close(); try { await store.close(); } catch { /* already closed or best-effort cleanup */ }

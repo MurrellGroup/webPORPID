@@ -310,6 +310,8 @@ export interface ResultBundle {
   runOptions?: RunOptions;
   /** Explicit state for every optional stage; absent in results through 0.3.5. */
   optionalStages?: Record<OptionalStageName, OptionalStageStatus>;
+  /** Whether stored post-processing decisions applied computed contamination calls or deliberately retained every consensus at that gate. */
+  postprocessingContaminationMode?: "applied" | "bypassed";
   /** Manual Alivibe/import corrections, keyed like `sample/nucleotide`. */
   alignmentEdits?: Record<string, AlignmentEdit>;
   /** Append-only record of interactive alignment and tree operations. */

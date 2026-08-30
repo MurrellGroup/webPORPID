@@ -1,4 +1,4 @@
-import { t as WASI } from "./dist-DmN76WoC.mjs";
+import { t as WASI } from "./dist-BFrMSSwW.mjs";
 import { readFile } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 //#region src/alivibe-msa-codec.ts

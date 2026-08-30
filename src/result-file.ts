@@ -141,8 +141,19 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   }
 
   const rawStageStatuses = bundle.optionalStages == null ? undefined : object(bundle.optionalStages, "optionalStages");
+  const contaminationComplete = rawStageStatuses == null
+    || object(rawStageStatuses.contamination, "optionalStages.contamination").state === "completed";
   const postprocessingComplete = rawStageStatuses == null
     || object(rawStageStatuses.postprocessing, "optionalStages.postprocessing").state === "completed";
+  if (bundle.postprocessingContaminationMode != null) {
+    const mode = text(bundle.postprocessingContaminationMode, "postprocessingContaminationMode");
+    if (!["applied", "bypassed"].includes(mode)) throw new Error("postprocessingContaminationMode is not recognized.");
+    if (!postprocessingComplete) throw new Error("An uncomputed post-processing stage cannot record a contamination mode.");
+    if (mode === "applied" && !contaminationComplete) throw new Error("Post-processing cannot apply an uncomputed contamination stage.");
+    if (mode === "applied" && parameters.contaminationFilter !== true) throw new Error("Post-processing cannot apply a disabled contamination filter.");
+  }
+  if (rawStageStatuses != null && !contaminationComplete && postprocessingComplete && bundle.postprocessingContaminationMode !== "bypassed")
+    throw new Error("Post-processing completed without contamination decisions must be marked as contamination-bypassed.");
 
   const recordIds = new Set<string>(), recordMetadata = new Map<string, { sample: string; alignedNt?: string; minimumAgreement: number }>();
   array(bundle.records, "records").forEach((entry, index) => {
@@ -164,6 +175,9 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   if (postprocessingComplete && (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id))))
     throw new Error("Consensus and post-processing records are inconsistent.");
   if (!postprocessingComplete && recordIds.size) throw new Error("An uncomputed post-processing stage cannot contain partial post-processing records.");
+  if (bundle.postprocessingContaminationMode === "bypassed"
+    && array(bundle.records, "records").some((entry) => object(entry, "record").contaminationPass !== true))
+    throw new Error("Bypassed contamination cannot reject a post-processing record.");
 
   for (const [label, entries] of [["alignments", object(bundle.alignments, "alignments")], ["trees", object(bundle.trees, "trees")]] as const)
     for (const [name, contents] of Object.entries(entries)) {
@@ -232,14 +246,16 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       throw new Error("runOptions.spoolStorage is not recognized.");
   }
   if (rawStageStatuses != null) {
-    let prerequisiteIncomplete = false;
     for (const stage of ["contamination", "postprocessing", "collapse", "tree"] as const) {
       const status = object(rawStageStatuses[stage], `optionalStages.${stage}`), state = text(status.state, `optionalStages.${stage}.state`);
       if (!["completed", "deferred", "skipped"].includes(state)) throw new Error(`optionalStages.${stage}.state is not recognized.`);
       text(status.detail, `optionalStages.${stage}.detail`); text(status.updatedUtc, `optionalStages.${stage}.updatedUtc`);
-      if (prerequisiteIncomplete && state === "completed") throw new Error(`optionalStages.${stage} cannot be completed before its prerequisite.`);
-      if (state !== "completed") prerequisiteIncomplete = true;
     }
+    const state = (stage: "postprocessing" | "collapse" | "tree") => object(rawStageStatuses[stage], `optionalStages.${stage}`).state;
+    if (state("postprocessing") !== "completed" && state("collapse") === "completed")
+      throw new Error("optionalStages.collapse cannot be completed before post-processing.");
+    if (state("collapse") !== "completed" && state("tree") === "completed")
+      throw new Error("optionalStages.tree cannot be completed before haplotype collapse.");
   }
   if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
     const sample = name.split("/", 1)[0]; knownSample(sample, `alignmentEdits.${name}`);

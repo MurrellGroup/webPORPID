@@ -104,11 +104,15 @@ const passedPostproc = (record: PostprocRecord) => record.artefactPass && record
 export function postprocFilterStats(bundle: ResultBundle, sample: string): DualCountStat[] {
   const records = bundle.records.filter((row) => row.sample === sample);
   const matching = (predicate: (row: PostprocRecord) => boolean) => records.filter(predicate);
+  const contaminationBypassed = bundle.postprocessingContaminationMode === "bypassed";
   return [
     dualRow("all", "All consensus families", records, records, "Denominator for both percentage columns; filter rows can overlap."),
     dualRow("artefact", "Artefact-cutoff rejects", matching((row) => !row.artefactPass), records),
     dualRow("agreement", "Minimum-agreement rejects", matching((row) => !row.agreementPass), records),
-    dualRow("contamination", "Contamination rejects", matching((row) => !row.contaminationPass), records),
+    dualRow("contamination", contaminationBypassed ? "Contamination filter bypassed" : "Contamination rejects",
+      matching((row) => !row.contaminationPass), records, contaminationBypassed
+        ? "This optional check was skipped, deferred, or disabled when downstream outputs were built; zero sequences were discarded at this gate."
+        : undefined),
     dualRow("panel", "Reference-panel rejects", matching((row) => !row.panelPass), records),
     dualRow("retained", "Passed non-functional filters", matching(passedPostproc), records),
   ];
@@ -170,7 +174,7 @@ export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] 
       heteroduplexReadPercent: dispositionReadPercent(families, "heteroduplex"),
       artefactReadPercent: rejectionReadPercent(records, (row) => !row.artefactPass),
       agreementReadPercent: rejectionReadPercent(records, (row) => !row.agreementPass),
-      contaminationReadPercent: records.length ? rejectionReadPercent(records, (row) => !row.contaminationPass)
+      contaminationReadPercent: records.length && bundle.postprocessingContaminationMode !== "bypassed" ? rejectionReadPercent(records, (row) => !row.contaminationPass)
         : percent(readCount(consensuses.filter((row) => contaminantIds.has(row.id))), readCount(consensuses)),
       panelReadPercent: rejectionReadPercent(records, (row) => !row.panelPass),
       functionalReadPercent: percent(readCount(evaluated.filter((row) => row.functionalPass === false)), readCount(records)),
@@ -204,6 +208,7 @@ export function parameterSettings(bundle: ResultBundle): ParameterSettingRow[] {
   for (const [parameter, value] of Object.entries(bundle.config.parameters)) addRun(parameter, value);
   addRun("workers", bundle.provenance.workers); addRun("engine", bundle.provenance.engine);
   addRun("temporaryReadStorage", bundle.runOptions?.spoolStorage ?? "not recorded");
+  addRun("postprocessingContaminationMode", bundle.postprocessingContaminationMode ?? "not recorded (legacy result)");
   for (const [parameter, value] of Object.entries(bundle.runOptions ?? {})) if (parameter !== "spoolStorage") addRun(parameter, value);
   for (const sample of bundle.config.samples) {
     const add = (parameter: string, value: unknown) => rows.push({ scope: "sample", sample: sample.name, parameter, value: String(value ?? "—") });

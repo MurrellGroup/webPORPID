@@ -55,3 +55,25 @@ export function restorePipelineConfig(config: ResultConfig, resources: Downstrea
 export function statusRecord(state: OptionalStageStatus["state"], detail: string, updatedUtc = new Date().toISOString()): OptionalStageStatus {
   return { state, detail, updatedUtc };
 }
+
+/**
+ * Record an explicit user skip without inventing dependencies between optional
+ * stages.  Contamination is a side gate, so skipping it does not invalidate
+ * unfiltered downstream output.  Post-processing and collapse are genuine
+ * prerequisites of the stages listed below them.
+ */
+export function markOptionalStageSkipped(bundle: ResultBundle, stage: OptionalStageName): ResultBundle {
+  const statuses = Object.fromEntries(OPTIONAL_STAGE_ORDER.map((name) => [name, { ...stageStatus(bundle, name) }])) as NonNullable<ResultBundle["optionalStages"]>;
+  const stamp = new Date().toISOString();
+  if (stageCompleted(bundle, stage)) {
+    statuses[stage] = statusRecord("completed", `${statuses[stage].detail} A requested recomputation was skipped; the previously completed output was preserved.`, stamp);
+    return { ...bundle, optionalStages: statuses,
+      log: [...bundle.log, `${stamp} on-demand ${stage}: recomputation skipped; previously completed output preserved`] };
+  }
+  statuses[stage] = statusRecord("skipped", "Skipped by user during on-demand computation; partial outputs from this stage were discarded.", stamp);
+  const blocked: OptionalStageName[] = stage === "postprocessing" ? ["collapse", "tree"] : stage === "collapse" ? ["tree"] : [];
+  for (const downstream of blocked)
+    statuses[downstream] = statusRecord("deferred", `Waiting for ${stage} after it was skipped.`, stamp);
+  return { ...bundle, optionalStages: statuses,
+    log: [...bundle.log, `${stamp} on-demand ${stage}: skipped by user; partial stage outputs discarded`] };
+}

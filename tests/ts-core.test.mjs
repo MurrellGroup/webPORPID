@@ -16,6 +16,7 @@ import {
 } from "../src/alivibe-roundtrip.ts";
 import { decodeResult, encodeResult, exportComponent } from "../src/result-file.ts";
 import { classifyContamination, classifyContaminationAsync, deduplicateContaminationCalls } from "../src/contamination.ts";
+import { markOptionalStageSkipped } from "../src/optional-stages.ts";
 import { collapseAlignment } from "../src/collapse.ts";
 import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
@@ -392,6 +393,27 @@ test("chunked contamination checks preserve synchronous decisions and emit live 
   assert(updates.some((state) => state.phase === "clustering")); assert(updates.some((state) => state.phase === "classification"));
 });
 
+test("skipped contamination remains an independent bypass while true downstream prerequisites stay explicit", () => {
+  const bundle = resultBundle();
+  bundle.optionalStages.contamination = { state: "deferred", detail: "not run", updatedUtc: "2026-08-27T00:00:00.000Z" };
+  bundle.postprocessingContaminationMode = "bypassed";
+  const skippedContamination = markOptionalStageSkipped(bundle, "contamination");
+  assert.equal(skippedContamination.optionalStages.contamination.state, "skipped");
+  assert.equal(skippedContamination.optionalStages.postprocessing.state, "completed");
+  assert.equal(skippedContamination.optionalStages.collapse.state, "completed");
+  assert.equal(skippedContamination.optionalStages.tree.state, "completed");
+  assert.equal(skippedContamination.postprocessingContaminationMode, "bypassed");
+  assert(skippedContamination.records.every((record) => record.contaminationPass));
+
+  const missingPostprocessing = resultBundle();
+  missingPostprocessing.optionalStages.postprocessing = { state: "deferred", detail: "not run", updatedUtc: "2026-08-27T00:00:00.000Z" };
+  missingPostprocessing.optionalStages.collapse = { state: "deferred", detail: "blocked", updatedUtc: "2026-08-27T00:00:00.000Z" };
+  missingPostprocessing.optionalStages.tree = { state: "deferred", detail: "blocked", updatedUtc: "2026-08-27T00:00:00.000Z" };
+  const skippedPostprocessing = markOptionalStageSkipped(missingPostprocessing, "postprocessing");
+  assert.equal(skippedPostprocessing.optionalStages.collapse.state, "deferred");
+  assert.equal(skippedPostprocessing.optionalStages.tree.state, "deferred");
+});
+
 test("functional alignment is codon-aware and clipped to the reference endpoints", async () => {
   const base = resultBundle(), reference = "ATGAAAAAATAA", query = "ATGAAAAAAGCTGCTTAA";
   const config = { dataset: "functional-trim", contaminationPanel: "contam.fa", contaminationPanelSequences: [],
@@ -512,8 +534,13 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   partial.optionalStages = Object.fromEntries(["contamination", "postprocessing", "collapse", "tree"].map((stage) => [stage,
     { state: "deferred", detail: "not computed", updatedUtc: "2026-08-27T00:00:00.000Z" }]));
   assert.deepEqual(decodeResult(encodeResult(partial)), partial, "consensus-only projects must remain valid and resumable");
-  const impossibleStages = structuredClone(bundle); impossibleStages.optionalStages.contamination.state = "deferred";
-  assert.throws(() => encodeResult(impossibleStages), /cannot be completed before its prerequisite/);
+  const bypassedContamination = structuredClone(bundle); bypassedContamination.optionalStages.contamination.state = "deferred";
+  bypassedContamination.postprocessingContaminationMode = "bypassed";
+  assert.doesNotThrow(() => encodeResult(bypassedContamination), "post-processing may continue while contamination is explicitly bypassed");
+  const invalidBypass = structuredClone(bypassedContamination); invalidBypass.records[0].contaminationPass = false;
+  assert.throws(() => encodeResult(invalidBypass), /Bypassed contamination cannot reject/);
+  const impossibleStages = structuredClone(bundle); impossibleStages.optionalStages.postprocessing.state = "deferred";
+  assert.throws(() => encodeResult(impossibleStages), /(uncomputed post-processing|collapse cannot be completed before post-processing)/);
   const pre035 = structuredClone(bundle); delete pre035.summaries[0].selectedReads; delete pre035.summaries[0].downsampledReads;
   delete pre035.contaminationReferences; delete pre035.downstreamResources; delete pre035.optionalStages;
   assert.doesNotThrow(() => decodeResult(encodeResult(pre035)), "pre-0.3.5 results must remain loadable without new optional statistics and references");
@@ -544,4 +571,19 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(styles, /overscroll-behavior-x:\s*none/);
   assert.match(app, /className="app-version"/); assert.match(app, /packageInformation\.version/);
   assert.match(styles, /\.app-version/);
+});
+
+test("landing, configuration, and result sections link to built detailed Methods pages", async () => {
+  const [app, configForm, results, methods, preprocessingHtml, consensusHtml, downstreamHtml, vite] = await Promise.all([
+    readFile("src/App.tsx", "utf8"), readFile("src/components/config-form.tsx", "utf8"),
+    readFile("src/components/results-explorer.tsx", "utf8"), readFile("src/Methods.tsx", "utf8"),
+    readFile("methods-preprocessing.html", "utf8"), readFile("methods-consensus.html", "utf8"),
+    readFile("methods-downstream.html", "utf8"), readFile("vite.config.ts", "utf8"),
+  ]);
+  assert.match(app, /href="\.\/methods\.html"/); assert.match(app, /Detailed preprocessing methods/);
+  assert.match(configForm, /MethodLink topic=/); assert.match(results, /topic="contamination"/);
+  for (const id of ["streaming-storage", "umi-offspring", "heteroduplex", "family-consensus", "optional-stages", "contamination", "functional-filter", "alignment-phylogeny"])
+    assert.match(methods, new RegExp(`id="${id}"`));
+  assert.match(preprocessingHtml, /data-methods-page="preprocessing"/); assert.match(consensusHtml, /data-methods-page="consensus"/);
+  assert.match(downstreamHtml, /data-methods-page="downstream"/); assert.match(vite, /methods-downstream\.html/);
 });

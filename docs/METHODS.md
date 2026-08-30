@@ -40,6 +40,10 @@ Consensus sequences are converted to raw six-mer count vectors. A DP-means pass 
 
 Sparse integer vectors are used for individual sequences and dense vectors only for cluster means. Squared distances and mean centers are algebraically the same as dense 4,096-element vectors.
 
+The large-run classifier fuses deterministic IUPAC resolution with rolling six-mer counting, scans only observed bins, reuses unambiguous consensus signatures between clustering and classification, and stores DP-means assignments in typed buffers. Exact inverted six-mer posting indexes accumulate candidate dot products by visiting only shared bins and are rebuilt in bounded increments while DP-means centers grow. Their temporary posting count is capped; an exceptionally fragmented database falls back to the sparse exact scan with a reverse-triangle norm lower bound. Primary/suspect ordering, first-tie behavior, means, strict threshold inequalities, distances, and labels are unchanged. Browser yields are elapsed-time based rather than one timer per small fixed record block, eliminating scheduler overhead while retaining responsive progress and Skip handling.
+
+Contamination is an independently bypassable gate. If deferred or skipped, no partial decisions are retained and no consensus is discarded as contamination; requested post-processing, collapse, and tree stages continue. The result records `postprocessingContaminationMode = bypassed`, and the UI/logs distinguish this state from a completed check with zero calls. Computing contamination later leaves existing downstream output explicitly unfiltered until the user requests recomputation with the new decisions applied.
+
 One intentional reproducibility difference remains: Julia resolves ambiguous IUPAC bases through its global RNG. webPORPID resolves them with a stable sequence/seed-derived generator. Unambiguous sequences are unaffected; ambiguous sequences can fall on a different side of a clustering or distance threshold.
 
 ## Post-processing

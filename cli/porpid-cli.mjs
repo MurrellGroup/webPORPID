@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-BVyb7bUx.mjs";
-import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DfCxIVAW.mjs";
-import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-Dm9J7url.mjs";
+import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-0FV66vte.mjs";
+import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
+import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-izZLhWZ1.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -16,75 +16,103 @@ function hash(text, ordinal = 0) {
 	for (let index = 0; index < text.length; index++) value = Math.imul(value ^ text.charCodeAt(index), 16777619) >>> 0;
 	return value || 1;
 }
-const IUPAC = {
-	A: "A",
-	C: "C",
-	G: "G",
-	T: "T",
-	U: "T",
-	R: "AG",
-	Y: "CT",
-	S: "CG",
-	W: "AT",
-	K: "GT",
-	M: "AC",
-	B: "CGT",
-	D: "AGT",
-	H: "ACT",
-	V: "ACG",
-	N: "ACGT"
+const IUPAC_CODES = {
+	65: [0],
+	67: [1],
+	71: [2],
+	84: [3],
+	85: [3],
+	82: [0, 2],
+	89: [1, 3],
+	83: [1, 2],
+	87: [0, 3],
+	75: [2, 3],
+	77: [0, 1],
+	66: [
+		1,
+		2,
+		3
+	],
+	68: [
+		0,
+		2,
+		3
+	],
+	72: [
+		0,
+		1,
+		3
+	],
+	86: [
+		0,
+		1,
+		2
+	],
+	78: [
+		0,
+		1,
+		2,
+		3
+	]
 };
-function resolve$1(sequence, seed) {
-	let state = seed >>> 0;
-	return [...sequence.replaceAll("-", "").toUpperCase()].map((base) => {
-		const choices = IUPAC[base] ?? "N";
+const INVALID_BASE = [-1];
+function createKmerScratch() {
+	return {
+		counts: new Uint32Array(4096),
+		touched: new Uint16Array(4096)
+	};
+}
+/** Resolve IUPAC symbols and count six-mers without an intermediate string or a full-bin scan. */
+function kmers(sequence, seed, scratch) {
+	const dense = scratch.counts, touched = scratch.touched;
+	let state = seed >>> 0, code = 0, valid = 0, touchedCount = 0, squaredNorm = 0, total = 0;
+	for (let offset = 0; offset < sequence.length; offset++) {
+		let character = sequence.charCodeAt(offset);
+		if (character === 45) continue;
+		if (character >= 97 && character <= 122) character -= 32;
 		state ^= state << 13;
 		state ^= state >>> 17;
 		state ^= state << 5;
-		return choices[(state >>> 0) % choices.length];
-	}).join("");
-}
-function kmers(sequence) {
-	const dense = new Uint32Array(4096), index = {
-		A: 0,
-		C: 1,
-		G: 2,
-		T: 3
-	};
-	let code = 0, valid = 0;
-	for (const base of sequence) {
-		const value = index[base];
-		if (value === void 0) {
+		const choices = IUPAC_CODES[character] ?? INVALID_BASE;
+		const base = choices[(state >>> 0) % choices.length];
+		if (base < 0) {
 			code = 0;
 			valid = 0;
 			continue;
 		}
-		code = (code << 2 | value) & 4095;
+		code = (code << 2 | base) & 4095;
 		valid++;
-		if (valid >= 6) dense[code]++;
+		if (valid < 6) continue;
+		const previous = dense[code];
+		if (previous === 0) touched[touchedCount++] = code;
+		dense[code] = previous + 1;
+		squaredNorm += 2 * previous + 1;
+		total++;
 	}
-	let nonzero = 0, squaredNorm = 0, total = 0;
-	for (const count of dense) if (count) {
-		nonzero++;
-		squaredNorm += count * count;
-		total += count;
+	const codes = touched.slice(0, touchedCount);
+	codes.sort();
+	const counts = new Uint32Array(touchedCount);
+	for (let index = 0; index < touchedCount; index++) {
+		const observedCode = codes[index];
+		counts[index] = dense[observedCode];
+		dense[observedCode] = 0;
 	}
-	const codes = new Uint16Array(nonzero), counts = new Uint32Array(nonzero);
-	let offset = 0;
-	dense.forEach((count, kmer) => {
-		if (count) {
-			codes[offset] = kmer;
-			counts[offset] = count;
-			offset++;
-		}
-	});
 	return {
 		kind: "sparse",
 		codes,
 		counts,
 		squaredNorm,
+		rootNorm: Math.sqrt(squaredNorm),
 		total
 	};
+}
+function hasRandomAmbiguity(sequence) {
+	for (let index = 0; index < sequence.length; index++) {
+		let character = sequence.charCodeAt(index);
+		if (character >= 97 && character <= 122) character -= 32;
+		if ((IUPAC_CODES[character]?.length ?? 1) > 1) return true;
+	}
+	return false;
 }
 function dot(left, right) {
 	if (left.kind === "dense" && right.kind === "dense") {
@@ -113,85 +141,276 @@ function distance(left, right) {
 	const total = left.total + right.total;
 	return total === 0 ? 0 : squared / (6 * total);
 }
-function mean(vectors, members) {
-	if (members.length === 1) return vectors[members[0]];
-	const values = new Float64Array(4096);
-	for (const member of members) {
-		const vector = vectors[member];
-		if (vector.kind === "dense") for (let index = 0; index < 4096; index++) values[index] += vector.values[index];
-		else for (let index = 0; index < vector.codes.length; index++) values[vector.codes[index]] += vector.counts[index];
+function distanceFromDot(left, right, dotProduct) {
+	const squared = Math.max(0, left.squaredNorm + right.squaredNorm - 2 * dotProduct);
+	const total = left.total + right.total;
+	return total === 0 ? 0 : squared / (6 * total);
+}
+/** Reverse-triangle lower bound on the exact normalized squared distance. */
+function distanceLowerBound(left, right) {
+	const total = left.total + right.total;
+	if (total === 0) return 0;
+	const difference = left.rootNorm - right.rootNorm;
+	return difference * difference / (6 * total);
+}
+const emptyCenter = () => ({
+	kind: "dense",
+	values: new Float64Array(4096),
+	squaredNorm: 0,
+	rootNorm: 0,
+	total: 0
+});
+function meanAll(vectors) {
+	if (vectors.length === 1) return vectors[0];
+	if (!vectors.length) return emptyCenter();
+	const values = new Float64Array(4096), touched = [];
+	for (const vector of vectors) for (let index = 0; index < vector.codes.length; index++) {
+		const code = vector.codes[index];
+		if (values[code] === 0) touched.push(code);
+		values[code] += vector.counts[index];
 	}
 	let squaredNorm = 0, total = 0;
-	for (let index = 0; index < 4096; index++) {
-		values[index] /= members.length;
-		squaredNorm += values[index] ** 2;
-		total += values[index];
+	touched.sort((left, right) => left - right);
+	for (const code of touched) {
+		values[code] /= vectors.length;
+		squaredNorm += values[code] ** 2;
+		total += values[code];
 	}
 	return {
 		kind: "dense",
 		values,
 		squaredNorm,
+		rootNorm: Math.sqrt(squaredNorm),
 		total
 	};
 }
-function dpMeans(vectors, radius) {
-	if (!vectors.length) return [];
-	let centers = [vectors[0]], assignments = Array(vectors.length).fill(-1);
-	for (let iteration = 0; iteration < 30; iteration++) {
-		const previous = assignments.join(",");
-		for (let point = 0; point < vectors.length; point++) {
-			let best = 0, bestDistance = Number.POSITIVE_INFINITY;
-			for (let cluster = 0; cluster < centers.length; cluster++) {
-				const candidate = distance(centers[cluster], vectors[point]);
-				if (candidate < bestDistance) {
-					best = cluster;
-					bestDistance = candidate;
-				}
-			}
-			if (bestDistance > radius) {
-				centers.push(vectors[point]);
-				assignments[point] = centers.length - 1;
-			} else assignments[point] = best;
-		}
-		const members = Array.from({ length: centers.length }, () => []);
-		assignments.forEach((cluster, point) => members[cluster].push(point));
-		centers = members.map((indices) => indices.length ? mean(vectors, indices) : {
-			kind: "dense",
-			values: new Float64Array(4096),
-			squaredNorm: 0,
-			total: 0
-		});
-		if (assignments.join(",") === previous) break;
+function updateCenters(vectors, assignments, centerCount) {
+	const counts = new Int32Array(centerCount), first = new Int32Array(centerCount);
+	first.fill(-1);
+	for (let point = 0; point < assignments.length; point++) {
+		const cluster = assignments[point];
+		counts[cluster]++;
+		if (first[cluster] < 0) first[cluster] = point;
 	}
-	const members = Array.from({ length: centers.length }, () => []);
-	assignments.forEach((cluster, point) => members[cluster].push(point));
+	const values = Array(centerCount), touched = Array(centerCount);
+	for (let cluster = 0; cluster < centerCount; cluster++) if (counts[cluster] > 1) {
+		values[cluster] = new Float64Array(4096);
+		touched[cluster] = [];
+	}
+	for (let point = 0; point < assignments.length; point++) {
+		const cluster = assignments[point], target = values[cluster];
+		if (!target) continue;
+		const observed = vectors[point], observedCodes = touched[cluster];
+		for (let index = 0; index < observed.codes.length; index++) {
+			const code = observed.codes[index];
+			if (target[code] === 0) observedCodes.push(code);
+			target[code] += observed.counts[index];
+		}
+	}
+	return Array.from({ length: centerCount }, (_, cluster) => {
+		if (counts[cluster] === 0) return emptyCenter();
+		if (counts[cluster] === 1) return vectors[first[cluster]];
+		const target = values[cluster], observedCodes = touched[cluster];
+		observedCodes.sort((left, right) => left - right);
+		let squaredNorm = 0, total = 0;
+		for (const code of observedCodes) {
+			target[code] /= counts[cluster];
+			squaredNorm += target[code] ** 2;
+			total += target[code];
+		}
+		return {
+			kind: "dense",
+			values: target,
+			squaredNorm,
+			rootNorm: Math.sqrt(squaredNorm),
+			total
+		};
+	});
+}
+function assignPointIndexed(vector, centers, index, indexedCount, radius) {
+	let best = 0, bestDistance = Number.POSITIVE_INFINITY;
+	if (index) {
+		scoreDatabase(vector, index);
+		for (let cluster = 0; cluster < indexedCount; cluster++) {
+			const candidate = distanceFromDot(vector, centers[cluster], index.dots[cluster]);
+			if (candidate < bestDistance) {
+				best = cluster;
+				bestDistance = candidate;
+			}
+		}
+	}
+	for (let cluster = indexedCount; cluster < centers.length; cluster++) {
+		if (distanceLowerBound(centers[cluster], vector) >= bestDistance) continue;
+		const candidate = distance(centers[cluster], vector);
+		if (candidate < bestDistance) {
+			best = cluster;
+			bestDistance = candidate;
+		}
+	}
+	return bestDistance > radius ? -1 : best;
+}
+const CENTER_INDEX_REBUILD_TAIL = 128;
+function centerIndex(centers) {
+	return buildDatabaseIndex(centers.map((vector, index) => ({
+		label: String(index),
+		vector
+	})));
+}
+function clusterMembers(assignments, centers) {
+	const counts = new Int32Array(centers.length);
+	for (let point = 0; point < assignments.length; point++) counts[assignments[point]]++;
 	return centers.map((center, index) => ({
 		center,
-		members: members[index]
-	})).filter((cluster) => cluster.members.length);
+		memberCount: counts[index]
+	})).filter((cluster) => cluster.memberCount);
 }
-function nearest(sample, vector, database, threshold) {
-	let closestSelf = Number.POSITIVE_INFINITY, nonself, nonselfDistance = Number.POSITIVE_INFINITY;
-	for (const entry of database) {
-		const value = distance(vector, entry.vector);
-		if (entry.sample === sample) closestSelf = Math.min(closestSelf, value);
-		else if (value < nonselfDistance) {
-			nonself = entry;
-			nonselfDistance = value;
+function dpMeans(vectors, radius) {
+	if (!vectors.length) return [];
+	let centers = [vectors[0]];
+	const assignments = new Int32Array(vectors.length);
+	assignments.fill(-1);
+	for (let iteration = 0; iteration < 30; iteration++) {
+		let changed = false, indexed = centerIndex(centers), indexedCount = indexed ? centers.length : 0, canRebuild = Boolean(indexed);
+		for (let point = 0; point < vectors.length; point++) {
+			if (canRebuild && centers.length - indexedCount >= CENTER_INDEX_REBUILD_TAIL) {
+				const replacement = centerIndex(centers);
+				if (replacement) {
+					indexed = replacement;
+					indexedCount = centers.length;
+				} else canRebuild = false;
+			}
+			let assigned = assignPointIndexed(vectors[point], centers, indexed, indexedCount, radius);
+			if (assigned < 0) {
+				centers.push(vectors[point]);
+				assigned = centers.length - 1;
+			}
+			if (assignments[point] !== assigned) {
+				assignments[point] = assigned;
+				changed = true;
+			}
+		}
+		centers = updateCenters(vectors, assignments, centers.length);
+		if (!changed) break;
+	}
+	return clusterMembers(assignments, centers);
+}
+function databaseView(database, sample) {
+	const self = [], nonself = [];
+	for (const entry of database) (entry.sample === sample ? self : nonself).push(entry);
+	return {
+		self,
+		nonself
+	};
+}
+function nearestNonself(vector, entries, threshold) {
+	let nearest, nearestDistance = threshold;
+	for (const entry of entries) {
+		if (distanceLowerBound(vector, entry.vector) >= nearestDistance) continue;
+		const candidate = distance(vector, entry.vector);
+		if (candidate < nearestDistance) {
+			nearest = entry;
+			nearestDistance = candidate;
 		}
 	}
-	return nonself && nonselfDistance < threshold ? {
-		label: nonself.label,
-		distance: nonselfDistance,
-		discard: closestSelf > threshold
+	return nearest ? {
+		label: nearest.label,
+		distance: nearestDistance
 	} : void 0;
 }
-/**
-* One consensus must have one displayed/stored contamination decision. Older
-* result files can contain both the primary call and the wider suspect-pass
-* call; prefer the primary decision and use the suspect call only when there
-* was no primary match.
-*/
+function nearestPrimary(vector, view, threshold) {
+	const nonself = nearestNonself(vector, view.nonself, threshold);
+	if (!nonself) return void 0;
+	let hasCloseSelf = false;
+	for (const entry of view.self) {
+		if (distanceLowerBound(vector, entry.vector) > threshold) continue;
+		if (distance(vector, entry.vector) <= threshold) {
+			hasCloseSelf = true;
+			break;
+		}
+	}
+	return {
+		...nonself,
+		discard: !hasCloseSelf
+	};
+}
+const MAX_INDEX_POSTINGS = 4e6;
+function buildDatabaseIndex(entries, postingLimit = MAX_INDEX_POSTINGS) {
+	const binSizes = new Uint32Array(4096);
+	let postingCount = 0;
+	for (const entry of entries) if (entry.vector.kind === "sparse") {
+		postingCount += entry.vector.codes.length;
+		if (postingCount > postingLimit) return void 0;
+		for (const code of entry.vector.codes) binSizes[code]++;
+	} else for (let code = 0; code < 4096; code++) if (entry.vector.values[code] !== 0) {
+		binSizes[code]++;
+		if (++postingCount > postingLimit) return void 0;
+	}
+	const offsets = new Uint32Array(4097);
+	for (let code = 0; code < 4096; code++) offsets[code + 1] = offsets[code] + binSizes[code];
+	const cursor = offsets.slice(0, 4096);
+	const entryIds = entries.length <= 65535 ? new Uint16Array(postingCount) : new Uint32Array(postingCount);
+	const values = new Float64Array(postingCount);
+	const add = (code, entry, value) => {
+		const position = cursor[code]++;
+		entryIds[position] = entry;
+		values[position] = value;
+	};
+	for (let entry = 0; entry < entries.length; entry++) {
+		const vector = entries[entry].vector;
+		if (vector.kind === "sparse") for (let offset = 0; offset < vector.codes.length; offset++) add(vector.codes[offset], entry, vector.counts[offset]);
+		else for (let code = 0; code < 4096; code++) if (vector.values[code] !== 0) add(code, entry, vector.values[code]);
+	}
+	return {
+		entries,
+		offsets,
+		entryIds,
+		values,
+		dots: new Float64Array(entries.length)
+	};
+}
+function scoreDatabase(vector, index) {
+	index.dots.fill(0);
+	for (let queryOffset = 0; queryOffset < vector.codes.length; queryOffset++) {
+		const code = vector.codes[queryOffset], queryCount = vector.counts[queryOffset];
+		for (let position = index.offsets[code]; position < index.offsets[code + 1]; position++) index.dots[index.entryIds[position]] += queryCount * index.values[position];
+	}
+}
+function nearestNonselfIndexed(vector, sample, index, threshold) {
+	scoreDatabase(vector, index);
+	let nearest, nearestDistance = threshold;
+	for (let entry = 0; entry < index.entries.length; entry++) {
+		const candidateEntry = index.entries[entry];
+		if (candidateEntry.sample === sample) continue;
+		const candidate = distanceFromDot(vector, candidateEntry.vector, index.dots[entry]);
+		if (candidate < nearestDistance) {
+			nearest = candidateEntry;
+			nearestDistance = candidate;
+		}
+	}
+	return nearest ? {
+		label: nearest.label,
+		distance: nearestDistance
+	} : void 0;
+}
+function nearestPrimaryIndexed(vector, sample, index, threshold) {
+	scoreDatabase(vector, index);
+	let nearest, nearestDistance = threshold, hasCloseSelf = false;
+	for (let entry = 0; entry < index.entries.length; entry++) {
+		const candidateEntry = index.entries[entry], candidate = distanceFromDot(vector, candidateEntry.vector, index.dots[entry]);
+		if (candidateEntry.sample === sample) {
+			if (candidate <= threshold) hasCloseSelf = true;
+		} else if (candidate < nearestDistance) {
+			nearest = candidateEntry;
+			nearestDistance = candidate;
+		}
+	}
+	return nearest ? {
+		label: nearest.label,
+		distance: nearestDistance,
+		discard: !hasCloseSelf
+	} : void 0;
+}
+/** One stored contamination decision per family, preferring a primary call over a suspect-only call. */
 function deduplicateContaminationCalls(calls) {
 	const bySequence = /* @__PURE__ */ new Map();
 	for (const call of calls) {
@@ -200,40 +419,53 @@ function deduplicateContaminationCalls(calls) {
 	}
 	return [...bySequence.values()].sort((a, b) => a.sample.localeCompare(b.sample) || a.nearestNonselfDistance - b.nearestNonselfDistance || a.sequenceId.localeCompare(b.sequenceId));
 }
-function classifyContamination(consensuses, config) {
-	if (!config.parameters.contaminationFilter) return [];
-	const panel = config.contaminationPanelSequences.map((record, index) => ({
-		label: record.name,
-		vector: kmers(resolve$1(record.sequence, hash(record.name, index)))
-	}));
-	const primary = [], suspect = [];
-	for (const sample of config.samples) {
-		const records = consensuses.filter((record) => record.sample === sample.name);
-		if (!records.length) continue;
-		const vectors = records.map((record, index) => kmers(resolve$1(record.sequence, hash(record.id, index))));
-		dpMeans(vectors, config.parameters.contaminationClusterThreshold).forEach((cluster, index) => {
-			const percent = Math.round(1e3 * cluster.members.length / vectors.length) / 10;
-			const entry = {
-				label: `${sample.name}_cluster${index + 1}_${percent}%`,
-				sample: sample.name,
-				vector: cluster.center
-			};
-			suspect.push(entry);
-			if (cluster.members.length / vectors.length > config.parameters.contaminationProportionThreshold) primary.push(entry);
-		});
-		const all = {
-			label: `${sample.name}_All`,
-			sample: sample.name,
-			vector: mean(vectors, vectors.map((_, index) => index))
-		};
-		primary.push(all);
-		suspect.push(all);
+function prepareConsensusVectors(consensuses, config, scratch) {
+	const bySample = new Map(config.samples.map((sample) => [sample.name, []]));
+	const byConsensus = Array(consensuses.length);
+	for (let globalIndex = 0; globalIndex < consensuses.length; globalIndex++) {
+		const record = consensuses[globalIndex], sampleVectors = bySample.get(record.sample);
+		if (!sampleVectors) continue;
+		const vector = kmers(record.sequence, hash(record.id, sampleVectors.length), scratch);
+		sampleVectors.push(vector);
+		byConsensus[globalIndex] = vector;
 	}
-	primary.push(...panel);
-	suspect.push(...panel);
-	const output = [], threshold = config.parameters.contaminationDistanceThreshold;
-	for (const [index, record] of consensuses.entries()) {
-		const vector = kmers(resolve$1(record.sequence, hash(record.id, index))), call = nearest(record.sample, vector, primary, threshold);
+	return {
+		bySample,
+		byConsensus
+	};
+}
+function addSampleDatabases(sampleName, vectors, config, primary, suspect, clusters) {
+	clusters.forEach((cluster, index) => {
+		const proportion = cluster.memberCount / vectors.length;
+		const percent = Math.round(1e3 * proportion) / 10;
+		const entry = {
+			label: `${sampleName}_cluster${index + 1}_${percent}%`,
+			sample: sampleName,
+			vector: cluster.center
+		};
+		suspect.push(entry);
+		if (proportion > config.parameters.contaminationProportionThreshold) primary.push(entry);
+	});
+	const all = {
+		label: `${sampleName}_All`,
+		sample: sampleName,
+		vector: meanAll(vectors)
+	};
+	primary.push(all);
+	suspect.push(all);
+}
+function classifyPrepared(consensuses, prepared, primary, suspect, config, scratch) {
+	const threshold = config.parameters.contaminationDistanceThreshold, output = [];
+	const primaryViews = /* @__PURE__ */ new Map(), suspectViews = /* @__PURE__ */ new Map();
+	const primaryIndex = buildDatabaseIndex(primary), suspectIndex = buildDatabaseIndex(suspect);
+	for (const sample of new Set(consensuses.map((record) => record.sample))) {
+		primaryViews.set(sample, databaseView(primary, sample));
+		suspectViews.set(sample, databaseView(suspect, sample));
+	}
+	for (let index = 0; index < consensuses.length; index++) {
+		const record = consensuses[index];
+		const vector = !hasRandomAmbiguity(record.sequence) && prepared.byConsensus[index] ? prepared.byConsensus[index] : kmers(record.sequence, hash(record.id, index), scratch);
+		const call = primaryIndex ? nearestPrimaryIndexed(vector, record.sample, primaryIndex, threshold) : nearestPrimary(vector, primaryViews.get(record.sample), threshold);
 		if (call) output.push({
 			sample: record.sample,
 			sequenceId: record.id,
@@ -243,18 +475,37 @@ function classifyContamination(consensuses, config) {
 			discarded: call.discard,
 			suspectOnly: false
 		});
-		const possible = nearest(record.sample, vector, suspect, threshold);
-		if (!call && possible) output.push({
-			sample: record.sample,
-			sequenceId: record.id,
-			nearestNonselfVariant: possible.label,
-			nearestNonselfDistance: possible.distance,
-			flagged: true,
-			discarded: false,
-			suspectOnly: true
-		});
+		else {
+			const possible = suspectIndex ? nearestNonselfIndexed(vector, record.sample, suspectIndex, threshold) : nearestNonself(vector, suspectViews.get(record.sample).nonself, threshold);
+			if (possible) output.push({
+				sample: record.sample,
+				sequenceId: record.id,
+				nearestNonselfVariant: possible.label,
+				nearestNonselfDistance: possible.distance,
+				flagged: true,
+				discarded: false,
+				suspectOnly: true
+			});
+		}
 	}
 	return deduplicateContaminationCalls(output);
+}
+function classifyContamination(consensuses, config) {
+	if (!config.parameters.contaminationFilter) return [];
+	const scratch = createKmerScratch();
+	const panel = config.contaminationPanelSequences.map((record, index) => ({
+		label: record.name,
+		vector: kmers(record.sequence, hash(record.name, index), scratch)
+	}));
+	const prepared = prepareConsensusVectors(consensuses, config, scratch), primary = [], suspect = [];
+	for (const sample of config.samples) {
+		const vectors = prepared.bySample.get(sample.name) ?? [];
+		if (!vectors.length) continue;
+		addSampleDatabases(sample.name, vectors, config, primary, suspect, dpMeans(vectors, config.parameters.contaminationClusterThreshold));
+	}
+	primary.push(...panel);
+	suspect.push(...panel);
+	return classifyPrepared(consensuses, prepared, primary, suspect, config, scratch);
 }
 //#endregion
 //#region src/alivibe-msa-runtime.ts
@@ -1322,7 +1573,7 @@ function statusRecord(state, detail, updatedUtc = (/* @__PURE__ */ new Date()).t
 	};
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/utils/utf8.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/utils/utf8.mjs
 function utf8Count(str) {
 	const strLength = str.length;
 	let byteLength = 0;
@@ -1437,7 +1688,7 @@ function utf8Decode(bytes, inputOffset, byteLength) {
 	else return utf8DecodeJs(bytes, inputOffset, byteLength);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/ExtData.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/ExtData.mjs
 /**
 * ExtData is used to handle Extension Types that are not registered to ExtensionCodec.
 */
@@ -1448,7 +1699,7 @@ var ExtData = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/DecodeError.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/DecodeError.mjs
 var DecodeError = class DecodeError extends Error {
 	constructor(message) {
 		super(message);
@@ -1553,7 +1804,7 @@ const timestampExtension = {
 	decode: decodeTimestampExtension
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/ExtensionCodec.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/ExtensionCodec.mjs
 var ExtensionCodec = class {
 	constructor() {
 		this.builtInEncoders = [];
@@ -1598,7 +1849,7 @@ var ExtensionCodec = class {
 };
 ExtensionCodec.defaultCodec = new ExtensionCodec();
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/utils/typedArrays.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/utils/typedArrays.mjs
 function isArrayBufferLike(buffer) {
 	return buffer instanceof ArrayBuffer || typeof SharedArrayBuffer !== "undefined" && buffer instanceof SharedArrayBuffer;
 }
@@ -1927,7 +2178,7 @@ var Encoder = class Encoder {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/encode.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/encode.mjs
 /**
 * It encodes `value` in the MessagePack format and
 * returns a byte buffer.
@@ -1938,12 +2189,12 @@ function encode(value, options) {
 	return new Encoder(options).encodeSharedRef(value);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/utils/prettyByte.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/utils/prettyByte.mjs
 function prettyByte(byte) {
 	return `${byte < 0 ? "-" : ""}0x${Math.abs(byte).toString(16).padStart(2, "0")}`;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/CachedKeyDecoder.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/CachedKeyDecoder.mjs
 const DEFAULT_MAX_KEY_LENGTH = 16;
 const DEFAULT_MAX_LENGTH_PER_KEY = 16;
 var CachedKeyDecoder = class {
@@ -1990,7 +2241,7 @@ var CachedKeyDecoder = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/Decoder.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/Decoder.mjs
 const STATE_ARRAY = "array";
 const STATE_MAP_KEY = "map_key";
 const STATE_MAP_VALUE = "map_value";
@@ -2496,7 +2747,7 @@ var Decoder = class Decoder {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@msgpack/msgpack/dist.esm/decode.mjs
+//#region node_modules/@msgpack/msgpack/dist.esm/decode.mjs
 /**
 * It decodes a single MessagePack object in a buffer.
 *
@@ -2510,7 +2761,7 @@ function decode(buffer, options) {
 	return new Decoder(options).decode(buffer);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/fflate/esm/browser.js
+//#region node_modules/fflate/esm/browser.js
 var u8 = Uint8Array, u16 = Uint16Array, i32 = Int32Array;
 var fleb = new u8([
 	0,
@@ -3425,7 +3676,16 @@ function validateResult(value) {
 		if (resourceSamples.size !== samples.length) throw new Error("Downstream resources are missing a configured sample.");
 	}
 	const rawStageStatuses = bundle.optionalStages == null ? void 0 : object(bundle.optionalStages, "optionalStages");
+	const contaminationComplete = rawStageStatuses == null || object(rawStageStatuses.contamination, "optionalStages.contamination").state === "completed";
 	const postprocessingComplete = rawStageStatuses == null || object(rawStageStatuses.postprocessing, "optionalStages.postprocessing").state === "completed";
+	if (bundle.postprocessingContaminationMode != null) {
+		const mode = text(bundle.postprocessingContaminationMode, "postprocessingContaminationMode");
+		if (!["applied", "bypassed"].includes(mode)) throw new Error("postprocessingContaminationMode is not recognized.");
+		if (!postprocessingComplete) throw new Error("An uncomputed post-processing stage cannot record a contamination mode.");
+		if (mode === "applied" && !contaminationComplete) throw new Error("Post-processing cannot apply an uncomputed contamination stage.");
+		if (mode === "applied" && parameters.contaminationFilter !== true) throw new Error("Post-processing cannot apply a disabled contamination filter.");
+	}
+	if (rawStageStatuses != null && !contaminationComplete && postprocessingComplete && bundle.postprocessingContaminationMode !== "bypassed") throw new Error("Post-processing completed without contamination decisions must be marked as contamination-bypassed.");
 	const recordIds = /* @__PURE__ */ new Set(), recordMetadata = /* @__PURE__ */ new Map();
 	array(bundle.records, "records").forEach((entry, index) => {
 		const row = object(entry, `records[${index}]`), id = text(row.id, `records[${index}].id`);
@@ -3467,6 +3727,7 @@ function validateResult(value) {
 	});
 	if (postprocessingComplete && (recordIds.size !== consensusIds.size || [...consensusIds].some((id) => !recordIds.has(id)))) throw new Error("Consensus and post-processing records are inconsistent.");
 	if (!postprocessingComplete && recordIds.size) throw new Error("An uncomputed post-processing stage cannot contain partial post-processing records.");
+	if (bundle.postprocessingContaminationMode === "bypassed" && array(bundle.records, "records").some((entry) => object(entry, "record").contaminationPass !== true)) throw new Error("Bypassed contamination cannot reject a post-processing record.");
 	for (const [label, entries] of [["alignments", object(bundle.alignments, "alignments")], ["trees", object(bundle.trees, "trees")]]) for (const [name, contents] of Object.entries(entries)) {
 		text(name, `${label} name`);
 		text(contents, `${label}.${name}`);
@@ -3538,7 +3799,6 @@ function validateResult(value) {
 		if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage"))) throw new Error("runOptions.spoolStorage is not recognized.");
 	}
 	if (rawStageStatuses != null) {
-		let prerequisiteIncomplete = false;
 		for (const stage of [
 			"contamination",
 			"postprocessing",
@@ -3553,9 +3813,10 @@ function validateResult(value) {
 			].includes(state)) throw new Error(`optionalStages.${stage}.state is not recognized.`);
 			text(status.detail, `optionalStages.${stage}.detail`);
 			text(status.updatedUtc, `optionalStages.${stage}.updatedUtc`);
-			if (prerequisiteIncomplete && state === "completed") throw new Error(`optionalStages.${stage} cannot be completed before its prerequisite.`);
-			if (state !== "completed") prerequisiteIncomplete = true;
 		}
+		const state = (stage) => object(rawStageStatuses[stage], `optionalStages.${stage}`).state;
+		if (state("postprocessing") !== "completed" && state("collapse") === "completed") throw new Error("optionalStages.collapse cannot be completed before post-processing.");
+		if (state("collapse") !== "completed" && state("tree") === "completed") throw new Error("optionalStages.tree cannot be completed before haplotype collapse.");
 	}
 	if (bundle.alignmentEdits != null) for (const [name, rawEdit] of Object.entries(object(bundle.alignmentEdits, "alignmentEdits"))) {
 		const sample = name.split("/", 1)[0];
@@ -3997,7 +4258,7 @@ function concatenateSpoolRecords(records) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.6";
+const VERSION = "0.3.7";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

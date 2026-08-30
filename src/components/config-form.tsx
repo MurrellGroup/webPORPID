@@ -1,4 +1,5 @@
 import type { PipelineConfig, PipelineParameters, SampleConfig } from "../types";
+import { MethodLink, type MethodTopic } from "./method-link";
 
 type NumberParameter = Exclude<keyof PipelineParameters, "contaminationFilter" | "deterministicSeed">;
 
@@ -58,11 +59,11 @@ function OptionalNumber({ label, help, value, onChange, min, max, step = 0.01 }:
   }} /></Field>;
 }
 
-function ParameterGroup({ title, description, settings, config, onChange }: {
-  title: string; description: string; settings: NumericSetting[]; config: PipelineConfig; onChange: (config: PipelineConfig) => void;
+function ParameterGroup({ title, description, settings, topic, config, onChange }: {
+  title: string; description: string; settings: NumericSetting[]; topic: MethodTopic; config: PipelineConfig; onChange: (config: PipelineConfig) => void;
 }) {
   const update = (key: NumberParameter, value: number) => onChange({ ...config, parameters: { ...config.parameters, [key]: value } });
-  return <section className="parameter-group"><header><h4>{title}</h4><p>{description}</p></header><div className="parameter-grid">
+  return <section className="parameter-group"><header><div><h4>{title}</h4><p>{description}</p></div><MethodLink topic={topic} /></header><div className="parameter-grid">
     {settings.map((setting) => <NumericField key={setting.key} setting={setting} value={config.parameters[setting.key]} onChange={(value) => update(setting.key, value)} />)}
   </div></section>;
 }
@@ -113,10 +114,10 @@ export function ConfigForm({ config, onChange, onReset, onDownload }: {
     </section>
 
     <div className="settings-groups">
-      <ParameterGroup title="Preprocessing" description="Read quality, length, primer matching and downsampling." settings={PREPROCESSING} config={config} onChange={onChange} />
-      <ParameterGroup title="UMI &amp; consensus" description="Offspring classification, family consensus and artefact controls." settings={UMI_CONSENSUS} config={config} onChange={onChange} />
-      <ParameterGroup title="Contamination" description="Run-aware self/non-self distance filters." settings={CONTAMINATION} config={config} onChange={onChange} />
-      <ParameterGroup title="Postprocessing" description="Reference-panel and optional coding-sequence filters." settings={POSTPROCESSING} config={config} onChange={onChange} />
+      <ParameterGroup title="Preprocessing" description="Read quality, length, primer matching and downsampling." settings={PREPROCESSING} topic="filtering" config={config} onChange={onChange} />
+      <ParameterGroup title="UMI &amp; consensus" description="Offspring classification, family consensus and artefact controls." settings={UMI_CONSENSUS} topic="umi" config={config} onChange={onChange} />
+      <ParameterGroup title="Contamination" description="Run-aware self/non-self distance filters." settings={CONTAMINATION} topic="contamination" config={config} onChange={onChange} />
+      <ParameterGroup title="Postprocessing" description="Reference-panel and optional coding-sequence filters." settings={POSTPROCESSING} topic="panel" config={config} onChange={onChange} />
       <section className="parameter-group"><header><h4>Resources &amp; reproducibility</h4><p>Disk partitioning and deterministic decisions.</p></header><div className="parameter-grid">
         <Field label="Spool partitions" help="Power of two; more partitions reduce peak memory."><select value={config.parameters.spoolPartitions} onChange={(event) => onChange({ ...config, parameters: { ...config.parameters, spoolPartitions: Number(event.target.value) } })}>{[1, 2, 4, 8, 16, 32, 64, 128, 256].map((value) => <option key={value}>{value}</option>)}</select></Field>
         <Field label="Deterministic seed" help="Unsigned integer stored in the audit trail."><input className="sequence-input" value={config.parameters.deterministicSeed.toString()} inputMode="numeric" onChange={(event) => { if (/^\d+$/.test(event.target.value)) onChange({ ...config, parameters: { ...config.parameters, deterministicSeed: BigInt(event.target.value) } }); }} /></Field>

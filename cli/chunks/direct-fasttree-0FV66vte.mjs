@@ -13,7 +13,7 @@ var __exportAll = (all, no_symbols) => {
 	return target;
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/identity.js
+//#region node_modules/yaml/browser/dist/nodes/identity.js
 const ALIAS = Symbol.for("yaml.alias");
 const DOC = Symbol.for("yaml.document");
 const MAP = Symbol.for("yaml.map");
@@ -45,7 +45,7 @@ function isNode(node) {
 }
 const hasAnchor = (node) => (isScalar$1(node) || isCollection$1(node)) && !!node.anchor;
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/visit.js
+//#region node_modules/yaml/browser/dist/visit.js
 const BREAK$1 = Symbol("break visit");
 const SKIP$1 = Symbol("skip children");
 const REMOVE$1 = Symbol("remove node");
@@ -230,7 +230,7 @@ function replaceNode(key, path, node) {
 	}
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/doc/directives.js
+//#region node_modules/yaml/browser/dist/doc/directives.js
 const escapeChars = {
 	"!": "%21",
 	",": "%2C",
@@ -390,7 +390,7 @@ Directives.defaultYaml = {
 };
 Directives.defaultTags = { "!!": "tag:yaml.org,2002:" };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/doc/anchors.js
+//#region node_modules/yaml/browser/dist/doc/anchors.js
 /**
 * Verify that the input string is a valid anchor.
 *
@@ -449,7 +449,7 @@ function createNodeAnchors(doc, prefix) {
 	};
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/doc/applyReviver.js
+//#region node_modules/yaml/browser/dist/doc/applyReviver.js
 /**
 * Applies the JSON.parse reviver algorithm as defined in the ECMA-262 spec,
 * in section 24.5.1.1 "Runtime Semantics: InternalizeJSONProperty" of the
@@ -486,7 +486,7 @@ function applyReviver(reviver, obj, key, val) {
 	return reviver.call(obj, key, val);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/toJS.js
+//#region node_modules/yaml/browser/dist/nodes/toJS.js
 /**
 * Recursively convert any node or its contents to native JavaScript
 *
@@ -519,7 +519,7 @@ function toJS(value, arg, ctx) {
 	return value;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/Node.js
+//#region node_modules/yaml/browser/dist/nodes/Node.js
 var NodeBase = class {
 	constructor(type) {
 		Object.defineProperty(this, NODE_TYPE, { value: type });
@@ -547,7 +547,7 @@ var NodeBase = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/Alias.js
+//#region node_modules/yaml/browser/dist/nodes/Alias.js
 var Alias = class extends NodeBase {
 	constructor(source) {
 		super(ALIAS);
@@ -633,7 +633,7 @@ function getAliasCount(doc, node, anchors) {
 	return 1;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/Scalar.js
+//#region node_modules/yaml/browser/dist/nodes/Scalar.js
 const isScalarValue = (value) => !value || typeof value !== "function" && typeof value !== "object";
 var Scalar = class extends NodeBase {
 	constructor(value) {
@@ -653,7 +653,7 @@ Scalar.PLAIN = "PLAIN";
 Scalar.QUOTE_DOUBLE = "QUOTE_DOUBLE";
 Scalar.QUOTE_SINGLE = "QUOTE_SINGLE";
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/doc/createNode.js
+//#region node_modules/yaml/browser/dist/doc/createNode.js
 const defaultTagPrefix = "tag:yaml.org,2002:";
 function findTagObject(value, tagName, tags) {
 	if (tagName) {
@@ -710,7 +710,7 @@ function createNode(value, tagName, ctx) {
 	return node;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/Collection.js
+//#region node_modules/yaml/browser/dist/nodes/Collection.js
 function collectionFromPath(schema, path, value) {
 	let v = value;
 	for (let i = path.length - 1; i >= 0; --i) {
@@ -823,7 +823,7 @@ var Collection = class extends NodeBase {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringifyComment.js
+//#region node_modules/yaml/browser/dist/stringify/stringifyComment.js
 /**
 * Stringifies a comment.
 *
@@ -838,7 +838,7 @@ function indentComment(comment, indent) {
 }
 const lineComment = (str, indent, comment) => str.endsWith("\n") ? indentComment(comment, indent) : comment.includes("\n") ? "\n" + indentComment(comment, indent) : (str.endsWith(" ") ? "" : " ") + comment;
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/foldFlowLines.js
+//#region node_modules/yaml/browser/dist/stringify/foldFlowLines.js
 const FOLD_FLOW = "flow";
 const FOLD_BLOCK = "block";
 const FOLD_QUOTED = "quoted";
@@ -948,7 +948,7 @@ function consumeMoreIndentedLines(text, i, indent) {
 	return end;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringifyString.js
+//#region node_modules/yaml/browser/dist/stringify/stringifyString.js
 const getFoldOptions = (ctx, isBlock) => ({
 	indentAtStart: isBlock ? ctx.indent.length : ctx.indentAtStart,
 	lineWidth: ctx.options.lineWidth,
@@ -1167,7 +1167,7 @@ function stringifyString(item, ctx, onComment, onChompKeep) {
 	return res;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringify.js
+//#region node_modules/yaml/browser/dist/stringify/stringify.js
 function createStringifyContext(doc, options) {
 	const opt = Object.assign({
 		blockQuote: true,
@@ -1267,7 +1267,7 @@ function stringify$2(item, ctx, onComment, onChompKeep) {
 	return isScalar$1(node) || str[0] === "{" || str[0] === "[" ? `${props} ${str}` : `${props}\n${ctx.indent}${str}`;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringifyPair.js
+//#region node_modules/yaml/browser/dist/stringify/stringifyPair.js
 function stringifyPair({ key, value }, ctx, onComment, onChompKeep) {
 	const { allNullValues, doc, indent, indentStep, options: { commentString, indentSeq, simpleKeys } } = ctx;
 	let keyComment = isNode(key) && key.comment || null;
@@ -1357,12 +1357,12 @@ function stringifyPair({ key, value }, ctx, onComment, onChompKeep) {
 	return str;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/log.js
+//#region node_modules/yaml/browser/dist/log.js
 function warn(logLevel, warning) {
 	if (logLevel === "debug" || logLevel === "warn") console.warn(warning);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/merge.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/merge.js
 const MERGE_KEY = "<<";
 const merge = {
 	identify: (value) => value === MERGE_KEY || typeof value === "symbol" && value.description === MERGE_KEY,
@@ -1398,7 +1398,7 @@ function resolveAliasValue(ctx, value) {
 	return ctx && isAlias(value) ? value.resolve(ctx.doc, ctx) : value;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/addPairToJSMap.js
+//#region node_modules/yaml/browser/dist/nodes/addPairToJSMap.js
 function addPairToJSMap(ctx, map, { key, value }) {
 	if (isNode(key) && key.addToJSMap) key.addToJSMap(ctx, map, value);
 	else if (isMergeKey(ctx, key)) addMergeToJSMap(ctx, map, value);
@@ -1441,7 +1441,7 @@ function stringifyKey(key, jsKey, ctx) {
 	return JSON.stringify(jsKey);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/Pair.js
+//#region node_modules/yaml/browser/dist/nodes/Pair.js
 function createPair(key, value, ctx) {
 	return new Pair(createNode(key, void 0, ctx), createNode(value, void 0, ctx));
 }
@@ -1465,7 +1465,7 @@ var Pair = class Pair {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringifyCollection.js
+//#region node_modules/yaml/browser/dist/stringify/stringifyCollection.js
 function stringifyCollection(collection, ctx, options) {
 	return (ctx.inFlow ?? collection.flow ? stringifyFlowCollection : stringifyBlockCollection)(collection, ctx, options);
 }
@@ -1577,7 +1577,7 @@ function addCommentBefore({ indent, options: { commentString } }, lines, comment
 	}
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/YAMLMap.js
+//#region node_modules/yaml/browser/dist/nodes/YAMLMap.js
 function findPair(items, key) {
 	const k = isScalar$1(key) ? key.value : key;
 	for (const it of items) if (isPair(it)) {
@@ -1676,7 +1676,7 @@ var YAMLMap = class extends Collection {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/common/map.js
+//#region node_modules/yaml/browser/dist/schema/common/map.js
 const map = {
 	collection: "map",
 	default: true,
@@ -1689,7 +1689,7 @@ const map = {
 	createNode: (schema, obj, ctx) => YAMLMap.from(schema, obj, ctx)
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/nodes/YAMLSeq.js
+//#region node_modules/yaml/browser/dist/nodes/YAMLSeq.js
 var YAMLSeq = class extends Collection {
 	static get tagName() {
 		return "tag:yaml.org,2002:seq";
@@ -1786,7 +1786,7 @@ function asItemIndex(key) {
 	return typeof idx === "number" && Number.isInteger(idx) && idx >= 0 ? idx : null;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/common/seq.js
+//#region node_modules/yaml/browser/dist/schema/common/seq.js
 const seq = {
 	collection: "seq",
 	default: true,
@@ -1799,7 +1799,7 @@ const seq = {
 	createNode: (schema, obj, ctx) => YAMLSeq.from(schema, obj, ctx)
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/common/string.js
+//#region node_modules/yaml/browser/dist/schema/common/string.js
 const string = {
 	identify: (value) => typeof value === "string",
 	default: true,
@@ -1811,7 +1811,7 @@ const string = {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/common/null.js
+//#region node_modules/yaml/browser/dist/schema/common/null.js
 const nullTag = {
 	identify: (value) => value == null,
 	createNode: () => new Scalar(null),
@@ -1822,7 +1822,7 @@ const nullTag = {
 	stringify: ({ source }, ctx) => typeof source === "string" && nullTag.test.test(source) ? source : ctx.options.nullStr
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/core/bool.js
+//#region node_modules/yaml/browser/dist/schema/core/bool.js
 const boolTag = {
 	identify: (value) => typeof value === "boolean",
 	default: true,
@@ -1837,7 +1837,7 @@ const boolTag = {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringifyNumber.js
+//#region node_modules/yaml/browser/dist/stringify/stringifyNumber.js
 function stringifyNumber({ format, minFractionDigits, tag, value }) {
 	if (typeof value === "bigint") return String(value);
 	const num = typeof value === "number" ? value : Number(value);
@@ -1855,7 +1855,7 @@ function stringifyNumber({ format, minFractionDigits, tag, value }) {
 	return n;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/core/float.js
+//#region node_modules/yaml/browser/dist/schema/core/float.js
 const floatNaN$1 = {
 	identify: (value) => typeof value === "number",
 	default: true,
@@ -1890,7 +1890,7 @@ const float$1 = {
 	stringify: stringifyNumber
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/core/int.js
+//#region node_modules/yaml/browser/dist/schema/core/int.js
 const intIdentify$2 = (value) => typeof value === "bigint" || Number.isInteger(value);
 const intResolve$1 = (str, offset, radix, { intAsBigInt }) => intAsBigInt ? BigInt(str) : parseInt(str.substring(offset), radix);
 function intStringify$1(node, radix, prefix) {
@@ -1925,7 +1925,7 @@ const intHex$1 = {
 	stringify: (node) => intStringify$1(node, 16, "0x")
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/core/schema.js
+//#region node_modules/yaml/browser/dist/schema/core/schema.js
 const schema$2 = [
 	map,
 	seq,
@@ -1940,7 +1940,7 @@ const schema$2 = [
 	float$1
 ];
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/json/schema.js
+//#region node_modules/yaml/browser/dist/schema/json/schema.js
 function intIdentify$1(value) {
 	return typeof value === "bigint" || Number.isInteger(value);
 }
@@ -1997,7 +1997,7 @@ const schema$1 = [map, seq].concat(jsonScalars, {
 	}
 });
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/binary.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/binary.js
 const binary = {
 	identify: (value) => value instanceof Uint8Array,
 	default: false,
@@ -2046,7 +2046,7 @@ const binary = {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/pairs.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/pairs.js
 function resolvePairs(seq, onError) {
 	if (isSeq(seq)) for (let i = 0; i < seq.items.length; ++i) {
 		let item = seq.items[i];
@@ -2097,7 +2097,7 @@ const pairs = {
 	createNode: createPairs
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/omap.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/omap.js
 var YAMLOMap = class YAMLOMap extends YAMLSeq {
 	constructor() {
 		super();
@@ -2151,7 +2151,7 @@ const omap = {
 	createNode: (schema, iterable, ctx) => YAMLOMap.from(schema, iterable, ctx)
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/bool.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/bool.js
 function boolStringify({ value, source }, ctx) {
 	if (source && (value ? trueTag : falseTag).test.test(source)) return source;
 	return value ? ctx.options.trueStr : ctx.options.falseStr;
@@ -2173,7 +2173,7 @@ const falseTag = {
 	stringify: boolStringify
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/float.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/float.js
 const floatNaN = {
 	identify: (value) => typeof value === "number",
 	default: true,
@@ -2211,7 +2211,7 @@ const float = {
 	stringify: stringifyNumber
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/int.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/int.js
 const intIdentify = (value) => typeof value === "bigint" || Number.isInteger(value);
 function intResolve(str, offset, radix, { intAsBigInt }) {
 	const sign = str[0];
@@ -2279,7 +2279,7 @@ const intHex = {
 	stringify: (node) => intStringify(node, 16, "0x")
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/set.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/set.js
 var YAMLSet = class YAMLSet extends YAMLMap {
 	constructor(schema) {
 		super(schema);
@@ -2340,7 +2340,7 @@ const set = {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/timestamp.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/timestamp.js
 /** Internal types handle bigint as number, because TS can't figure it out. */
 function parseSexagesimal(str, asBigInt) {
 	const sign = str[0];
@@ -2417,7 +2417,7 @@ const timestamp = {
 	stringify: ({ value }) => value?.toISOString().replace(/(T00:00:00)?\.000Z$/, "") ?? ""
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/yaml-1.1/schema.js
+//#region node_modules/yaml/browser/dist/schema/yaml-1.1/schema.js
 const schema = [
 	map,
 	seq,
@@ -2442,7 +2442,7 @@ const schema = [
 	timestamp
 ];
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/tags.js
+//#region node_modules/yaml/browser/dist/schema/tags.js
 const schemas = new Map([
 	["core", schema$2],
 	["failsafe", [
@@ -2506,7 +2506,7 @@ function getTags(customTags, schemaName, addMergeTag) {
 	}, []);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/schema/Schema.js
+//#region node_modules/yaml/browser/dist/schema/Schema.js
 const sortMapEntriesByKey = (a, b) => a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
 var Schema = class Schema {
 	constructor({ compat, customTags, merge, resolveKnownTags, schema, sortMapEntries, toStringDefaults }) {
@@ -2527,7 +2527,7 @@ var Schema = class Schema {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/stringify/stringifyDocument.js
+//#region node_modules/yaml/browser/dist/stringify/stringifyDocument.js
 function stringifyDocument(doc, options) {
 	const lines = [];
 	let hasDirectives = options.directives === true;
@@ -2582,7 +2582,7 @@ function stringifyDocument(doc, options) {
 	return lines.join("\n") + "\n";
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/doc/Document.js
+//#region node_modules/yaml/browser/dist/doc/Document.js
 var Document = class Document {
 	constructor(value, replacer, options) {
 		/** A comment before this Document */
@@ -2847,7 +2847,7 @@ function assertCollection(contents) {
 	throw new Error("Expected a YAML collection as document contents");
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/errors.js
+//#region node_modules/yaml/browser/dist/errors.js
 var YAMLError = class extends Error {
 	constructor(name, pos, code, message) {
 		super();
@@ -2894,7 +2894,7 @@ const prettifyError = (src, lc) => (error) => {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-props.js
+//#region node_modules/yaml/browser/dist/compose/resolve-props.js
 function resolveProps(tokens, { flow, indicator, next, offset, onError, parentIndent, startOnNewline }) {
 	let spaceBefore = false;
 	let atNewline = startOnNewline;
@@ -2998,7 +2998,7 @@ function resolveProps(tokens, { flow, indicator, next, offset, onError, parentIn
 	};
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/util-contains-newline.js
+//#region node_modules/yaml/browser/dist/compose/util-contains-newline.js
 function containsNewline(key) {
 	if (!key) return null;
 	switch (key.type) {
@@ -3024,7 +3024,7 @@ function containsNewline(key) {
 	}
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/util-flow-indent-check.js
+//#region node_modules/yaml/browser/dist/compose/util-flow-indent-check.js
 function flowIndentCheck(indent, fc, onError) {
 	if (fc?.type === "flow-collection") {
 		const end = fc.end[0];
@@ -3032,7 +3032,7 @@ function flowIndentCheck(indent, fc, onError) {
 	}
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/util-map-includes.js
+//#region node_modules/yaml/browser/dist/compose/util-map-includes.js
 function mapIncludes(ctx, items, search) {
 	const { uniqueKeys } = ctx.options;
 	if (uniqueKeys === false) return false;
@@ -3040,7 +3040,7 @@ function mapIncludes(ctx, items, search) {
 	return items.some((pair) => isEqual(pair.key, search));
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-block-map.js
+//#region node_modules/yaml/browser/dist/compose/resolve-block-map.js
 const startColMsg = "All mapping items must start at the same column";
 function resolveBlockMap({ composeNode, composeEmptyNode }, ctx, bm, onError, tag) {
 	const map = new (tag?.nodeClass ?? YAMLMap)(ctx.schema);
@@ -3115,7 +3115,7 @@ function resolveBlockMap({ composeNode, composeEmptyNode }, ctx, bm, onError, ta
 	return map;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-block-seq.js
+//#region node_modules/yaml/browser/dist/compose/resolve-block-seq.js
 function resolveBlockSeq({ composeNode, composeEmptyNode }, ctx, bs, onError, tag) {
 	const seq = new (tag?.nodeClass ?? YAMLSeq)(ctx.schema);
 	if (ctx.atRoot) ctx.atRoot = false;
@@ -3151,7 +3151,7 @@ function resolveBlockSeq({ composeNode, composeEmptyNode }, ctx, bs, onError, ta
 	return seq;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-end.js
+//#region node_modules/yaml/browser/dist/compose/resolve-end.js
 function resolveEnd(end, offset, reqSpace, onError) {
 	let comment = "";
 	if (end) {
@@ -3186,7 +3186,7 @@ function resolveEnd(end, offset, reqSpace, onError) {
 	};
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-flow-collection.js
+//#region node_modules/yaml/browser/dist/compose/resolve-flow-collection.js
 const blockMsg = "Block collections are not allowed within flow collections";
 const isBlock = (token) => token && (token.type === "block-map" || token.type === "block-seq");
 function resolveFlowCollection({ composeNode, composeEmptyNode }, ctx, fc, onError, tag) {
@@ -3330,7 +3330,7 @@ function resolveFlowCollection({ composeNode, composeEmptyNode }, ctx, fc, onErr
 	return coll;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/compose-collection.js
+//#region node_modules/yaml/browser/dist/compose/compose-collection.js
 function resolveCollection(CN, ctx, token, onError, tagName, tag) {
 	const coll = token.type === "block-map" ? resolveBlockMap(CN, ctx, token, onError, tag) : token.type === "block-seq" ? resolveBlockSeq(CN, ctx, token, onError, tag) : resolveFlowCollection(CN, ctx, token, onError, tag);
 	const Coll = coll.constructor;
@@ -3372,7 +3372,7 @@ function composeCollection(CN, ctx, token, props, onError) {
 	return node;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-block-scalar.js
+//#region node_modules/yaml/browser/dist/compose/resolve-block-scalar.js
 function resolveBlockScalar(ctx, scalar, onError) {
 	const start = scalar.offset;
 	const header = parseBlockScalarHeader(scalar, ctx.options.strict, onError);
@@ -3544,7 +3544,7 @@ function splitLines(source) {
 	return lines;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/resolve-flow-scalar.js
+//#region node_modules/yaml/browser/dist/compose/resolve-flow-scalar.js
 function resolveFlowScalar(scalar, strict, onError) {
 	const { offset, type, source, end } = scalar;
 	let _type;
@@ -3744,7 +3744,7 @@ function parseCharCode(source, offset, length, onError) {
 	}
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/compose-scalar.js
+//#region node_modules/yaml/browser/dist/compose/compose-scalar.js
 function composeScalar(ctx, token, tagToken, onError) {
 	const { value, type, comment, range } = token.type === "block-scalar" ? resolveBlockScalar(ctx, token, onError) : resolveFlowScalar(token, ctx.options.strict, onError);
 	const tagName = tagToken ? ctx.directives.tagName(tagToken.source, (msg) => onError(tagToken, "TAG_RESOLVE_FAILED", msg)) : null;
@@ -3796,7 +3796,7 @@ function findScalarTagByTest({ atKey, directives, schema }, value, token, onErro
 	return tag;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/util-empty-scalar-position.js
+//#region node_modules/yaml/browser/dist/compose/util-empty-scalar-position.js
 function emptyScalarPosition(offset, before, pos) {
 	if (before) {
 		pos ?? (pos = before.length);
@@ -3820,7 +3820,7 @@ function emptyScalarPosition(offset, before, pos) {
 	return offset;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/compose-node.js
+//#region node_modules/yaml/browser/dist/compose/compose-node.js
 const CN = {
 	composeNode,
 	composeEmptyNode
@@ -3898,7 +3898,7 @@ function composeAlias({ options }, { offset, source, end }, onError) {
 	return alias;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/compose-doc.js
+//#region node_modules/yaml/browser/dist/compose/compose-doc.js
 function composeDoc(options, directives, { offset, start, value, end }, onError) {
 	const doc = new Document(void 0, Object.assign({ _directives: directives }, options));
 	const ctx = {
@@ -3932,7 +3932,7 @@ function composeDoc(options, directives, { offset, start, value, end }, onError)
 	return doc;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/compose/composer.js
+//#region node_modules/yaml/browser/dist/compose/composer.js
 function getErrorPos(src) {
 	if (typeof src === "number") return [src, src + 1];
 	if (Array.isArray(src)) return src.length === 2 ? src : [src[0], src[1]];
@@ -4118,7 +4118,7 @@ var Composer = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/cst-scalar.js
+//#region node_modules/yaml/browser/dist/parse/cst-scalar.js
 function resolveAsScalar(token, strict = true, onError) {
 	if (token) {
 		const _onError = (pos, code, message) => {
@@ -4376,7 +4376,7 @@ function setFlowScalarValue(token, source, type) {
 	}
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/cst-stringify.js
+//#region node_modules/yaml/browser/dist/parse/cst-stringify.js
 /**
 * Stringify a CST document, token, or collection item
 *
@@ -4424,7 +4424,7 @@ function stringifyItem({ start, key, sep, value }) {
 	return res;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/cst-visit.js
+//#region node_modules/yaml/browser/dist/parse/cst-visit.js
 const BREAK = Symbol("break visit");
 const SKIP = Symbol("skip children");
 const REMOVE = Symbol("remove item");
@@ -4512,7 +4512,7 @@ function _visit(path, item, visitor) {
 	return typeof ctrl === "function" ? ctrl(item, path) : ctrl;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/cst.js
+//#region node_modules/yaml/browser/dist/parse/cst.js
 var cst_exports = /* @__PURE__ */ __exportAll({
 	BOM: () => "﻿",
 	DOCUMENT: () => "",
@@ -4580,7 +4580,7 @@ function tokenType(source) {
 	return null;
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/lexer.js
+//#region node_modules/yaml/browser/dist/parse/lexer.js
 function isEmpty(ch) {
 	switch (ch) {
 		case void 0:
@@ -5107,7 +5107,7 @@ var Lexer = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/line-counter.js
+//#region node_modules/yaml/browser/dist/parse/line-counter.js
 /**
 * Tracks newlines during parsing in order to provide an efficient API for
 * determining the one-indexed `{ line, col }` position for any offset
@@ -5151,7 +5151,7 @@ var LineCounter = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/parse/parser.js
+//#region node_modules/yaml/browser/dist/parse/parser.js
 function includesToken(list, type) {
 	for (let i = 0; i < list.length; ++i) if (list[i].type === type) return true;
 	return false;
@@ -6007,7 +6007,7 @@ var Parser = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/dist/public-api.js
+//#region node_modules/yaml/browser/dist/public-api.js
 function parseOptions(options) {
 	const prettyErrors = options.prettyErrors !== false;
 	return {
@@ -6081,7 +6081,7 @@ function stringify(value, replacer, options) {
 	return new Document(value, _replacer, options).toString(options);
 }
 //#endregion
-//#region ../../work/webPORPID/node_modules/yaml/browser/index.js
+//#region node_modules/yaml/browser/index.js
 var browser_default = /* @__PURE__ */ __exportAll({
 	Alias: () => Alias,
 	CST: () => cst_exports,

@@ -49,7 +49,7 @@ var Event = class {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@bjorn3/browser_wasi_shim/dist/debug.js
+//#region node_modules/@bjorn3/browser_wasi_shim/dist/debug.js
 let Debug = class Debug {
 	enable(enabled) {
 		this.log = createLogger(enabled === void 0 ? true : enabled, this.prefix);
@@ -69,7 +69,7 @@ function createLogger(enabled, prefix) {
 }
 const debug = new Debug(false);
 //#endregion
-//#region ../../work/webPORPID/node_modules/@bjorn3/browser_wasi_shim/dist/wasi.js
+//#region node_modules/@bjorn3/browser_wasi_shim/dist/wasi.js
 var WASIProcExit = class extends Error {
 	constructor(code) {
 		super("exit with exit code " + code);
@@ -543,7 +543,7 @@ let WASI = class WASI {
 	}
 };
 //#endregion
-//#region ../../work/webPORPID/node_modules/@bjorn3/browser_wasi_shim/dist/fd.js
+//#region node_modules/@bjorn3/browser_wasi_shim/dist/fd.js
 var Inode = class Inode {
 	static issue_ino() {
 		return Inode.next_ino++;

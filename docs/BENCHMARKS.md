@@ -2,6 +2,12 @@
 
 This benchmark uses the corrected six-sample simulated dataset supplied for the 2026-08-27 validation. The biological strings were treated as opaque fixtures: the comparison reads pipeline outputs and aggregate counts, not sequence content. The run contained 59,695 FASTQ records, 59,432 demultiplexed reads, 3,454 observed UMI families, and 3,043 consensus calls.
 
+## Version 0.3.7 contamination stress check
+
+A separate in-memory fixture was generated locally from 12 random 600-base founders, bounded substitutions, six samples, 6,000 consensus families, and 80 panel references. It contains no uploaded data. On Node 24 in the same process environment, the 0.3.6 contamination implementation took 55.667 s and the final 0.3.7 implementation took 3.920 s (14.2× faster). The complete, sorted contamination-call JSON—including cluster/panel label, discard/suspect decision, and floating distance—was identical. A second 320-family differential containing IUPAC and unknown symbols also matched every call and distance exactly.
+
+This is a focused algorithm stress check rather than an end-to-end prediction for every run. Speedup depends on sample count, sequence length, and the number/occupancy of DP-means clusters; the temporary inverted index has a fixed posting cap and deliberately falls back to the exact sparse scan instead of growing without bound.
+
 ## Measurement interpretation
 
 - Julia 1.10.5 ran the supplied local nanopore pipeline through Snakemake with five cores. No online PORPIDpipeline source was used.

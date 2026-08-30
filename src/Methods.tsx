@@ -1,0 +1,168 @@
+import packageInformation from "../package.json";
+
+export type MethodsPage = "index" | "preprocessing" | "consensus" | "downstream";
+
+const pageLinks = [
+  ["methods.html", "Methods index"],
+  ["methods-preprocessing.html", "Reads + UMI grouping"],
+  ["methods-consensus.html", "Family consensus"],
+  ["methods-downstream.html", "Filtering + phylogeny"],
+] as const;
+
+function Header({ page }: { page: MethodsPage }) {
+  return <><header className="site-header methods-site-header"><a className="brand" href="./" aria-label="webPORPID home"><span className="brand-mark">wp</span><span>webPORPID<small>Nanopore &amp; PacBio analysis</small></span></a><div className="site-header-right"><nav><a href="./">Run</a><a className="active" href="./methods.html">Methods</a><a href="https://github.com/MurrellGroup/webPORPID">GitHub</a></nav><span className="app-version">v{packageInformation.version}</span></div></header><nav className="methods-page-nav" aria-label="Methods pages">{pageLinks.map(([href, label], index) => <a className={(page === "index" ? index === 0 : page === "preprocessing" ? index === 1 : page === "consensus" ? index === 2 : index === 3) ? "active" : ""} href={`./${href}`} key={href}>{label}</a>)}</nav></>;
+}
+
+function Footer() { return <footer className="site-footer"><span>webPORPID · detailed computational methods</span><a href="./">Return to analysis</a></footer>; }
+
+function Section({ id, kicker, title, lead, children }: { id: string; kicker: string; title: string; lead: string; children: React.ReactNode }) {
+  return <section className="methods-section" id={id}><header><span className="section-kicker">{kicker}</span><h2>{title}</h2><p>{lead}</p></header><div className="methods-copy">{children}</div><a className="methods-top" href="#methods-top">Back to page contents ↑</a></section>;
+}
+
+function Equation({ children }: { children: React.ReactNode }) { return <div className="method-equation">{children}</div>; }
+function ParameterTable({ rows }: { rows: Array<[string, string, string]> }) {
+  return <div className="method-table-wrap"><table><thead><tr><th>Parameter</th><th>Decision point</th><th>Boundary</th></tr></thead><tbody>{rows.map(([parameter, point, boundary]) => <tr key={parameter}><td><code>{parameter}</code></td><td>{point}</td><td>{boundary}</td></tr>)}</tbody></table></div>;
+}
+
+function IndexPage() {
+  return <><Header page="index" /><main className="methods-main methods-index" id="methods-top"><section className="methods-hero"><span className="section-kicker">Computational methods</span><h1>What webPORPID computes, and exactly where each decision enters.</h1><p>These pages document the algorithms, thresholds, data representations, ordering rules, resumable-stage semantics, and intentional implementation differences. Links beside controls and result sections jump directly to the relevant method.</p></section><section className="methods-directory">
+    <a href="./methods-preprocessing.html"><span>01</span><h2>Reads + UMI grouping</h2><p>Streaming FASTQ/GZIP, disk-backed partitioning, expected-error and length filters, bidirectional primer matching, sample/UMI extraction, deterministic subsampling, and the two-edit offspring model.</p><strong>Open page →</strong></a>
+    <a href="./methods-consensus.html"><span>02</span><h2>Family consensus</h2><p>Heteroduplex detection, six-mer centroid selection, seeded high-indel alignment, iterative block refinement, terminal extension, primer trimming, and minimum-agreement statistics.</p><strong>Open page →</strong></a>
+    <a href="./methods-downstream.html"><span>03</span><h2>Filtering + phylogeny</h2><p>Run-derived contamination databases, artefact/agreement gates, profile-to-panel extraction, functional filtering, APOBEC summaries, haplotype collapse, MSA, FastTree, and exports.</p><strong>Open page →</strong></a>
+  </section><section className="methods-principles"><article><h3>Units remain explicit</h3><p>Raw-read counts, UMI-family counts, consensus-family decisions, and collapsed haplotype multiplicities are stored separately. Collapse multiplicity is the number of UMI families, never the number of reads.</p></article><article><h3>Optional means bypassable</h3><p>Contamination can be deferred or skipped without blocking valid downstream work. In that case every consensus passes that gate, the stored output is labelled unfiltered, and an empty contamination table is never reported as a negative result.</p></article><article><h3>Originals are immutable</h3><p>Interactive alignment edits are stored as separate copies with fingerprints and an audit trail. Tree recomputation uses the active copy; pipeline-generated alignments and consensus calls remain preserved.</p></article></section></main><Footer /></>;
+}
+
+function PreprocessingPage() {
+  return <><Header page="preprocessing" /><main className="methods-main" id="methods-top"><section className="methods-hero compact"><span className="section-kicker">Methods · page 1 of 3</span><h1>Streaming reads, demultiplexing, and probabilistic UMI grouping</h1><p>The complete path from compressed FASTQ bytes to a globally classified set of UMI families.</p></section><nav className="methods-toc"><a href="#streaming-storage">Streaming + scratch</a><a href="#read-filtering">Read filters</a><a href="#demultiplexing">Primer + sample assignment</a><a href="#subsampling">Subsampling</a><a href="#umi-offspring">UMI offspring model</a></nav>
+
+  <Section id="streaming-storage" kicker="Input architecture" title="Streaming decompression and bounded working storage" lead="Raw reads are never loaded as one decompressed object and are never stored in the results file.">
+    <p><code>.fastq.gz</code> input is decompressed incrementally. The parser carries only an incomplete terminal record between chunks, validates the four-line FASTQ framing, and checks that sequence and quality lengths agree before a batch enters the WASM core. Malformed records are counted separately.</p>
+    <ol><li>Passing demultiplexed reads are encoded as length-framed binary spool records containing sample index, UMI, name, oriented sequence, quality, and deterministic sampling hash.</li><li>The stable hash of <code>(sample, UMI)</code> selects one of <code>spoolPartitions</code> partitions. This keeps every family together while allowing different partitions to be processed independently.</li><li>A first partition pass counts sample totals and establishes deterministic subsampling cutoffs. A second pass materializes only selected records, counts UMI families, and fits the global offspring model.</li><li>Partitions are then revisited for consensus calling and deleted. Only post-consensus records continue downstream.</li></ol>
+    <p><strong>External scratch directory</strong> is the browser default when the File System Access API is available. Writes go to ordinary user-selected disk files rather than origin-scoped browser storage. Automatic OPFS remains selectable. Both paths retry short writes and validate complete spool frames.</p>
+    <aside>Memory is bounded by input chunk size, active worker batches, UMI count tables, and one selected partition per consensus worker—not by decompressed FASTQ size.</aside>
+  </Section>
+
+  <Section id="read-filtering" kicker="Preprocessing" title="FASTQ integrity, expected-error, and length gates" lead="Filters are applied before primer matching, in a fixed order with explicit strict boundaries.">
+    <p>For each Phred character <code>Q</code>, the implied error probability is <code>10^(−Q/10)</code>. The read statistic is the arithmetic mean across quality positions:</p>
+    <Equation><code>meanError = (1/L) Σᵢ 10^(−Qᵢ/10)</code></Equation>
+    <p>A read passes the quality gate only when <code>meanError &lt; errorRate</code>. It then passes length only when <code>minLength &lt; L &lt; maxLength</code>; equality to either boundary is rejected. <code>qualityReads</code> counts reads that have passed all three tests, not merely the Phred test.</p>
+    <ParameterTable rows={[["errorRate", "Mean per-base error probability", "reject when ≥ threshold"], ["minLength", "Raw read length", "reject when ≤ threshold"], ["maxLength", "Raw read length", "reject when ≥ threshold"]]} />
+  </Section>
+
+  <Section id="demultiplexing" kicker="Preprocessing" title="Orientation, primer matching, sample ID, and barcode/primer-boundary alignment" lead="The cDNA-primer notation encodes conserved sequence, sample identity, UMI positions, and downstream fixed sequence.">
+    <p>The maximal second-strand primer groups samples that share nested primer strings. For each group, the read is tested in forward and reverse-complement orientation. Primer searches are semi-global Levenshtein dynamic programs over the configured terminal windows with IUPAC compatibility. Repeated matches follow non-overlapping “find first, resume after hit” behavior and the last acceptable hit is retained. Both terminal primers must be present and non-crossing.</p>
+    <p>After orientation and primer trimming, the sequence is reverse-complemented into the cDNA/UMI-side orientation. The first contiguous lowercase run in <code>cDNA_primer</code> defines the sample ID. It must occur exactly within the first ten bases of the trimmed read.</p>
+    <p>The remaining template consists of that fixed sample ID, every <code>N</code> UMI position, fixed post-UMI bases, and a terminal repeat-any state. A full dynamic program uses log weights <code>insertion = deletion = log(0.01)</code>, <code>barcode = log(0.25)</code>, <code>fixed match = log(0.999)</code>, and <code>fixed mismatch = log(0.000333…)</code>. Its traceback extracts inserted bases adjacent to barcode states and counts fixed mismatches, insertions, and deletions. More than four errors enters the aggregate <code>BPB-rejects</code> read bucket.</p>
+    <ParameterTable rows={[["primerWindow", "Bases searched at each read end", "terminal window; minimum 16"], ["primerTolerance", "Primer edit distance", "accept when ≤ tolerance"], ["primerChop", "Leading primer bases omitted from matching", "must be shorter than each primer"]]} />
+  </Section>
+
+  <Section id="subsampling" kicker="Selection" title="Deterministic, sample-specific read subsampling" lead="Subsampling is performed after demultiplexing and before UMI counts are fitted.">
+    <p>When a sample has <code>N ≤ maxReadsPerSample</code>, every read is retained. Otherwise the intended Bernoulli inclusion probability is <code>p = maxReadsPerSample/N</code>. webPORPID maps a stable 64-bit hash of the deterministic seed, sample index, read ordinal, and UMI to the unit interval and retains hashes below the corresponding threshold. This preserves the configured inclusion probability while making the exact subset independent of worker scheduling.</p>
+    <p>The browser spool can discard records above the final cutoff before consensus materialization. With <code>maxReadsPerSample = 0</code>, downsampling is disabled and every demultiplexed read survives until the global UMI model and consensus pass; external scratch is therefore recommended.</p>
+  </Section>
+
+  <Section id="umi-offspring" kicker="Molecular grouping" title="Sparse two-edit UMI offspring model and LDA update" lead="Observed strings are classified as candidate real UMIs or likely error-derived offspring before family consensus is attempted.">
+    <p>For each sample, exact observed UMI counts are merged across spool partitions. A sparse likelihood row is built only for observed candidate parents reachable within two insertion, deletion, or substitution events. One-event weights use total error <code>e = 0.005</code>: insertion <code>0.4e/4</code>, deletion <code>0.4e</code>, and substitution <code>0.2e/3</code>. Identity has probability <code>(1−e)^L</code>. Two-event probabilities sum over generated intermediate strings; duplicate paths are accumulated.</p>
+    <p>Let <code>P(o|r)</code> be this sparse likelihood and <code>πᵣ</code> the current real-UMI mixture. Starting uniformly, each iteration apportions observed count <code>nₒ</code> across reachable parents and applies a symmetric Dirichlet concentration of 0.5:</p>
+    <Equation><code>E[Nᵣ] = Σₒ nₒ · πᵣP(o|r) / ΣⱼπⱼP(o|j)</code><br /><code>πᵣ ← (E[Nᵣ] + 0.5) / Σⱼ(E[Nⱼ] + 0.5)</code></Equation>
+    <p>Iterations stop after convergence at <code>|Δπ| &lt; 10⁻¹⁷/K</code> or 1,000 updates. Each observed UMI is assigned to the maximum posterior parent and stores that normalized posterior probability. Decisions then occur in order: posterior below <code>ldaThreshold</code>, UMI length not eight, and family size below the effective threshold. A later heteroduplex check can supersede an initially accepted decision.</p>
+    <ParameterTable rows={[["ldaThreshold", "Posterior probability of most likely parent", "reject when < threshold"], ["familySizeThreshold", "Selected reads in observed UMI family", "reject when < effective threshold"], ["deterministicSeed", "Subsampling identity", "stored as an unsigned integer"]]} />
+  </Section>
+  <div className="methods-next"><a href="./methods-consensus.html">Next: family consensus →</a></div></main><Footer /></>;
+}
+
+function ConsensusPage() {
+  return <><Header page="consensus" /><main className="methods-main" id="methods-top"><section className="methods-hero compact"><span className="section-kicker">Methods · page 2 of 3</span><h1>Heteroduplex control and indel-tolerant family consensus</h1><p>Consensus is called independently within each accepted UMI family without assuming low insertion/deletion rates.</p></section><nav className="methods-toc"><a href="#heteroduplex">Heteroduplex test</a><a href="#family-consensus">Consensus refinement</a><a href="#seeded-alignment">Seeded alignment</a><a href="#agreement">Agreement + low sites</a><a href="#primer-trimming">Primer trimming</a></nav>
+
+  <Section id="heteroduplex" kicker="Family QC" title="Quality-profile heteroduplex test" lead="The test detects families whose UMI positions have anomalously poor base quality relative to downstream template positions.">
+    <p>Families with any read shorter than 50 quality positions are not called heteroduplex by this test. Otherwise, Phred scores are averaged position-wise over the first 50 bases. The UMI interval is located from the lowercase sample-ID length and contiguous <code>N</code> run in <code>cDNA_primer</code>; the comparison interval is 21 positions beginning four bases after the UMI.</p>
+    <p>The family is rejected only if all three conditions hold: mean UMI quality is lower than mean downstream quality; a pooled two-sample t-test gives <code>p &lt; 1/(5n²)</code> for family size <code>n</code>; and the minimum UMI-position mean is less than half the downstream mean. The t probability is evaluated through the regularized incomplete beta function.</p>
+  </Section>
+
+  <Section id="family-consensus" kicker="Consensus" title="Centroid initialization and three deterministic refinement passes" lead="Every accepted family retains read order by original FASTQ ordinal before consensus work begins.">
+    <p>For one read, or for a byte-identical family, that sequence is returned directly with minimum agreement 1. Otherwise, each read becomes a raw six-mer count vector. The initial reference is the <em>observed read</em> minimizing summed squared six-mer distance to the family—not an artificial per-column sequence.</p>
+    <p>Each of up to three passes aligns all reads to the current candidate. Adjacent candidate positions are considered well supported when at least 70% of reads contribute exactly those two candidate bases through the mapped interval. Contiguous poorly supported blocks are replaced by the modal ungapped read substring spanning the block. Sequence beyond the mapped candidate ends is separately extended while a strict majority of reads still contributes extension, with iterative realignment and modal-string selection.</p>
+    <p>Refinement stops at a fixed point. Because another identical deterministic pass cannot alter the candidate, the last alignments are reused for agreement calculation.</p>
+  </Section>
+
+  <Section id="seeded-alignment" kicker="Alignment kernel" title="Exact seeds, adaptive bands, and full-matrix fallback" lead="The pairwise kernel accelerates long, indel-rich reads without converting consensus into an edit-distance heuristic.">
+    <p>Canonical 30-base words are encoded collision-free in rolling two-bit integers. A word anchors an interval only when it is unique and collinear in both sequences. Seeded intervals are globally aligned with the configured scoring and terminal-gap behavior.</p>
+    <p>When no consistent seed exists, the band covers the complete terminal length difference plus a square-root noise allowance. If the endpoint is unreachable, the implementation falls back to the full dynamic-programming matrix. Thus large indels and seedless regions remain alignable; the band is an execution optimization, not a rejection criterion.</p>
+    <aside>Seed placement can alter which equally scoring gap arrangement is returned in repetitive sequence. It does not skip bases or substitute a low-indel model.</aside>
+  </Section>
+
+  <Section id="agreement" kicker="Consensus QC" title="Per-position agreement, minimum agreement, and low-site metadata" lead="Agreement is calculated against the final candidate from fresh seeded alignments unless fixed-point alignments can be reused exactly.">
+    <p>For each candidate position, a read contributes the uppercase base mapped to that reference position, or a gap/empty observation. Agreement is the fraction of all family reads whose non-gap mapped base equals the candidate base. Modal observations are counted separately with first-observed tie behavior.</p>
+    <p>The family <code>minimumAgreement</code> is the minimum agreement across interior candidate positions only (first and last excluded), rounded to two decimals. Every position whose rounded agreement is at or below that minimum and whose modal observation is non-gap is logged. The stored coordinate is one-based from the 3′ end, and the stored modal base is complemented into final output orientation. Its homopolymer run length is calculated on the modal-observation string.</p>
+    <p>This statistic remains a UMI-family property. When identical consensuses are later collapsed, it is not synthesized, averaged, minimized, or attached to the haplotype.</p>
+  </Section>
+
+  <Section id="primer-trimming" kicker="Output orientation" title="IUPAC-aware primer removal and final reverse complement" lead="The family candidate still begins in the cDNA/UMI-side orientation when refinement finishes.">
+    <p>If the expected primer remainder is directly compatible—where <code>N</code> matches any base—it is removed by length. Otherwise, the primer is globally aligned to a bounded candidate prefix with high internal-gap penalties, half-cost terminal gaps, and IUPAC-compatible substitutions. Candidate bases consumed through the last non-gap primer position are removed. The remaining consensus is reverse-complemented into reported orientation, and low-site coordinates/bases follow the same orientation convention.</p>
+  </Section>
+  <div className="methods-next"><a href="./methods-preprocessing.html">← Previous: reads + UMI grouping</a><a href="./methods-downstream.html">Next: downstream analysis →</a></div></main><Footer /></>;
+}
+
+function DownstreamPage() {
+  return <><Header page="downstream" /><main className="methods-main" id="methods-top"><section className="methods-hero compact"><span className="section-kicker">Methods · page 3 of 3</span><h1>Contamination, downstream filters, collapse, alignment, and phylogeny</h1><p>All operations after the stored UMI-family consensus calls, including explicit behavior when optional stages are bypassed.</p></section><nav className="methods-toc"><a href="#optional-stages">Optional stages</a><a href="#contamination">Contamination</a><a href="#artefact-agreement">Artefact + agreement</a><a href="#panel-filter">Panel filter</a><a href="#functional-filter">Functional filter</a><a href="#apobec">APOBEC</a><a href="#collapse">Collapse</a><a href="#alignment-phylogeny">Alignment + tree</a><a href="#results-file">Results file</a></nav>
+
+  <Section id="optional-stages" kicker="Control flow" title="Deferred and live-skipped stages" lead="A stage is bypassed when its output is not scientifically required for the next requested calculation.">
+    <p>Contamination classification is an optional side gate on consensus records. If it is deferred or skipped while running, its partial calls are discarded, zero consensuses are excluded as contamination, and post-processing continues when requested. The project records <code>postprocessingContaminationMode = bypassed</code>; tables and logs label downstream outputs as unfiltered. Computing contamination later does not silently rewrite those outputs. A separate explicit recomputation applies the new decisions and invalidates alignments and trees derived from the unfiltered set.</p>
+    <p>Post-processing itself is a true prerequisite for collapse because it creates the retained nucleotide alignment. Collapse is a true prerequisite for the default collapsed phylogeny. Skipping either leaves its dependants deferred. Uncollapsed and functional trees remain available interactively whenever their corresponding post-processing alignments exist.</p>
+  </Section>
+
+  <Section id="contamination" kicker="Run-wide filter" title="DP-means six-mer databases and self/non-self decision rule" lead="Each sequence is compared with run-derived sample signatures and the supplied external contamination panel.">
+    <p>Gaps are removed and ambiguous IUPAC bases are resolved with a stable sequence-derived xorshift generator. A sequence becomes a 4,096-bin raw six-mer count vector <code>x</code>. The distance used throughout is:</p>
+    <Equation><code>d(x,y) = ||x−y||² / [6 · (Σx + Σy)]</code></Equation>
+    <p>Within each sample, DP-means starts at the first vector. Points are assigned to their closest current center; a new center is created when the closest distance is strictly greater than <code>contaminationClusterThreshold</code>. Centers are arithmetic count-vector means. Assignment/mean updates run for at most 30 iterations and stop when no assignment changes.</p>
+    <p>Every cluster enters the <em>suspect</em> database. A cluster enters the <em>primary</em> database only when its sample proportion is strictly greater than <code>contaminationProportionThreshold</code>. Each sample’s all-sequence mean enters both databases. The external panel is appended after run-derived entries, preserving equal-distance label order.</p>
+    <p>For a query, the closest non-self primary entry is reported only when its distance is strictly below <code>contaminationDistanceThreshold</code>. It is discarded only when no same-sample primary entry lies at or below that threshold. If there is no primary call, the wider suspect database can produce a reported-but-retained suspect call. Exactly one decision per family is stored.</p>
+    <h3>Performance-preserving implementation</h3><p>IUPAC resolution and six-mer counting are fused; only observed bins are sorted and materialized. Unambiguous signatures are reused between clustering and classification. Typed assignment buffers replace string snapshots. Exact inverted six-mer posting indexes accumulate every candidate dot product by visiting only shared bins; the same index is rebuilt in bounded increments as DP-means centers grow. A temporary-posting cap bounds memory and falls back to the sparse exact scan on an exceptionally fragmented run. A reverse-triangle norm bound also skips a fallback candidate only when it cannot mathematically beat the current exact distance. Database order, first-tie behavior, strict inequalities, means, labels, and calls are unchanged. Cooperative yields are triggered by elapsed CPU time rather than every fixed handful of records, keeping Skip responsive without tens of thousands of timer callbacks.</p>
+    <ParameterTable rows={[["contaminationClusterThreshold", "Create a new DP-means center", "new center when nearest > threshold"], ["contaminationProportionThreshold", "Include cluster in primary database", "include when proportion > threshold"], ["contaminationDistanceThreshold", "Report nearest non-self", "report when distance < threshold"]]} />
+  </Section>
+
+  <Section id="artefact-agreement" kicker="Post-processing gates" title="Family-abundance artefact cutoff and minimum agreement" lead="The two gates are independent and their rejection reasons can overlap.">
+    <p>For each sample, contamination-discarded families are excluded from the family-size distribution when contamination was applied. The effective artefact cutoff is:</p>
+    <Equation><code>ceil[ quantile(familySize, outlierQuantile) · artefactFraction ]</code></Equation>
+    <p>A family passes abundance when <code>familySize ≥ cutoff</code> and agreement when <code>minimumAgreement ≥ agreementThreshold</code>. Per-sample overrides replace the corresponding run-wide value. Only families passing abundance, agreement, and any applied contamination gate enter reference-panel alignment.</p>
+  </Section>
+
+  <Section id="panel-filter" kicker="Reference extraction" title="Candidate MSA, panel-profile alignment, and maximum-subarray score" lead="The supplied panel is treated as an existing reference alignment rather than independently realigned sequences.">
+    <p>Preliminary candidates are jointly nucleotide-aligned. The aligned candidate profile is then affine-gap aligned against the aligned panel profile using the ported profile-column costs, gap-open/extension values, and deterministic traceback priorities. Candidate residues projected onto the panel coordinate interval are extracted.</p>
+    <p>At each projected position, the panel-derived probability of the observed candidate symbol is converted to an indel-ignoring mismatch contribution. A maximum-subarray calculation identifies the worst local divergence segment. The resulting <code>panelScore</code> passes only when it is strictly less than <code>panelThreshold</code>.</p>
+  </Section>
+
+  <Section id="functional-filter" kicker="Coding-sequence filter" title="Joint amino-acid alignment with codon-preserving backtranslation" lead="The functional alignment is anchored and clipped to the supplied functional reference endpoints.">
+    <p>Sequences containing symbols outside A/C/G/T receive <code>ambiguousSymbols-reject</code>. Otherwise the longest start-to-stop ORF across three frames is selected; if none exists, the maximal complete-codon prefix is used. The functional reference and all eligible candidate ORFs are translated and jointly aligned as amino acids. Every amino-acid gap is projected back as exactly <code>---</code>, so alignment cannot introduce a one- or two-base frameshift.</p>
+    <p>The nucleotide alignment is sliced from the first through last non-gap nucleotide of the functional reference. Query-only terminal sequence is excluded from exports and tree inference. The filter reports late start, missing/early terminal coverage, and reference-match rejection categories. Reference match is exact aligned nucleotide identity divided by the clipped reference-alignment width, rounded to three significant digits and compared with <code>functionalMatchThreshold</code>.</p>
+  </Section>
+
+  <Section id="apobec" kicker="Annotation" title="Four-state substitution model and APOBEC posterior" lead="APOBEC values are annotations and visual encodings, not filtering gates.">
+    <p>The modal retained alignment sequence is compared with each aligned family sequence to form a 4×4 substitution-count matrix, ignoring gaps and ambiguous symbols. A continuous-time four-state rate matrix uses transition/transversion structure and a separate G→A multiplier. The posterior is evaluated on a grid of log mutation rate <code>t ∈ [−12,−1]</code> and log multiplier <code>ga ∈ [−1,5]</code>. Matrix exponentials use scaling-and-squaring with a 24-term series.</p>
+    <p>The prior is Normal(−5,1) on <code>t</code> and a 0.99·Normal(0,0.1)+0.01·Normal(0,1) mixture on <code>ga</code>. Stored outputs include posterior mean mutation rate, posterior geometric G→A multiplier, and posterior probability that <code>ga &gt; 0</code>.</p>
+  </Section>
+
+  <Section id="collapse" kicker="Haplotype reduction" title="Exact nucleotide haplotypes with UMI-family multiplicity" lead="Collapse removes redundant family consensuses without converting family metadata into haplotype metadata.">
+    <p>Retained aligned nucleotide rows are degapped and grouped by exact nucleotide content. The first row in each group is the representative and retains its aligned gap placement. <code>familyCount</code> is exactly the number of member consensus rows—one per accepted UMI family. Original read-family sizes never contribute to this count.</p>
+    <p><code>minimumAgreement</code> is not assigned to a collapsed node because it is defined for a UMI family, not a nucleotide haplotype. Family-level agreement remains available in the uncollapsed viewer and exports. Tree bubble radius is proportional to <code>√familyCount</code>, so rendered area is exactly linear in family count; the user scale slider multiplies area without clipping or min/max remapping.</p>
+  </Section>
+
+  <Section id="alignment-phylogeny" kicker="Exploration" title="MSA, double-precision FastTree, rooting, and mutation mapping" lead="Collapsed, uncollapsed, and functional alignments are separate inspectable analysis variants.">
+    <p>Below the configured large-alignment threshold, sequences are processed in one packaged POA MSA. Larger inputs use shared-anchor batches to bound working memory while preserving row order and every ungapped residue. Nucleotide phylogenies are inferred by the locally packaged double-precision FastTree build. No runtime dependency on an external service or Swig remains.</p>
+    <p>Collapsed trees are automatically rooted on a zero-length branch immediately above the modal haplotype. Midpoint rooting is available and preserves every pairwise patristic distance. Branch mutations are recomputed by deterministic Fitch-style parsimony whenever the active alignment changes. Reference-region display maps requested one-based nucleotide or amino-acid coordinates through the active gapped reference row.</p>
+    <p>Alivibe receives the exact active nucleotide FASTA. Returned edits may substitute bases, move gaps, add or remove rows, or change row order after an explicit warning. Fingerprints, row/base change summaries, source, time, and tree staleness are stored separately; recalculating a tree is always an explicit action.</p>
+  </Section>
+
+  <Section id="results-file" kicker="Persistence" title="Versioned project file, validation, and exports" lead="The project begins at consensus calls and excludes raw reads and temporary spool data.">
+    <p>The <code>.webporpid</code> file contains configuration, exact input-slot mappings, preprocessing/family/consensus statistics, consensus sequences, optional-stage states, contamination calls, post-processing records, alignments, trees, collapse membership, retained small reference sequences, edit copies, audit history, timings, and logs. It is schema-validated, MessagePack encoded, gzip compressed, and prefixed by a versioned magic header.</p>
+    <p>Stage-aware validation distinguishes an uncomputed contamination check from a negative check and permits downstream records explicitly marked as contamination-bypassed. It still requires post-processing before collapse and collapse before the default tree. FASTA/CSV/Newick component downloads derive from the validated bundle. “Export all” adds every per-sample component plus cross-sample summary, parameters, stage status, timing, mappings, and provenance tables to one <code>.tar.gz</code>.</p>
+  </Section>
+  <div className="methods-next"><a href="./methods-consensus.html">← Previous: family consensus</a><a href="./">Return to webPORPID →</a></div></main><Footer /></>;
+}
+
+export function Methods({ page }: { page: MethodsPage }) {
+  if (page === "preprocessing") return <PreprocessingPage />;
+  if (page === "consensus") return <ConsensusPage />;
+  if (page === "downstream") return <DownstreamPage />;
+  return <IndexPage />;
+}
