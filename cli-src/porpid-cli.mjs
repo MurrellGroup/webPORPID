@@ -18,24 +18,28 @@ import {
   decodeConsensusOutput, decodeFamilyCounts, decodeFamilyModel, makeCutoffs, makeCutoffValues, mergeFamilyCounts, mergeStats,
 } from "../src/wasm-runtime.ts";
 import { createFastTreeRunner } from "./direct-fasttree.mjs";
+import { createMafftRunner } from "./direct-mafft.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
+import { createIndependentPanelFilterRunner } from "./direct-panel-filter.mjs";
 
-const VERSION = "0.3.8";
+const VERSION = "0.3.9";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
 export function defaultCliAssets() {
   const directory = join(CLI_DIRECTORY, "assets");
   return { wasmPath: join(directory, "webporpid.wasm"), msaPath: join(directory, "alivibe-msa.wasm"),
+    mafftJavascriptPath: join(directory, "disttbfast.mjs"), mafftWasmPath: join(directory, "disttbfast.wasm"),
     fastTreeJavascriptPath: join(directory, "fasttree.cjs"), fastTreeWasmPath: join(directory, "fasttree.wasm"),
     msaWorkerPath: join(CLI_DIRECTORY, "porpid-msa-worker.mjs"),
+    mafftWorkerPath: join(CLI_DIRECTORY, "porpid-mafft-worker.mjs"), panelWorkerPath: join(CLI_DIRECTORY, "porpid-panel-worker.mjs"),
     fastTreeWorkerPath: join(CLI_DIRECTORY, "porpid-fasttree-worker.mjs") };
 }
 
 function usage() {
   return `porpid-cli ${VERSION}\n\n` +
     `Run the complete nanopore/PacBio pipeline:\n` +
-    `  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--defer-phylogeny]\n\n` +
+    `  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--panel-filter mafft-batch|independent-query] [--defer-phylogeny]\n\n` +
     `Inspect or export a saved analysis:\n` +
     `  porpid-cli inspect results.webporpid\n` +
     `  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\n` +
@@ -189,15 +193,20 @@ async function loadConfiguration(path) {
   return { config: loaded, mappings };
 }
 
-async function runPipeline({ inputPath, configPath, outputPath, workers, assets, deferPhylogeny = false }) {
+async function runPipeline({ inputPath, configPath, outputPath, workers, assets, deferPhylogeny = false, panelFilterMode }) {
   const runStarted = performance.now(), timings = [];
   const input = resolve(inputPath), configuration = resolve(configPath), inputInformation = await stat(input);
-  const loadedConfiguration = await loadConfiguration(configuration), config = loadedConfiguration.config, compiledConfig = compileConfig(config);
-  const configHash = createHash("sha256").update(compiledConfig).digest("hex"), inputHash = createHash("sha256");
+  const loadedConfiguration = await loadConfiguration(configuration), config = loadedConfiguration.config;
+  if (panelFilterMode != null) {
+    if (!new Set(["mafft-batch", "independent-query"]).has(panelFilterMode)) throw new Error("--panel-filter must be mafft-batch or independent-query.");
+    config.parameters.panelFilterMode = panelFilterMode;
+  }
+  const compiledConfig = compileConfig(config);
+  const configHash = createHash("sha256").update(JSON.stringify(resultConfig(config))).digest("hex"), inputHash = createHash("sha256");
   status(`starting ${config.dataset} with ${workers} workers`);
   const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
   const log = [`${now()} webPORPID ${VERSION} started`, `${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
-    `${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}`];
+    `${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}, panel_filter=${config.parameters.panelFilterMode ?? "mafft-batch"}`];
   const inputMappings = [{ slot: "reads", role: "reads", uploadedName: basename(input), uploadedSize: inputInformation.size }, ...loadedConfiguration.mappings];
   for (const mapping of inputMappings) log.push(`${now()} input mapping: ${mapping.role} slot ${mapping.slot}${mapping.expectedName ? ` (${mapping.expectedName})` : ""} <- ${mapping.uploadedName} (${mapping.uploadedSize} bytes)`);
   const storeTiming = (stage, seconds, workItems) => {
@@ -276,9 +285,13 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
     // larger pool only instantiates idle WASM runtimes (and can be surprisingly
     // expensive on machines reporting dozens of logical CPUs).
     const msaRunner = createMsaRunner(assets.msaPath, Math.min(workers, config.samples.length), assets.msaWorkerPath);
+    const panelMsaRunner = createMafftRunner(assets.mafftJavascriptPath, assets.mafftWasmPath,
+      Math.min(workers, config.samples.length), assets.mafftWorkerPath);
+    const panelFilterRunner = createIndependentPanelFilterRunner(assets.panelWorkerPath);
     const downstreamStarted = performance.now(); let downstream;
-    try { downstream = await postprocess(consensuses, contamination, config, undefined, msaRunner, workers); }
-    finally { await msaRunner.close?.(); }
+    try { downstream = await postprocess(consensuses, contamination, config, undefined, msaRunner, workers, undefined,
+      { panelMsa: panelMsaRunner, panelFilter: panelFilterRunner }); }
+    finally { await Promise.all([msaRunner.close?.(), panelMsaRunner.close?.()]); }
     downstream.summaries.forEach((summary, index) => {
       summary.demultiplexedReads = quality.perSample[index] ?? 0;
       summary.selectedReads = selectedReadsBySample[index] ?? 0;
@@ -354,5 +367,5 @@ export async function runCli(overrideAssets) {
   if (!inputPath || inputPath.startsWith("--") || !configPath) throw new Error("run requires an input FASTQ and --config config.yaml.");
   const outputPath = option(args, "--output") ?? option(args, "--out") ?? `${basename(inputPath).replace(/\.(fastq|fq)(\.gz)?$/i, "")}.webporpid`;
   await runPipeline({ inputPath, configPath, outputPath, workers: integer(option(args, "--workers"), "--workers", availableParallelism()),
-    assets: overrideAssets ?? defaultCliAssets(), deferPhylogeny: args.includes("--defer-phylogeny") });
+    assets: overrideAssets ?? defaultCliAssets(), deferPhylogeny: args.includes("--defer-phylogeny"), panelFilterMode: option(args, "--panel-filter") });
 }

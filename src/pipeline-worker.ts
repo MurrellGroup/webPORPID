@@ -95,7 +95,9 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   const workers = Math.max(1, Math.floor(request.workers)), compiledConfig = compileConfig(request.config);
   if (request.spoolStorage === "external-directory" && !request.scratchDirectory)
     throw new Error("External scratch storage was selected, but no writable directory handle was provided.");
-  const configForHash = compiledConfig.slice().buffer as ArrayBuffer;
+  // Include browser/CLI analysis settings that are intentionally not part of
+  // the fixed C++ configuration ABI (for example the panel-filter strategy).
+  const configForHash = new TextEncoder().encode(JSON.stringify(resultConfig(request.config))).buffer as ArrayBuffer;
   const [module, configHashBytes] = await Promise.all([compileCore(), crypto.subtle.digest("SHA-256", configForHash)]);
   const pool = await CoreWorkerPool.create(workers, module, compiledConfig);
   let store: PartitionStore;
@@ -109,9 +111,9 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   } catch (cause) { pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.8 started`,
+  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.9 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
-    `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}`];
+    `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}, panel_filter=${request.config.parameters.panelFilterMode ?? "mafft-batch"}`];
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
   for (const mapping of request.inputMappings ?? []) {
     log.push(`${now()} input mapping: ${mapping.role} slot ${mapping.slot}${mapping.expectedName ? ` (${mapping.expectedName})` : ""} <- ${mapping.uploadedName} (${mapping.uploadedSize} bytes)`);
@@ -212,7 +214,6 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       if (selection.id !== review.id || selection.phase !== review.phase) throw new Error("The interactive UMI-threshold response did not match the open checkpoint.");
       const accepted = applyThresholdSelection(request.config, umiFamilies, selection); thresholdSelections.push(accepted);
       familyModel = new Uint8Array(encodeFamilyModel(umiFamilies));
-      log.push(`${now()} interactive UMI threshold values: ${JSON.stringify({ global: accepted.parameters, samples: accepted.samples })}`);
       for (const change of accepted.changes) log.push(`${now()} interactive UMI threshold: ${change}`);
       progress({ stage: "umi", fraction: .88, detail: "Accepted UMI thresholds; updating family decisions for every observed UMI" });
     }
@@ -327,7 +328,6 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       thresholdReviewPauseMs += performance.now() - pauseStarted;
       if (selection.id !== review.id || selection.phase !== review.phase) throw new Error("The interactive consensus-filter response did not match the open checkpoint.");
       const accepted = applyThresholdSelection(request.config, umiFamilies, selection); thresholdSelections.push(accepted);
-      log.push(`${now()} interactive consensus-filter values: ${JSON.stringify({ global: accepted.parameters, samples: accepted.samples })}`);
       for (const change of accepted.changes) log.push(`${now()} interactive consensus filter: ${change}`);
       progress({ stage: "postprocessing", fraction: 0,
         detail: "Accepted consensus-family thresholds; continuing to panel screening and functional analysis" });
@@ -437,7 +437,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.8", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.9", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },

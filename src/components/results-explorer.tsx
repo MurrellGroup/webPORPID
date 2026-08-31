@@ -246,7 +246,6 @@ function uncollapsedMetadata(records: PostprocRecord[]): Record<string, LeafMeta
 }
 
 const DONOR_COLORS = ["#08796f", "#c5534f", "#5e55a4", "#c77b20", "#3c78a8", "#8b5a82", "#557b3d", "#a84b70"];
-const donorColor = (index: number) => DONOR_COLORS[index] ?? `hsl(${Math.round(index * 137.508) % 360} 58% 42%)`;
 
 function DonorView({ bundle, donorId }: { bundle: ResultBundle; donorId: string }) {
   const [variant, setVariant] = useState<"collapsed" | "functional">("collapsed");
@@ -278,7 +277,7 @@ function DonorView({ bundle, donorId }: { bundle: ResultBundle; donorId: string 
       if (!rows.length) throw new Error(`No ${variant} sequences are available for donor ${donorId}. Compute the required downstream stages first.`);
       const aligned = rows.length > 1 ? await runScalableMsa(rows.map((row) => row.sequence), runAlivibeMsa, undefined, 3, "nucleotide") : [rows[0].sequence];
       const fasta = rows.map((row, index) => `>${row.name}\n${aligned[index]}\n`).join(""), newick = await runFastTree(fasta);
-      const legend = samples.map((sample, index) => ({ label: sample.name, color: donorColor(index) }));
+      const legend = samples.map((sample, index) => ({ label: sample.name, color: DONOR_COLORS[index % DONOR_COLORS.length] }));
       const colors = new Map(legend.map((row) => [row.label, row.color]));
       setAnalysis({ donorId, variant, fasta, newick, legend,
         leafMetadata: Object.fromEntries(rows.map((row) => [row.name, { familyCount: row.familyCount,
@@ -483,7 +482,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const targetSample = sampleRef.current, current = effectiveAlignment(bundleRef.current, targetSample, variant); if (!current.fasta) return;
     setAlignmentError(""); setAlignmentStatus("Opening the bundled Alivibe editor…");
     const applicationBase = new URL(import.meta.env.BASE_URL, document.baseURI), editorUrl = new URL("tools/alivibe.html", applicationBase);
-    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.8");
+    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.9");
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const popup = window.open(editorUrl.href, `webporpid-alivibe-${token}`, "popup,width=1500,height=920") as AlivibeEditorWindow | null;
     if (!popup) { setAlignmentError("The browser blocked the Alivibe window. Allow pop-ups for this site and try again."); return; }

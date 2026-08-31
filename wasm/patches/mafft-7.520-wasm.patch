@@ -1,0 +1,23 @@
+diff --git a/core/Makefile b/core/Makefile
+index 9c2aa4d..12dd68d 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -6,7 +6,8 @@ DESTDIR =
+ 
+ #MNO_CYGWIN = -mno-cygwin
+ 
+-ENABLE_MULTITHREAD = -Denablemultithread
++# WebAssembly jobs are parallelized outside MAFFT; keep each instance single-threaded.
++ENABLE_MULTITHREAD =
+ # Comment out the above line if your compiler 
+ # does not support TLS (thread-local strage).
+ 
+@@ -198,7 +199,7 @@ addsingle : $(OBJADDSINGLE)
+ 	$(CC) -o $@ $(OBJADDSINGLE) $(MYCFLAGS) $(LDFLAGS) $(LIBS)
+ 
+ disttbfast : $(OBJDISTTBFAST)
+-	$(CC) -o $@ $(OBJDISTTBFAST) $(MYCFLAGS) $(LDFLAGS) $(LIBS)
++	$(CC) -o ../build/disttbfast.mjs $(OBJDISTTBFAST) $(MYCFLAGS) $(LDFLAGS) $(LIBS)
+ 
+ libdisttbfast.so : $(OBJDISTTBFAST)
+ 	$(CC) -shared -o $@ $(OBJDISTTBFAST) $(MYCFLAGS) $(LDFLAGS) $(LIBS)

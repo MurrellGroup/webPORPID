@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-8Kw3hjMk.mjs";
+import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-CuMSsXhU.mjs";
 import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
 import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-izZLhWZ1.mjs";
+import { n as createMafftRunner } from "./chunks/direct-mafft-IVivIuqW.mjs";
+import { t as filterQueriesAgainstPanel } from "./chunks/independent-panel-filter-DmDC1Ts9.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -559,6 +561,125 @@ async function runAlivibeMsa(sequences, signal, iterations = 3, scoringMode = "n
 			iterations,
 			scoringMode
 		}, [input]);
+	});
+}
+//#endregion
+//#region src/independent-panel-filter-runtime.ts
+/** Split independent query/profile alignments over isolated CPU workers. */
+async function runIndependentPanelFilter(sequences, panelRows, signal, workers = 1, onProgress) {
+	if (!sequences.length) return {
+		sequences: [],
+		scores: []
+	};
+	if (signal?.aborted) throw new DOMException("Independent panel filtering cancelled.", "AbortError");
+	const count = Math.max(1, Math.min(sequences.length, Math.floor(workers) || 1));
+	const outputSequences = new Array(sequences.length), scores = new Array(sequences.length);
+	const instances = [], completed = new Uint32Array(count);
+	let settled = false, rejectCancellation;
+	const terminate = () => {
+		for (const worker of instances) worker.terminate();
+	};
+	const cancellation = new Promise((_resolve, reject) => {
+		rejectCancellation = reject;
+	});
+	const abort = () => {
+		if (!settled) {
+			terminate();
+			rejectCancellation?.(new DOMException("Independent panel filtering cancelled.", "AbortError"));
+		}
+	};
+	signal?.addEventListener("abort", abort, { once: true });
+	try {
+		const jobs = Array.from({ length: count }, (_, workerIndex) => {
+			const start = Math.floor(workerIndex * sequences.length / count), end = Math.floor((workerIndex + 1) * sequences.length / count);
+			const worker = new Worker(new URL("./independent-panel-filter-worker.ts", import.meta.url), { type: "module" });
+			instances.push(worker);
+			return new Promise((resolve, reject) => {
+				worker.onmessage = (event) => {
+					if (event.data.type === "progress") {
+						completed[workerIndex] = event.data.completed ?? 0;
+						onProgress?.({
+							completed: completed.reduce((sum, value) => sum + value, 0),
+							total: sequences.length
+						});
+						return;
+					}
+					if (event.data.type === "error") {
+						reject(new Error(event.data.message || "Independent panel filtering failed."));
+						return;
+					}
+					const result = event.data.result;
+					if (!result || result.sequences.length !== end - start || result.scores.length !== end - start) {
+						reject(/* @__PURE__ */ new Error("An independent panel-filter worker returned an invalid result."));
+						return;
+					}
+					for (let index = 0; index < result.sequences.length; index++) {
+						outputSequences[start + index] = result.sequences[index];
+						scores[start + index] = result.scores[index];
+					}
+					completed[workerIndex] = end - start;
+					onProgress?.({
+						completed: completed.reduce((sum, value) => sum + value, 0),
+						total: sequences.length
+					});
+					resolve();
+				};
+				worker.onerror = (event) => reject(new Error(event.message || "An independent panel-filter worker stopped unexpectedly."));
+				worker.postMessage({
+					sequences: sequences.slice(start, end).map(String),
+					panelRows: panelRows.map(String)
+				});
+			});
+		});
+		await Promise.race([Promise.all(jobs), cancellation]);
+		if (signal?.aborted) throw new DOMException("Independent panel filtering cancelled.", "AbortError");
+		settled = true;
+		return {
+			sequences: outputSequences,
+			scores
+		};
+	} finally {
+		signal?.removeEventListener("abort", abort);
+		terminate();
+	}
+}
+//#endregion
+//#region src/mafft-msa-runtime.ts
+/** Run MAFFT 7.520 FFT-NS-2 in an isolated worker with growable WASM memory. */
+async function runMafftFftnsMsa(sequences, signal, _iterations = 0, scoringMode = "nucleotide", onProgress) {
+	if (sequences.length < 2) return [...sequences];
+	if (scoringMode === "amino-acid") throw new Error("The reference-panel MAFFT runner expects nucleotide sequences.");
+	const worker = new Worker(new URL("./mafft-msa-worker.ts", import.meta.url), { type: "module" });
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const finish = () => {
+			if (settled) return false;
+			settled = true;
+			signal?.removeEventListener("abort", abort);
+			worker.terminate();
+			return true;
+		};
+		const abort = () => {
+			if (finish()) reject(new DOMException("MAFFT panel alignment cancelled.", "AbortError"));
+		};
+		worker.onmessage = (event) => {
+			if (event.data.type === "progress") {
+				onProgress?.({ detail: event.data.detail ?? "MAFFT is aligning candidate sequences" });
+				return;
+			}
+			if (!finish()) return;
+			if (event.data.type === "error") reject(new Error(event.data.message || "MAFFT failed."));
+			else resolve(event.data.result ?? []);
+		};
+		worker.onerror = (event) => {
+			if (finish()) reject(new Error(event.message || "The MAFFT worker stopped unexpectedly."));
+		};
+		if (signal?.aborted) {
+			abort();
+			return;
+		}
+		signal?.addEventListener("abort", abort, { once: true });
+		worker.postMessage({ sequences: sequences.map(String) });
 	});
 }
 //#endregion
@@ -1352,6 +1473,8 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 	};
 }
 async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1, onProgress, options = {}) {
+	const panelMsa = options.panelMsa ?? runMafftFftnsMsa;
+	const independentPanelFilter = options.panelFilter ?? runIndependentPanelFilter;
 	const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
 	const outputs = Array(config.samples.length);
 	let cursor = 0;
@@ -1389,8 +1512,18 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			})).filter(({ record }) => record.familySize >= artefactCutoff && record.minimumAgreement >= agreementThreshold && !discarded.has(record.id));
 			const scores = Array(source.length).fill(0), panelPass = Array(source.length).fill(true), extracted = /* @__PURE__ */ new Map();
 			if (preliminary.length && sample.panelSequences.length) {
-				report(sampleIndex, .18, `Screening candidate sequences against the reference panel for sample ${sample.name}`);
-				const panelResult = extractAndScorePanel(preliminary.length > 1 ? await runScalableMsa(preliminary.map(({ record }) => degap(record.sequence)), runMsa, signal, 3, "nucleotide") : preliminary.map(({ record }) => degap(record.sequence)), sample.panelSequences.map((record) => record.sequence));
+				const panelRows = sample.panelSequences.map((record) => record.sequence), rawCandidates = preliminary.map(({ record }) => degap(record.sequence));
+				const panelMode = config.parameters.panelFilterMode ?? "mafft-batch";
+				report(sampleIndex, .18, panelMode === "independent-query" ? `Aligning ${preliminary.length.toLocaleString()} candidate families independently to the reference panel for ${sample.name}` : `Building the batch MAFFT FFT-NS-2 alignment for ${preliminary.length.toLocaleString()} candidate families in ${sample.name}`);
+				let panelResult;
+				if (panelMode === "independent-query") {
+					const activeSamples = Math.max(1, Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))));
+					panelResult = await independentPanelFilter(rawCandidates, panelRows, signal, options.panelWorkers ?? Math.max(1, Math.floor(Math.max(1, sampleConcurrency) / activeSamples)), ({ completed, total }) => report(sampleIndex, .18 + .2 * completed / Math.max(1, total), `Reference-panel alignment for ${sample.name}: ${completed.toLocaleString()} of ${total.toLocaleString()} families`));
+				} else {
+					const candidates = rawCandidates.length > 1 ? await panelMsa(rawCandidates, signal, 0, "nucleotide", ({ detail }) => report(sampleIndex, .24, `MAFFT FFT-NS-2 for ${sample.name}: ${detail}`)) : rawCandidates;
+					report(sampleIndex, .34, `Projecting the ${sample.name} candidate alignment onto its fixed reference panel`);
+					panelResult = extractAndScorePanel(candidates, panelRows);
+				}
 				preliminary.forEach(({ index }, candidate) => {
 					extracted.set(index, degap(panelResult.sequences[candidate]));
 					scores[index] = panelResult.scores[candidate];
@@ -3571,6 +3704,7 @@ function validateResult(value) {
 		"spoolPartitions"
 	]) numeric(parameters[key], `config.parameters.${key}`);
 	bool(parameters.contaminationFilter, "config.parameters.contaminationFilter");
+	if (parameters.panelFilterMode != null && parameters.panelFilterMode !== "mafft-batch" && parameters.panelFilterMode !== "independent-query") throw new Error("config.parameters.panelFilterMode must be mafft-batch or independent-query.");
 	text(parameters.deterministicSeed, "config.parameters.deterministicSeed");
 	const samples = array(config.samples, "config.samples").map((entry, index) => {
 		const sample = object(entry, `config.samples[${index}]`);
@@ -4322,8 +4456,88 @@ function concatenateSpoolRecords(records) {
 	return output;
 }
 //#endregion
+//#region cli-src/direct-panel-filter.mjs
+function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-panel-worker.mjs", import.meta.url)) {
+	return async (sequences, panelRows, signal, workers = 1, onProgress) => {
+		if (!sequences.length) return {
+			sequences: [],
+			scores: []
+		};
+		if (signal?.aborted) throw new Error("Analysis cancelled.");
+		const count = Math.max(1, Math.min(sequences.length, Math.floor(workers) || 1));
+		if (count === 1) return filterQueriesAgainstPanel(sequences, panelRows, ({ completed, total }) => onProgress?.({
+			completed,
+			total
+		}));
+		const outputSequences = new Array(sequences.length), scores = new Array(sequences.length), completed = new Uint32Array(count), instances = [];
+		let rejectCancellation, settled = false;
+		const cancellation = new Promise((_resolve, reject) => {
+			rejectCancellation = reject;
+		});
+		const terminate = () => {
+			for (const worker of instances) worker.terminate();
+		};
+		const abort = () => {
+			if (!settled) {
+				terminate();
+				rejectCancellation(/* @__PURE__ */ new Error("Analysis cancelled."));
+			}
+		};
+		signal?.addEventListener("abort", abort, { once: true });
+		try {
+			const jobs = Array.from({ length: count }, (_, workerIndex) => {
+				const start = Math.floor(workerIndex * sequences.length / count), end = Math.floor((workerIndex + 1) * sequences.length / count);
+				const worker = new Worker$1(workerPath);
+				instances.push(worker);
+				return new Promise((resolve, reject) => {
+					worker.on("message", (message) => {
+						if (message.progress) {
+							completed[workerIndex] = message.progress.completed;
+							onProgress?.({
+								completed: completed.reduce((sum, value) => sum + value, 0),
+								total: sequences.length
+							});
+							return;
+						}
+						if (message.error) {
+							reject(new Error(message.error));
+							return;
+						}
+						const result = message.result;
+						if (!result || result.sequences.length !== end - start || result.scores.length !== end - start) {
+							reject(/* @__PURE__ */ new Error("An independent panel-filter worker returned an invalid result."));
+							return;
+						}
+						for (let index = 0; index < result.sequences.length; index++) {
+							outputSequences[start + index] = result.sequences[index];
+							scores[start + index] = result.scores[index];
+						}
+						completed[workerIndex] = end - start;
+						resolve();
+					});
+					worker.on("error", reject);
+					worker.postMessage({
+						sequences: sequences.slice(start, end).map(String),
+						panelRows: panelRows.map(String)
+					});
+				});
+			});
+			await Promise.race([Promise.all(jobs), cancellation]);
+			if (signal?.aborted) throw new Error("Analysis cancelled.");
+			settled = true;
+			return {
+				sequences: outputSequences,
+				scores
+			};
+		} finally {
+			signal?.removeEventListener("abort", abort);
+			terminate();
+		}
+	};
+}
+//#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.8";
+const VERSION = "0.3.9";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -4331,14 +4545,18 @@ function defaultCliAssets() {
 	return {
 		wasmPath: join(directory, "webporpid.wasm"),
 		msaPath: join(directory, "alivibe-msa.wasm"),
+		mafftJavascriptPath: join(directory, "disttbfast.mjs"),
+		mafftWasmPath: join(directory, "disttbfast.wasm"),
 		fastTreeJavascriptPath: join(directory, "fasttree.cjs"),
 		fastTreeWasmPath: join(directory, "fasttree.wasm"),
 		msaWorkerPath: join(CLI_DIRECTORY, "porpid-msa-worker.mjs"),
+		mafftWorkerPath: join(CLI_DIRECTORY, "porpid-mafft-worker.mjs"),
+		panelWorkerPath: join(CLI_DIRECTORY, "porpid-panel-worker.mjs"),
 		fastTreeWorkerPath: join(CLI_DIRECTORY, "porpid-fasttree-worker.mjs")
 	};
 }
 function usage() {
-	return `porpid-cli ${VERSION}\n\nRun the complete nanopore/PacBio pipeline:\n  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--defer-phylogeny]\n\nInspect or export a saved analysis:\n  porpid-cli inspect results.webporpid\n  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\nWorkers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\nComponents: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n            uncollapsed-protein-alignment, uncollapsed-newick, functional-nucleotide-alignment,\n            functional-protein-alignment, functional-newick, log`;
+	return `porpid-cli ${VERSION}\n\nRun the complete nanopore/PacBio pipeline:\n  porpid-cli run reads.fastq.gz --config config.yaml --output results.webporpid [--workers N] [--panel-filter mafft-batch|independent-query] [--defer-phylogeny]\n\nInspect or export a saved analysis:\n  porpid-cli inspect results.webporpid\n  porpid-cli export results.webporpid --component consensus-fasta [--sample NAME] --output consensus.fasta\n\nWorkers default to all logical CPUs (${availableParallelism()}). Temporary read partitions are streamed to disk and removed after consensus.\nComponents: consensus-fasta, passed-consensus-fasta, rejected-consensus-fasta, trimmed-nt-fasta, trimmed-aa-fasta,\n            family-csv, low-agreement-csv, contamination-csv, postproc-csv, apobec-csv, collapse-csv,\n            nucleotide-alignment, protein-alignment, newick, uncollapsed-nucleotide-alignment,\n            uncollapsed-protein-alignment, uncollapsed-newick, functional-nucleotide-alignment,\n            functional-protein-alignment, functional-newick, log`;
 }
 function option(args, name) {
 	const index = args.indexOf(name);
@@ -4603,17 +4821,22 @@ async function loadConfiguration(path) {
 		mappings
 	};
 }
-async function runPipeline({ inputPath, configPath, outputPath, workers, assets, deferPhylogeny = false }) {
+async function runPipeline({ inputPath, configPath, outputPath, workers, assets, deferPhylogeny = false, panelFilterMode }) {
 	const runStarted = performance.now(), timings = [];
 	const input = resolve(inputPath), configuration = resolve(configPath), inputInformation = await stat(input);
-	const loadedConfiguration = await loadConfiguration(configuration), config = loadedConfiguration.config, compiledConfig = compileConfig(config);
-	const configHash = createHash("sha256").update(compiledConfig).digest("hex"), inputHash = createHash("sha256");
+	const loadedConfiguration = await loadConfiguration(configuration), config = loadedConfiguration.config;
+	if (panelFilterMode != null) {
+		if (!new Set(["mafft-batch", "independent-query"]).has(panelFilterMode)) throw new Error("--panel-filter must be mafft-batch or independent-query.");
+		config.parameters.panelFilterMode = panelFilterMode;
+	}
+	const compiledConfig = compileConfig(config);
+	const configHash = createHash("sha256").update(JSON.stringify(resultConfig(config))).digest("hex"), inputHash = createHash("sha256");
 	status(`starting ${config.dataset} with ${workers} workers`);
 	const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
 	const log = [
 		`${now()} webPORPID ${VERSION} started`,
 		`${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
-		`${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}`
+		`${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}, panel_filter=${config.parameters.panelFilterMode ?? "mafft-batch"}`
 	];
 	const inputMappings = [{
 		slot: "reads",
@@ -4723,12 +4946,17 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 		log.push(`${now()} contamination: ${contamination.filter((call) => call.discarded).length} discarded; ${contamination.filter((call) => call.suspectOnly).length} suspect calls`);
 		stageStarted = recordTiming("contamination", stageStarted, consensuses.length);
 		const msaRunner = createMsaRunner(assets.msaPath, Math.min(workers, config.samples.length), assets.msaWorkerPath);
+		const panelMsaRunner = createMafftRunner(assets.mafftJavascriptPath, assets.mafftWasmPath, Math.min(workers, config.samples.length), assets.mafftWorkerPath);
+		const panelFilterRunner = createIndependentPanelFilterRunner(assets.panelWorkerPath);
 		const downstreamStarted = performance.now();
 		let downstream;
 		try {
-			downstream = await postprocess(consensuses, contamination, config, void 0, msaRunner, workers);
+			downstream = await postprocess(consensuses, contamination, config, void 0, msaRunner, workers, void 0, {
+				panelMsa: panelMsaRunner,
+				panelFilter: panelFilterRunner
+			});
 		} finally {
-			await msaRunner.close?.();
+			await Promise.all([msaRunner.close?.(), panelMsaRunner.close?.()]);
 		}
 		downstream.summaries.forEach((summary, index) => {
 			summary.demultiplexedReads = quality.perSample[index] ?? 0;
@@ -4872,7 +5100,8 @@ async function runCli(overrideAssets) {
 		outputPath: option(args, "--output") ?? option(args, "--out") ?? `${basename(inputPath).replace(/\.(fastq|fq)(\.gz)?$/i, "")}.webporpid`,
 		workers: integer(option(args, "--workers"), "--workers", availableParallelism()),
 		assets: overrideAssets ?? defaultCliAssets(),
-		deferPhylogeny: args.includes("--defer-phylogeny")
+		deferPhylogeny: args.includes("--defer-phylogeny"),
+		panelFilterMode: option(args, "--panel-filter")
 	});
 }
 //#endregion

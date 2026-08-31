@@ -43,7 +43,8 @@ test("porpid-cli runs, inspects, and exports a complete synthetic analysis", asy
     await execute(executable, [...prefix, "export", result, "--component", "consensus-fasta", "--sample", "sample_1", "--output", exported]);
     const consensus = await readFile(exported, "utf8"); assert.match(consensus, /^>sample_1AACCGGTT fs=5 minag=/m);
     const serialResult = join(directory, "serial.webporpid"), serialExport = join(directory, "serial-consensus.fasta");
-    await execute(executable, [...prefix, "run", reads, "--config", join(directory, "config.yaml"), "--output", serialResult, "--workers", "1", "--defer-phylogeny"], { timeout: 60_000 });
+    await execute(executable, [...prefix, "run", reads, "--config", join(directory, "config.yaml"), "--output", serialResult,
+      "--workers", "1", "--panel-filter", "independent-query", "--defer-phylogeny"], { timeout: 60_000 });
     const deferred = JSON.parse((await execute(executable, [...prefix, "inspect", serialResult])).stdout);
     assert.deepEqual(deferred.components.trees, []);
     await execute(executable, [...prefix, "export", serialResult, "--component", "consensus-fasta", "--sample", "sample_1", "--output", serialExport]);

@@ -78,7 +78,8 @@ jobs:
         run: |
           node -e "require('node:fs').mkdirSync('release', { recursive: true })"
           bun build cli-src/porpid-cli-standalone.mjs cli-src/porpid-worker.mjs \
-            cli-src/porpid-msa-worker.mjs cli-src/porpid-fasttree-worker.mjs \
+            cli-src/porpid-msa-worker.mjs cli-src/porpid-mafft-worker.mjs \
+            cli-src/porpid-panel-worker.mjs cli-src/porpid-fasttree-worker.mjs \
             --compile --minify '--entry-naming=[name].mjs' \
             --target=${{ matrix.target }} --outfile=release/${{ matrix.artifact }}
       - name: Smoke-test the actual executable

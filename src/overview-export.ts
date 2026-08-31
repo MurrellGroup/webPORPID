@@ -10,25 +10,6 @@ const csv = (headers: string[], rows: unknown[][]) => [headers, ...rows].map((ro
 
 export interface OverviewExport { name: string; text: string }
 
-function thresholdDecisionRows(bundle: ResultBundle): unknown[][] {
-  const rows: unknown[][] = [];
-  for (const record of bundle.thresholdSelections ?? []) {
-    for (const [parameter, value] of Object.entries(record.parameters))
-      rows.push([record.id, record.phase, record.acceptedUtc, "global", "", parameter, value, ""]);
-    for (const sample of record.samples) {
-      const parameters = record.phase === "umi"
-        ? [["familySizeOverride", sample.familySizeOverride]] as const
-        : [["artefactFractionOverride", sample.artefactFractionOverride], ["outlierQuantileOverride", sample.outlierQuantileOverride],
-          ["agreementOverride", sample.agreementOverride]] as const;
-      for (const [parameter, value] of parameters)
-        rows.push([record.id, record.phase, record.acceptedUtc, "sample", sample.sample, parameter, value ?? "global", ""]);
-    }
-    for (const change of record.changes)
-      rows.push([record.id, record.phase, record.acceptedUtc, "audit", "", "", "", change]);
-  }
-  return rows;
-}
-
 /** Machine-readable counterparts of every run-wide overview section. */
 export function buildOverviewExports(bundle: ResultBundle): OverviewExport[] {
   const overview = sampleOverviewStats(bundle), input = inputFilterStats(bundle), parameters = parameterSettings(bundle);
@@ -52,8 +33,8 @@ export function buildOverviewExports(bundle: ResultBundle): OverviewExport[] {
       const status = stageStatus(bundle, stage); return [stage, status.state, status.detail, status.updatedUtc];
     })) },
     { name: "timings.csv", text: csv(["stage", "seconds", "work_items"], (bundle.timings ?? []).map((row) => [row.stage, row.seconds, row.workItems])) },
-    { name: "interactive-threshold-decisions.csv", text: csv(
-      ["checkpoint_id", "phase", "accepted_utc", "scope", "sample", "parameter", "value", "change"], thresholdDecisionRows(bundle)) },
+    { name: "interactive-threshold-decisions.csv", text: csv(["checkpoint_id", "phase", "accepted_utc", "change"],
+      (bundle.thresholdSelections ?? []).flatMap((record) => record.changes.map((change) => [record.id, record.phase, record.acceptedUtc, change]))) },
     { name: "input-file-mappings.csv", text: csv(["slot", "role", "expected_name", "uploaded_name", "uploaded_size"],
       (bundle.inputMappings ?? []).map((row) => [row.slot, row.role, row.expectedName, row.uploadedName, row.uploadedSize])) },
     { name: "provenance.csv", text: csv(["field", "value"], Object.entries(bundle.provenance).map(([key, value]) => [key, value])) },

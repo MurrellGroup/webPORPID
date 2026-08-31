@@ -22,6 +22,8 @@ import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.t
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
 import { postprocess } from "../src/postprocess.ts";
+import { filterQueriesAgainstPanel } from "../src/independent-panel-filter.ts";
+import { extractAndScorePanel } from "../src/panel-profile.ts";
 import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
 import { adaptiveSpoolCutoff, PartitionStore, writeAllSync } from "../src/partition-store.ts";
 import { runScalableMsa } from "../src/scalable-msa.ts";
@@ -197,7 +199,11 @@ test("original single-dataset PORPID YAML remains accepted", async () => {
     const config = parseConfigYaml(`legacy_run:\n  sample_A:\n    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fa\n    donor_ID: donor-7\n    af_override: 0.4\n`);
     assert.equal(config.dataset, "legacy_run"); assert.equal(config.samples[0].name, "sample_A");
     assert.equal(config.samples[0].artefactFractionOverride, 0.4); assert.equal(config.samples[0].donorId, "donor-7"); assert.equal(config.parameters.ldaThreshold, 0.995);
+    assert.equal(config.parameters.panelFilterMode, "mafft-batch");
     assert.match(serializeConfigYaml(config), /donor_ID: donor-7/);
+    const independent = parseConfigYaml(`dataset: direct\nsamples:\n  sample_A:\n    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panel.fa\nparameters:\n  panel_filter: per-query\n`);
+    assert.equal(independent.parameters.panelFilterMode, "independent-query");
+    assert.match(serializeConfigYaml(independent), /panelFilterMode: independent-query/);
     config.parameters.contaminationFilter = false;
     const resolved = await resolveReferenceFiles(config, new Map([
       ["panels/panel.fa", async () => ">correct\nACGT\n"], ["archive/panel.fa", async () => ">wrong\nTGCA\n"],
@@ -330,9 +336,8 @@ test("report figures and the Swig-derived viewer render from a result payload", 
       alphabet: "nt", highlighter: false, bubbleAreaPerFamily: 25, showAbundanceScale: true, colorByAgreement: false, mutations: new Map(), mutationLimit: 2, tipLegend: [] });
     assert.match(combined, /Tree coordinated with aligned leaf sequences/); assert.match(combined, /<rect[^>]+fill="#78c679"/); assert.match(combined, />A<\/text>/); assert.match(combined, /no radius floor, cap, or dataset normalization/);
     const collapsedViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);", collapsed: true,
-      leafMetadata: { a: { familyCount: 3, minimumAgreement: .7, color: "#123456", category: "sample A" } } }));
+      leafMetadata: { a: { familyCount: 3, minimumAgreement: .7 } } }));
     assert.doesNotMatch(collapsedViewer, /Tip color|family minimum agreement/i, "legacy agreement metadata must not appear as a collapsed-haplotype property");
-    assert.match(collapsedViewer, /fill="#123456"/, "collapsed donor tips must retain their sample color while agreement metadata stays hidden");
     const familyViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);",
       leafMetadata: { a: { familyCount: 1, minimumAgreement: .7 } } }));
     assert.match(familyViewer, /Family minimum agreement/i);
@@ -473,6 +478,39 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   assert.equal(output.records[0].functionalPass, true);
 });
 
+test("independent panel alignment preserves exact scoring, query order, and large indels", () => {
+  const panel = ["ACGTACGTACGT", "ACGTTCGTACGT"];
+  const exact = filterQueriesAgainstPanel(["ACGTTCGTACGT"], panel);
+  const batch = extractAndScorePanel(["ACGTTCGTACGT"], panel);
+  assert.equal(exact.sequences[0], "ACGTTCGTACGT");
+  assert(Math.abs(exact.scores[0] - batch.scores[0]) < 1e-5, "direct panel scoring diverged on an unambiguous alignment");
+
+  const left = "ACGT".repeat(60), right = "TGCA".repeat(60), insertion = "G".repeat(110);
+  const reference = left + right, queries = [reference, `${left}${insertion}${right}`, `${left.slice(0, 170)}${left.slice(205)}${right}`];
+  const forward = filterQueriesAgainstPanel(queries, [reference]), reverse = filterQueriesAgainstPanel([...queries].reverse(), [reference]);
+  assert.deepEqual(forward.sequences, queries, "query insertions or deletions were not retained in extracted sequence space");
+  assert.deepEqual(forward.scores, [...reverse.scores].reverse(), "independent panel decisions changed with query order");
+  assert(forward.scores.every(Number.isFinite));
+});
+
+test("independent panel alignment shares the CPU budget across concurrent samples", async () => {
+  const base = resultBundle(), panel = [{ name: "panel_ref", sequence: "ATGTAA" }];
+  const samples = ["sample_1", "sample_2"].map((name) => ({ ...base.config.samples[0], name, panelSequences: panel }));
+  const config = { ...base.config, samples, parameters: { ...base.config.parameters, panelFilterMode: "independent-query",
+    agreementThreshold: 0, panelThreshold: 100 } };
+  const consensuses = samples.map((sample, sampleIndex) => ({ ...base.consensuses[0], id: `c${sampleIndex + 1}`,
+    sample: sample.name, sampleIndex, minimumAgreement: 1 }));
+  const allocations = [];
+  const panelFilter = async (sequences, _panelRows, _signal, workers) => {
+    allocations.push(workers); return { sequences: [...sequences], scores: sequences.map(() => 0) };
+  };
+  await postprocess(consensuses, [], config, undefined, async (sequences) => [...sequences], 8, undefined,
+    { collapse: false, panelFilter });
+  assert.deepEqual(allocations.sort((left, right) => left - right), [4, 4]);
+  assert.doesNotMatch(await readFile("cli-src/porpid-cli.mjs", "utf8"), /panelWorkers:\s*workers/,
+    "the CLI must not grant the full worker budget independently to every sample");
+});
+
 test("reference regions and mutation mapping follow the active alignment", () => {
   assert.deepEqual(referenceDisplayColumns("ATG---GCTAAC", "1;3;7-9", "nt", "nt", 0, 12), [0, 2, 9, 10, 11]);
   assert.deepEqual(referenceDisplayColumns("ATG---GCTAAC", "1;3", "aa", "nt", 0, 12), [0, 1, 2, 9, 10, 11]);
@@ -596,8 +634,7 @@ test("export all is one gzip-compressed tar with every sample output in its samp
   assert.equal(decoder.decode(entries.get("sample_1/families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
   assert.match(decoder.decode(entries.get("cross-sample-overview/parameters.csv")), /maxReadsPerSample/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/sample-summary.csv")), /sample_1/);
-  assert.match(decoder.decode(entries.get("cross-sample-overview/interactive-threshold-decisions.csv")),
-    /checkpoint_id,phase,accepted_utc,scope,sample,parameter,value,change/);
+  assert.match(decoder.decode(entries.get("cross-sample-overview/interactive-threshold-decisions.csv")), /checkpoint_id,phase,accepted_utc,change/);
   assert.deepEqual(decodeResult(entries.get("test.webporpid")), bundle);
 });
 
@@ -615,19 +652,6 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(styles, /overscroll-behavior-x:\s*none/);
   assert.match(app, /className="app-version"/); assert.match(app, /packageInformation\.version/);
   assert.match(styles, /\.app-version/);
-});
-
-test("interactive threshold and donor-level controls stay wired into the project UI", async () => {
-  const [app, thresholdDialog, configForm, results] = await Promise.all([
-    readFile("src/App.tsx", "utf8"), readFile("src/components/threshold-review.tsx", "utf8"),
-    readFile("src/components/config-form.tsx", "utf8"), readFile("src/components/results-explorer.tsx", "utf8"),
-  ]);
-  assert.match(app, /Review UMI and consensus thresholds interactively/); assert.match(app, /type: "threshold-selection"/);
-  assert.match(thresholdDialog, /type="range"/); assert.match(thresholdDialog, /className="threshold-direct" type="text"/);
-  assert.match(thresholdDialog, /passes current guides/); assert.match(thresholdDialog, /Accept thresholds and continue/);
-  assert.match(configForm, /label="Donor ID"/); assert.match(configForm, /same ID are treated as self/);
-  assert.match(results, /Donor-level view/); assert.match(results, /Post-collapse haplotypes/); assert.match(results, /Functional-filter passes/);
-  assert.match(results, /category: row\.sample/); assert.match(results, /collapsed bubble area remains exactly linear/);
 });
 
 test("landing, configuration, and result sections link to built detailed Methods pages", async () => {

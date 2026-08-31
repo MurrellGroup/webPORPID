@@ -56,26 +56,17 @@ function DecisionPlot({ review, sample, thresholds }: { review: ThresholdReview;
   const horizontal = review.phase === "umi" ? thresholds.ldaThreshold ?? 0 : thresholds.agreementThreshold ?? 0;
   const vertical = review.phase === "umi" ? thresholds.familySizeThreshold ?? 0
     : Math.ceil(quantileFromCounts(sample.familySizeCounts, thresholds.outlierQuantile ?? 0) * (thresholds.artefactFraction ?? 0));
-  const xTicks = [...new Set([0, .25, .5, .75, 1].map((fraction) => Math.round(Math.expm1(Math.log1p(maximumFamily) * fraction))))];
-  const pointColor = (point: (typeof points)[number]) => {
-    if (review.phase === "consensus-filters" && point.contaminationEligible === false) return "#89918d";
-    const verticalPass = point.familySize >= vertical;
-    const horizontalPass = Number(point[yValue]) >= horizontal;
-    const umiLengthPass = review.phase !== "umi" || point.umiLength === 8;
-    return verticalPass && horizontalPass && umiLengthPass ? "#08796f" : "#c5534f";
-  };
   return <figure className="threshold-plot"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${review.phase === "umi" ? "UMI probability" : "Consensus agreement"} cutoff plot for ${sample.sample}`}>
     <rect x={left} y={top} width={width - left - right} height={height - top - bottom} fill="#fbfcfb" stroke="#c8d3cf" />
     {[0, .25, .5, .75, 1].map((tick) => <g key={tick}><line x1={left - 4} x2={width - right} y1={y(tick)} y2={y(tick)} stroke={tick ? "#e2e8e5" : "#879992"} /><text x={left - 9} y={y(tick) + 4} textAnchor="end">{tick}</text></g>)}
-    {xTicks.map((tick) => <g key={tick}><line x1={x(tick)} x2={x(tick)} y1={top} y2={height - bottom + 4} stroke="#e2e8e5" /><text x={x(tick)} y={height - bottom + 17} textAnchor="middle">{tick}</text></g>)}
-    {points.map((point, index) => <circle key={index} cx={x(point.familySize)} cy={y(Number(point[yValue]))} r="2.4" fill={pointColor(point)} opacity=".52" />)}
+    {points.map((point, index) => <circle key={index} cx={x(point.familySize)} cy={y(Number(point[yValue]))} r="2.4" fill={point.disposition === "likely_real" ? "#08796f" : "#c5534f"} opacity=".45" />)}
     <line x1={left} x2={width - right} y1={y(horizontal)} y2={y(horizontal)} stroke="#b13c45" strokeWidth="2" strokeDasharray="7 5" />
     <line x1={x(vertical)} x2={x(vertical)} y1={top} y2={height - bottom} stroke="#4b3e91" strokeWidth="2" strokeDasharray="7 5" />
     <text x={(left + width - right) / 2} y={height - 8} textAnchor="middle">UMI family size (log scale)</text>
     <text transform={`translate(15 ${(top + height - bottom) / 2}) rotate(-90)`} textAnchor="middle">{review.phase === "umi" ? "Offspring probability" : "Minimum agreement"}</text>
     <text x={Math.min(width - 150, x(vertical) + 5)} y={top + 14} fill="#4b3e91">family cutoff {vertical}</text>
     <text x={left + 6} y={Math.max(top + 14, y(horizontal) - 6)} fill="#b13c45">{review.phase === "umi" ? "probability" : "agreement"} {horizontal}</text>
-  </svg><figcaption><span><i className="threshold-pass" />passes current guides <i className="threshold-reject" />fails a current guide{review.phase === "consensus-filters" && <><i className="threshold-ineligible" />contamination-ineligible</>}</span>{points.length.toLocaleString()} display points from {sample.totalFamilies.toLocaleString()} families. Threshold decisions run over the complete family table.</figcaption></figure>;
+  </svg><figcaption>{points.length.toLocaleString()} display points from {sample.totalFamilies.toLocaleString()} families. Threshold decisions run over the complete family table.</figcaption></figure>;
 }
 
 export function ThresholdReviewDialog({ review, onAccept, onCancel }: {

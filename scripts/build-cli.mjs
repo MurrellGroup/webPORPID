@@ -8,6 +8,8 @@ await build({
     "porpid-cli": new URL("../cli-src/porpid-cli-node.mjs", import.meta.url).pathname,
     "porpid-worker": new URL("../cli-src/porpid-worker.mjs", import.meta.url).pathname,
     "porpid-msa-worker": new URL("../cli-src/porpid-msa-worker.mjs", import.meta.url).pathname,
+    "porpid-mafft-worker": new URL("../cli-src/porpid-mafft-worker.mjs", import.meta.url).pathname,
+    "porpid-panel-worker": new URL("../cli-src/porpid-panel-worker.mjs", import.meta.url).pathname,
     "porpid-fasttree-worker": new URL("../cli-src/porpid-fasttree-worker.mjs", import.meta.url).pathname,
   },
   external: /^node:/,
@@ -16,6 +18,8 @@ await build({
 const assets = new URL("assets/", output); await mkdir(assets, { recursive: true });
 for (const [source, target] of [
   ["public/webporpid.wasm", "webporpid.wasm"], ["public/alivibe-msa.wasm", "alivibe-msa.wasm"],
+  ["public/biowasm/mafft/disttbfast.mjs", "disttbfast.mjs"], ["public/biowasm/mafft/disttbfast.wasm", "disttbfast.wasm"],
+  ["public/biowasm/mafft/LICENSE", "MAFFT-LICENSE"],
   ["public/biowasm/fasttree/fasttree.cjs", "fasttree.cjs"], ["public/biowasm/fasttree/fasttree.wasm", "fasttree.wasm"],
 ]) await copyFile(new URL(source, root), new URL(target, assets));
 await chmod(new URL("porpid-cli.mjs", output), 0o755);

@@ -8,7 +8,7 @@ This audit covers the browser/CLI pipeline from streamed FASTQ input through rep
 |---|---|---|---|
 | Contamination DP-means | Up to 30 complete assignment/mean passes per sample | Hard cap of three passes, with early convergence | Deliberate requested approximation. Center assignments after pass three are used as-is. Threshold inequalities and exact distance kernels are unchanged. |
 | Donor-aware contamination | Same-sample was the only self category | Precomputed donor/sample self-group key is used by both indexed and fallback nearest-neighbor paths | Samples with the same nonblank `donor_ID` cannot be non-self candidates for one another. Samples without an ID retain the previous per-sample behavior. |
-| Consensus partition grouping | Ordered `std::map` insertion plus a concatenated sample/tag key for every selected read: O(reads log families) | Reserved per-sample hash tables followed by the existing deterministic within-family read sort | Consensus records are sorted by the caller, so output content and final order are preserved. |
+| Consensus partition grouping | Ordered `std::map` insertion for every selected read: O(reads log families) | Reserved hash table followed by the existing deterministic within-family read sort | Consensus records are sorted by the caller, so output content and final order are preserved. |
 | Post-processing dispatch | Every worker-scoped sample scanned the complete consensus array | One linear pre-bucketing pass by sample index/name | Exact same records per sample. |
 | Pipeline/sample summaries | Repeated whole-array `filter` calls per sample and per statistic | Single-pass typed counters and per-sample buckets | Exact counts and percentages. |
 | Alignment modal sequence | A new `Map` and sort at every alignment column | Reused 128-symbol typed histogram plus first-observed tie order | Exact modal sequence, including the existing first-observed tie rule. |
@@ -24,21 +24,19 @@ Environment: Node v24.19.0, Linux x64, one process. Timings are wall-clock and s
 
 | Fixture | 0.3.7 | 0.3.8 | Speedup |
 |---|---:|---:|---:|
-| Consensus partition grouping, 20,000 three-read families | 0.087 s | 0.070 s | 1.25× |
 | Contamination, 6,000 × 600-nt consensuses, 6 samples, 80 panel rows | 3.963 s | 3.174 s | 1.25× |
 | Downstream filtering/annotation, 250 × 600-nt consensuses | 0.222 s | 0.158 s | 1.41× |
 | Across-sample overview, 100,000 families across 100 samples | 0.116 s | 0.011 s | 10.5× |
 
-The consensus benchmark's sorted consensus/sequence/agreement hash was identical (`f5014b…546c`). The downstream non-APOBEC record hash was identical (`5e203a…ba9`) and a direct APOBEC differential was also exact. The contamination hash intentionally differs because the requested three-pass cap can stop before the former 30-pass fixed point; the number of calls in this fixture happened to remain 5,832.
+The downstream non-APOBEC record hash was identical (`5e203a…ba9`) and a direct APOBEC differential was also exact. The contamination hash intentionally differs because the requested three-pass cap can stop before the former 30-pass fixed point; the number of calls in this fixture happened to remain 5,832.
 
 Run the current benchmark with:
 
 ```bash
 node scripts/benchmark-hotpaths.mjs
-node scripts/benchmark-consensus-grouping.mjs
 ```
 
-The hot-path script accepts module URL environment variables, and the consensus script accepts `WEBPORPID_CORE_WASM`, so a prior source tree/core can be used for a local differential without copying data.
+The script accepts module URL environment variables so a prior source tree can be used for a local differential without copying data.
 
 ## Remaining opportunities, not silently changed
 

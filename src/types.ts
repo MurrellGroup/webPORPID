@@ -1,3 +1,5 @@
+export type PanelFilterMode = "mafft-batch" | "independent-query";
+
 export interface PipelineParameters {
   errorRate: number;
   minLength: number;
@@ -16,6 +18,8 @@ export interface PipelineParameters {
   artefactFraction: number;
   outlierQuantile: number;
   panelThreshold: number;
+  /** Reference-panel alignment strategy; absent in projects through 0.3.8. */
+  panelFilterMode: PanelFilterMode;
   functionalMatchThreshold: number;
   spoolPartitions: number;
   deterministicSeed: bigint;
@@ -302,8 +306,7 @@ export interface ThresholdReviewSample {
   /** Exact 101-bin minimum-agreement distribution on [0,1]. */
   agreementBins?: number[];
   /** A deterministic display-only sample. Thresholds are always applied to every family. */
-  displayPoints?: Array<{ familySize: number; posteriorProbability?: number; minimumAgreement?: number;
-    umiLength?: number; contaminationEligible?: boolean; disposition: FamilyDisposition }>;
+  displayPoints?: Array<{ familySize: number; posteriorProbability?: number; minimumAgreement?: number; disposition: FamilyDisposition }>;
   current: {
     familySizeThreshold?: number;
     artefactFraction?: number;

@@ -11,7 +11,7 @@ The repository contains a neutral simulated demo only. Raw reads are processed l
 - Sparse two-edit UMI offspring likelihoods, LDA assignment, family-size gates, and heteroduplex detection.
 - Indel-tolerant family consensus, minimum-agreement calculation, and low-agreement-site logging.
 - Run-aware contamination clustering and filtering with three-pass DP-means, exact sparse six-mer kernels, bounded inverted posting indexes, donor-aware self groups, threshold-safe distance pruning, and time-budgeted progress updates for large runs.
-- Artefact, agreement, panel-profile, and functional filters, plus APOBEC summaries.
+- Artefact, agreement, and functional filters plus APOBEC summaries. Reference-panel filtering defaults to bundled MAFFT 7.520 FFT-NS-2 and also offers a multi-worker independent-query affine profile aligner for very large family sets.
 - Post-filter haplotype collapse with one multiplicity per retained UMI family, collapsed-tree abundance bubbles, and optional on-demand family-level trees.
 - Exact abundance geometry: bubble area is strictly linear in retained UMI-family count with no radius cap or floor, and the display slider is expressed as area per family.
 - Live, scrollable per-sample demultiplexing counts and phase-specific feedback with an independent working heartbeat for long operations.
@@ -62,6 +62,8 @@ node cli/porpid-cli.mjs export results.webporpid --component consensus-fasta --s
 
 Reference paths are resolved relative to the configuration file. Workers default to all logical CPUs; use `--workers N` to cap them. Use `--defer-phylogeny` to store collapsed alignments without running FastTree until requested in the browser. Temporary partitions default to the operating-system temporary directory and can be redirected with `WEBPORPID_TMPDIR`.
 
+The reference-panel strategy is stored as `parameters.panelFilterMode` in YAML (`mafft-batch`, the default, or `independent-query`). The CLI can override it for one run with `--panel-filter independent-query`. The independent mode avoids a joint candidate MSA, distributes candidates over the requested workers, and is recommended when a sample contains a very large number of retained UMI families.
+
 The release workflow compiles self-contained `porpid-cli` executables for Linux x64/arm64, macOS x64/arm64, and Windows x64 whenever a `v*` tag is pushed or the workflow is started manually.
 
 ## Simulated demo
@@ -78,7 +80,7 @@ The supplied demo has one accepted UMI family and exercises indel-tolerant conse
 
 Input is decoded in bounded batches. Demultiplexed reads are hashed into disk partitions; the count and consensus passes scan fixed-size record headers and materialize one partition per active worker. External scratch is the browser default when the directory API is available: the user chooses a writable directory, partitions are streamed sequentially outside origin quota, and the temporary subdirectory is removed after consensus. Automatic OPFS/browser storage remains selectable; its monotone deterministic cutoff bypasses records that cannot survive `maxReadsPerSample`, and periodic compaction removes stale early candidates without changing the final selected set. Count/consensus concurrency is bounded from measured partition sizes. The CLI always uses an ordinary temporary directory; the automatic browser fallback has an explicit 512 MiB in-memory limit if OPFS is unavailable.
 
-Downstream MSA runs monolithically up to 8,000 rows and 128 MiB of input bases. Larger jobs use deterministic 2,000-row shared-anchor batches, retaining only the final alignment rather than a single enormous aligner workspace.
+The default panel filter runs one MAFFT FFT-NS-2 candidate MSA per sample. The optional independent-query strategy uses adaptive-banded affine alignment to the fixed panel profile and does not allocate an all-candidate MSA. Other downstream MSAs run monolithically up to 8,000 rows and 128 MiB of input bases; larger jobs use deterministic 2,000-row shared-anchor batches.
 
 ## Validation
 

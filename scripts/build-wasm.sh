@@ -43,6 +43,6 @@ sources=(
   -o "$build_dir/webporpid.raw.wasm"
 
 "$wasm_opt" "$build_dir/webporpid.raw.wasm" -O4 --converge --enable-bulk-memory \
-  --enable-simd --enable-nontrapping-float-to-int --strip-debug --strip-producers -o "$build_dir/webporpid.wasm"
+  --enable-simd --strip-debug --strip-producers -o "$build_dir/webporpid.wasm"
 install -m 755 "$build_dir/webporpid.wasm" "$project_dir/public/webporpid.wasm"
 echo "Built optimized SIMD public/webporpid.wasm"

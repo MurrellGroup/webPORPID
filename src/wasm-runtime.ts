@@ -1,5 +1,5 @@
 import { WASI } from "@bjorn3/browser_wasi_shim";
-import { BinaryReader, BinaryWriter } from "./binary.ts";
+import { BinaryReader, BinaryWriter } from "./binary";
 import type { ConsensusRecord, FamilyDisposition, PipelineConfig, QualityStats, UmiFamily } from "./types";
 
 interface CoreExports extends WebAssembly.Exports {

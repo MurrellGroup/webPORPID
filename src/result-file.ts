@@ -40,6 +40,8 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     "functionalMatchThreshold", "spoolPartitions"])
     numeric(parameters[key], `config.parameters.${key}`);
   bool(parameters.contaminationFilter, "config.parameters.contaminationFilter");
+  if (parameters.panelFilterMode != null && parameters.panelFilterMode !== "mafft-batch" && parameters.panelFilterMode !== "independent-query")
+    throw new Error("config.parameters.panelFilterMode must be mafft-batch or independent-query.");
   text(parameters.deterministicSeed, "config.parameters.deterministicSeed");
   const samples = array(config.samples, "config.samples").map((entry, index) => {
     const sample = object(entry, `config.samples[${index}]`); const name = text(sample.name, `config.samples[${index}].name`);

@@ -6133,6 +6133,7 @@ const DEFAULT_PARAMETERS = {
 	artefactFraction: .25,
 	outlierQuantile: .99,
 	panelThreshold: 50,
+	panelFilterMode: "mafft-batch",
 	functionalMatchThreshold: .7,
 	spoolPartitions: 64,
 	deterministicSeed: 88301613631812n
@@ -6176,6 +6177,22 @@ function parseParameters(source) {
 	assignNumber("artefactFraction", "artefactFraction", "artefact_fraction", "af_thresh");
 	assignNumber("outlierQuantile", "outlierQuantile", "outlier_quantile", "q_thresh");
 	assignNumber("panelThreshold", "panelThreshold", "panel_threshold", "panel_thresh");
+	const rawPanelMode = pick(source, "panelFilterMode", "panel_filter_mode", "panel_filter");
+	if (rawPanelMode !== void 0) {
+		const value = String(rawPanelMode).trim().toLowerCase();
+		const modes = {
+			"mafft-batch": "mafft-batch",
+			mafft: "mafft-batch",
+			batch: "mafft-batch",
+			"fft-ns-2": "mafft-batch",
+			"independent-query": "independent-query",
+			independent: "independent-query",
+			"per-query": "independent-query",
+			pairwise: "independent-query"
+		};
+		if (!modes[value]) throw new Error("panelFilterMode must be mafft-batch or independent-query.");
+		result.panelFilterMode = modes[value];
+	}
 	assignNumber("functionalMatchThreshold", "functionalMatchThreshold", "functional_match_threshold", "ff_match");
 	assignNumber("spoolPartitions", "spoolPartitions", "spool_partitions");
 	const contamination = pick(source, "contaminationFilter", "contamination_filter", "contam_toggle");
@@ -6183,7 +6200,7 @@ function parseParameters(source) {
 	const seed = pick(source, "deterministicSeed", "deterministic_seed");
 	if (seed !== void 0) result.deterministicSeed = BigInt(String(seed));
 	for (const [key, value] of Object.entries(result)) {
-		if (key === "deterministicSeed" || key === "contaminationFilter") continue;
+		if (key === "deterministicSeed" || key === "contaminationFilter" || key === "panelFilterMode") continue;
 		if (!Number.isFinite(value)) throw new Error(`Parameter ${key} must be numeric.`);
 	}
 	if (result.deterministicSeed < 0n || result.deterministicSeed > 18446744073709551615n) throw new Error("deterministicSeed must be an unsigned 64-bit integer.");

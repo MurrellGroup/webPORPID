@@ -435,35 +435,37 @@ std::vector<std::uint8_t> process_consensus_partition(std::span<const std::uint8
                                                       const Config& config, std::string& error) {
   const auto thresholds = cutoffs(cutoff_bytes, error); if (!error.empty()) return {};
   const auto records = decode_spool(bytes, error); if (!error.empty()) return {};
-  std::vector<std::size_t> decisions_per_sample(config.samples.size());
-  for (const auto& decision : model) if (decision.sample < decisions_per_sample.size()) decisions_per_sample[decision.sample]++;
-  std::vector<std::unordered_map<std::string, const FamilyDecision*>> decisions(config.samples.size());
-  for (std::size_t sample = 0; sample < decisions.size(); ++sample) decisions[sample].reserve(decisions_per_sample[sample]);
-  for (const auto& decision : model) if (decision.sample < decisions.size()) decisions[decision.sample].emplace(decision.umi, &decision);
+  const auto key = [](std::uint16_t sample, std::string_view umi) { return std::to_string(sample) + '\0' + std::string(umi); };
+  std::unordered_map<std::string, const FamilyDecision*> decisions;
+  for (const auto& decision : model) decisions.emplace(key(decision.sample, decision.umi), &decision);
   // Callers sort decoded consensus records, so an ordered family map only adds
-  // O(reads log families) work. Per-sample hash tables also avoid allocating a
-  // concatenated sample/tag lookup key for every read. Within-family read order
-  // is still restored explicitly below.
-  std::vector<std::unordered_map<std::string, std::vector<SpoolRecord>>> grouped(config.samples.size());
-  for (std::size_t sample = 0; sample < grouped.size(); ++sample) grouped[sample].reserve(decisions_per_sample[sample]);
-  for (const auto& record : records) if (record.sample < grouped.size() && selected(record, thresholds)
-      && decisions[record.sample].contains(record.umi)) grouped[record.sample][record.umi].push_back(record);
+  // O(reads log families) work. Hash grouping preserves every family member;
+  // within-family read order is still restored explicitly below.
+  std::unordered_map<std::string, std::vector<SpoolRecord>> grouped;
+  grouped.reserve(std::min(records.size(), model.size()));
+  for (const auto& record : records) if (selected(record, thresholds)) {
+    auto family_key = key(record.sample, record.umi);
+    if (decisions.contains(family_key)) grouped[std::move(family_key)].push_back(record);
+  }
   std::vector<ConsensusRecord> consensuses;
   std::vector<std::pair<std::uint16_t, std::string>> heteroduplexes;
-  for (std::size_t sample_index = 0; sample_index < grouped.size(); ++sample_index) for (auto& [umi, family_reads] : grouped[sample_index]) {
-    const auto* decision = decisions[sample_index].at(umi);
+  for (auto& [family_key, family_reads] : grouped) {
+    const auto* decision = decisions[family_key];
+    const auto sample_index = decision->sample;
+    const auto& umi = decision->umi;
+    if (sample_index >= config.samples.size()) continue;
     std::stable_sort(family_reads.begin(), family_reads.end(), [](const auto& left, const auto& right) {
       const auto left_ordinal = read_ordinal(left.name), right_ordinal = read_ordinal(right.name);
       return left_ordinal != right_ordinal ? left_ordinal < right_ordinal : left.name < right.name;
     });
     if (decision->disposition == FamilyDisposition::bpb_reject) continue;
     if (heteroduplex(family_reads, config.samples[sample_index])) {
-      heteroduplexes.emplace_back(static_cast<std::uint16_t>(sample_index), umi); continue;
+      heteroduplexes.emplace_back(sample_index, umi); continue;
     }
     if (decision->disposition != FamilyDisposition::likely_real) continue;
     std::vector<std::string> sequences; sequences.reserve(family_reads.size());
     for (const auto& read : family_reads) sequences.push_back(read.sequence);
-    ConsensusRecord record; record.sample = static_cast<std::uint16_t>(sample_index); record.umi = umi;
+    ConsensusRecord record; record.sample = sample_index; record.umi = umi;
     record.family_size = family_reads.size();
     auto raw = family_consensus(sequences, record.minimum_agreement, record.low_sites);
     const auto& full_primer = config.samples[sample_index].cdna_primer;

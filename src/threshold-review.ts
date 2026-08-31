@@ -40,7 +40,7 @@ export function buildUmiThresholdReview(families: readonly UmiFamily[], config: 
       return { sample: sample.name, donorId: sample.donorId, totalFamilies: rows.length,
         familySizeCounts: frequencyTable(rows.map((row) => row.familySize)), posteriorBins: bins(rows.map((row) => row.posteriorProbability), 200),
         displayPoints: stableDisplaySample(rows).map((row) => ({ familySize: row.familySize,
-          posteriorProbability: row.posteriorProbability, umiLength: row.umi.length, disposition: row.disposition })),
+          posteriorProbability: row.posteriorProbability, disposition: row.disposition })),
         current: { familySizeThreshold: sample.familySizeOverride ?? config.parameters.familySizeThreshold },
         usesGlobal: { familySizeThreshold: sample.familySizeOverride === undefined } };
     }),
@@ -66,7 +66,7 @@ export function buildConsensusThresholdReview(consensuses: readonly ConsensusRec
         familySizeCounts: frequencyTable(abundanceRows.map((row) => row.familySize)),
         agreementBins: bins(allRows.map((row) => row.minimumAgreement), 100),
         displayPoints: stableDisplaySample(allRows).map((row) => ({ familySize: row.familySize,
-          minimumAgreement: row.minimumAgreement, contaminationEligible: !discardedIds.has(row.id), disposition: "likely_real" as const })),
+          minimumAgreement: row.minimumAgreement, disposition: "likely_real" as const })),
         current: { artefactFraction: sample.artefactFractionOverride ?? config.parameters.artefactFraction,
           outlierQuantile: sample.outlierQuantileOverride ?? config.parameters.outlierQuantile,
           agreementThreshold: sample.agreementOverride ?? config.parameters.agreementThreshold },

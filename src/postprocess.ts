@@ -1,4 +1,7 @@
 import { runAlivibeMsa } from "./alivibe-msa-runtime.ts";
+import { runIndependentPanelFilter } from "./independent-panel-filter-runtime.ts";
+import type { PanelFilterResult } from "./independent-panel-filter.ts";
+import { runMafftFftnsMsa } from "./mafft-msa-runtime.ts";
 import { translateAlignedNucleotides } from "./alignment-utils.ts";
 import { collapseAlignment } from "./collapse.ts";
 import { extractAndScorePanel } from "./panel-profile.ts";
@@ -15,13 +18,22 @@ export interface PostprocessOutput {
 }
 
 export type MsaRunner = (sequences: readonly string[], signal?: AbortSignal, iterations?: number,
-  scoringMode?: "literal" | "nucleotide" | "amino-acid") => Promise<string[]>;
+  scoringMode?: "literal" | "nucleotide" | "amino-acid", onProgress?: (progress: { detail: string }) => void) => Promise<string[]>;
+
+export type PanelFilterRunner = (sequences: readonly string[], panelRows: readonly string[], signal?: AbortSignal,
+  workers?: number, onProgress?: (progress: { completed: number; total: number }) => void) => Promise<PanelFilterResult>;
 
 export interface PostprocessProgress { fraction: number; detail: string }
 export interface PostprocessOptions {
   /** Keep false when collapse is run as its own cancellable pipeline stage. */
   collapse?: boolean;
   onCollapseProgress?: (progress: PostprocessProgress) => void;
+  /** Batch panel MSA. The browser default is the bundled MAFFT FFT-NS-2 runtime. */
+  panelMsa?: MsaRunner;
+  /** Independent query-to-panel implementation, injected by the CLI. */
+  panelFilter?: PanelFilterRunner;
+  /** CPU workers available to each active sample's independent panel filter. */
+  panelWorkers?: number;
 }
 
 const degap = (sequence: string) => sequence.replaceAll("-", "").toUpperCase();
@@ -242,6 +254,8 @@ export async function postprocess(
   runMsa: MsaRunner = runAlivibeMsa, sampleConcurrency = 1, onProgress?: (progress: PostprocessProgress) => void,
   options: PostprocessOptions = {},
 ): Promise<PostprocessOutput> {
+  const panelMsa = options.panelMsa ?? runMafftFftnsMsa;
+  const independentPanelFilter = options.panelFilter ?? runIndependentPanelFilter;
   const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
   const outputs: PostprocessOutput[] = Array(config.samples.length); let cursor = 0;
   const sourceBySample = Array.from({ length: config.samples.length }, () => [] as ConsensusRecord[]);
@@ -271,13 +285,26 @@ export async function postprocess(
       && record.minimumAgreement >= agreementThreshold && !discarded.has(record.id));
     const scores = Array(source.length).fill(0), panelPass = Array(source.length).fill(true), extracted = new Map<number, string>();
     if (preliminary.length && sample.panelSequences.length) {
-      report(sampleIndex, .18, `Screening candidate sequences against the reference panel for sample ${sample.name}`);
-      const candidates = preliminary.length > 1
-        ? await runScalableMsa(preliminary.map(({ record }) => degap(record.sequence)), runMsa, signal, 3, "nucleotide")
-        : preliminary.map(({ record }) => degap(record.sequence));
-      // The supplied panel is already a reference alignment in PORPID. Align
-      // its profile to the independently aligned sample profile, matching the reference workflow.
-      const panelResult = extractAndScorePanel(candidates, sample.panelSequences.map((record) => record.sequence));
+      const panelRows = sample.panelSequences.map((record) => record.sequence), rawCandidates = preliminary.map(({ record }) => degap(record.sequence));
+      const panelMode = config.parameters.panelFilterMode ?? "mafft-batch";
+      report(sampleIndex, .18, panelMode === "independent-query"
+        ? `Aligning ${preliminary.length.toLocaleString()} candidate families independently to the reference panel for ${sample.name}`
+        : `Building the batch MAFFT FFT-NS-2 alignment for ${preliminary.length.toLocaleString()} candidate families in ${sample.name}`);
+      let panelResult: PanelFilterResult;
+      if (panelMode === "independent-query") {
+        const activeSamples = Math.max(1, Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))));
+        const panelWorkers = options.panelWorkers ?? Math.max(1, Math.floor(Math.max(1, sampleConcurrency) / activeSamples));
+        panelResult = await independentPanelFilter(rawCandidates, panelRows, signal, panelWorkers, ({ completed, total }) =>
+          report(sampleIndex, .18 + .2 * completed / Math.max(1, total),
+            `Reference-panel alignment for ${sample.name}: ${completed.toLocaleString()} of ${total.toLocaleString()} families`));
+      } else {
+        const candidates = rawCandidates.length > 1
+          ? await panelMsa(rawCandidates, signal, 0, "nucleotide", ({ detail }) =>
+            report(sampleIndex, .24, `MAFFT FFT-NS-2 for ${sample.name}: ${detail}`))
+          : rawCandidates;
+        report(sampleIndex, .34, `Projecting the ${sample.name} candidate alignment onto its fixed reference panel`);
+        panelResult = extractAndScorePanel(candidates, panelRows);
+      }
       preliminary.forEach(({ index }, candidate) => {
         extracted.set(index, degap(panelResult.sequences[candidate])); scores[index] = panelResult.scores[candidate];
         panelPass[index] = scores[index] < config.parameters.panelThreshold;

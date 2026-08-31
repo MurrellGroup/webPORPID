@@ -36,7 +36,7 @@ WPP_EXPORT std::uint8_t* wpp_alloc(std::uint32_t size) {
 
 WPP_EXPORT void wpp_free(void* pointer) { std::free(pointer); }
 
-WPP_EXPORT const char* wpp_version() { return "0.3.8"; }
+WPP_EXPORT const char* wpp_version() { return "0.3.0"; }
 
 WPP_EXPORT std::int32_t wpp_init_config(const std::uint8_t* pointer, std::uint32_t length) {
   error.clear(); result.clear(); model.clear(); stats = {};
