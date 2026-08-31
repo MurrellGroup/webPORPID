@@ -6217,6 +6217,7 @@ function parseSamples(source) {
 		const value = mapping(raw, `Sample ${name}`);
 		return {
 			name,
+			donorId: text(pick(value, "donor_ID", "donor_id", "donorId"), `${name}.donor_ID`, true).trim() || void 0,
 			cdnaPrimer: text(pick(value, "cDNA_primer", "cdna_primer", "cdnaPrimer"), `${name}.cDNA_primer`),
 			secondStrandPrimer: text(pick(value, "sec_str_primer", "secondStrandPrimer"), `${name}.sec_str_primer`),
 			panel: text(value.panel, `${name}.panel`),
@@ -6255,6 +6256,7 @@ function parseConfigYaml(source) {
 	const assays = /* @__PURE__ */ new Set();
 	for (const sample of config.samples) {
 		if (!sample.name.trim()) throw new Error("Every sample needs a non-empty name.");
+		if (sample.donorId !== void 0 && !sample.donorId.trim()) throw new Error(`${sample.name}.donor_ID cannot be blank.`);
 		if (!sample.cdnaPrimer.match(/[a-z]+/)?.[0].toUpperCase()) throw new Error(`${sample.name} cDNA_primer has no lower-case sample ID.`);
 		const assay = `${sample.secondStrandPrimer.toUpperCase()}\0${sample.cdnaPrimer.toUpperCase()}`;
 		if (assays.has(assay)) throw new Error(`${sample.name} duplicates another sample's complete primer pair.`);

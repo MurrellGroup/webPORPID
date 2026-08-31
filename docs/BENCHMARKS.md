@@ -1,5 +1,7 @@
 # Corrected simulated-data benchmark
 
+The 0.3.8 whole-pipeline hot-path audit and reproducible synthetic benchmark are in [PERFORMANCE_AUDIT.md](PERFORMANCE_AUDIT.md).
+
 This benchmark uses the corrected six-sample simulated dataset supplied for the 2026-08-27 validation. The biological strings were treated as opaque fixtures: the comparison reads pipeline outputs and aggregate counts, not sequence content. The run contained 59,695 FASTQ records, 59,432 demultiplexed reads, 3,454 observed UMI families, and 3,043 consensus calls.
 
 ## Version 0.3.7 contamination stress check

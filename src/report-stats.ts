@@ -20,6 +20,7 @@ export interface CountStat {
 
 export interface SampleOverviewStat {
   sample: string;
+  donorId: string;
   demultiplexedReads: number;
   selectedReads: number;
   downsampledReads: number;
@@ -149,35 +150,60 @@ function rejectionReadPercent(records: readonly PostprocRecord[], predicate: (ro
 }
 
 export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] {
+  const familiesBySample = new Map(bundle.config.samples.map((sample) => [sample.name, [] as UmiFamily[]]));
+  const recordsBySample = new Map(bundle.config.samples.map((sample) => [sample.name, [] as PostprocRecord[]]));
+  const consensusesBySample = new Map(bundle.config.samples.map((sample) => [sample.name, [] as typeof bundle.consensuses]));
+  const contaminantsBySample = new Map(bundle.config.samples.map((sample) => [sample.name, new Set<string>()]));
+  const summariesBySample = new Map(bundle.summaries.map((summary) => [summary.sample, summary]));
+  for (const row of bundle.umiFamilies) familiesBySample.get(row.sample)?.push(row);
+  for (const row of bundle.records) recordsBySample.get(row.sample)?.push(row);
+  for (const row of bundle.consensuses) consensusesBySample.get(row.sample)?.push(row);
+  for (const row of bundle.contamination) if (row.discarded) contaminantsBySample.get(row.sample)?.add(row.sequenceId);
   return bundle.config.samples.map((configured) => {
-    const sample = configured.name, summary = bundle.summaries.find((row) => row.sample === sample);
-    const families = bundle.umiFamilies.filter((row) => row.sample === sample), records = bundle.records.filter((row) => row.sample === sample);
-    const consensuses = bundle.consensuses.filter((row) => row.sample === sample);
-    const contaminantIds = new Set(bundle.contamination.filter((row) => row.sample === sample && row.discarded).map((row) => row.sequenceId));
-    const demultiplexedReads = summary?.demultiplexedReads ?? 0, selectedReads = selectedReadCount(bundle, sample);
+    const sample = configured.name, summary = summariesBySample.get(configured.name);
+    const families = familiesBySample.get(sample)!, records = recordsBySample.get(sample)!, consensuses = consensusesBySample.get(sample)!;
+    const contaminantIds = contaminantsBySample.get(sample)!;
+    const functionalConfigured = Boolean(configured.functionalReference);
+    let familyReads = 0, observedFamilies = 0;
+    const dispositionReads = new Map<FamilyDisposition, number>();
+    for (const row of families) {
+      familyReads += row.familySize; if (row.disposition !== "BPB-rejects") observedFamilies++;
+      dispositionReads.set(row.disposition, (dispositionReads.get(row.disposition) ?? 0) + row.familySize);
+    }
+    const demultiplexedReads = summary?.demultiplexedReads ?? 0, selectedReads = summary?.selectedReads ?? familyReads;
     const downsampledReads = summary?.downsampledReads ?? Math.max(0, demultiplexedReads - selectedReads);
-    const evaluated = records.filter(functionalWasEvaluated), functionalConfigured = Boolean(configured.functionalReference);
+    let recordReads = 0, artefactRejectReads = 0, agreementRejectReads = 0, contaminationRejectReads = 0, panelRejectReads = 0;
+    let functionalRejectReads = 0, retainedFamilies = 0, functionalEvaluatedFamilies = 0, functionalPassedFamilies = 0;
+    for (const row of records) {
+      recordReads += row.familySize; if (!row.artefactPass) artefactRejectReads += row.familySize;
+      if (!row.agreementPass) agreementRejectReads += row.familySize; if (!row.contaminationPass) contaminationRejectReads += row.familySize;
+      if (!row.panelPass) panelRejectReads += row.familySize; if (passedPostproc(row)) retainedFamilies++;
+      if (functionalWasEvaluated(row)) { functionalEvaluatedFamilies++; if (row.functionalPass) functionalPassedFamilies++; else functionalRejectReads += row.familySize; }
+    }
+    const dispositionPercent = (disposition: FamilyDisposition) => percent(dispositionReads.get(disposition) ?? 0, familyReads);
+    let consensusReads = 0, contaminantConsensusReads = 0;
+    for (const row of consensuses) { consensusReads += row.familySize; if (contaminantIds.has(row.id)) contaminantConsensusReads += row.familySize; }
     return {
-      sample, demultiplexedReads, selectedReads, downsampledReads,
+      sample, donorId: configured.donorId ?? "—", demultiplexedReads, selectedReads, downsampledReads,
       downsampledPercent: percent(downsampledReads, demultiplexedReads),
-      observedFamilies: families.filter((row) => row.disposition !== "BPB-rejects").length,
+      observedFamilies,
       consensusFamilies: summary?.consensusSequences ?? consensuses.length,
-      retainedFamilies: records.filter(passedPostproc).length,
+      retainedFamilies,
       functionalConfigured,
-      functionalEvaluatedFamilies: evaluated.length,
-      functionalPassedFamilies: evaluated.filter((row) => row.functionalPass === true).length,
+      functionalEvaluatedFamilies,
+      functionalPassedFamilies,
       collapsedHaplotypes: summary?.collapsedSequences ?? bundle.collapseGroups?.[sample]?.length ?? 0,
-      bpbReadPercent: dispositionReadPercent(families, "BPB-rejects"),
-      umiLengthReadPercent: dispositionReadPercent(families, "UMI_len != 8"),
-      familySizeReadPercent: dispositionReadPercent(families, "family-size-reject"),
-      ldaReadPercent: dispositionReadPercent(families, "LDA-rejects"),
-      heteroduplexReadPercent: dispositionReadPercent(families, "heteroduplex"),
-      artefactReadPercent: rejectionReadPercent(records, (row) => !row.artefactPass),
-      agreementReadPercent: rejectionReadPercent(records, (row) => !row.agreementPass),
-      contaminationReadPercent: records.length && bundle.postprocessingContaminationMode !== "bypassed" ? rejectionReadPercent(records, (row) => !row.contaminationPass)
-        : percent(readCount(consensuses.filter((row) => contaminantIds.has(row.id))), readCount(consensuses)),
-      panelReadPercent: rejectionReadPercent(records, (row) => !row.panelPass),
-      functionalReadPercent: percent(readCount(evaluated.filter((row) => row.functionalPass === false)), readCount(records)),
+      bpbReadPercent: dispositionPercent("BPB-rejects"),
+      umiLengthReadPercent: dispositionPercent("UMI_len != 8"),
+      familySizeReadPercent: dispositionPercent("family-size-reject"),
+      ldaReadPercent: dispositionPercent("LDA-rejects"),
+      heteroduplexReadPercent: dispositionPercent("heteroduplex"),
+      artefactReadPercent: percent(artefactRejectReads, recordReads),
+      agreementReadPercent: percent(agreementRejectReads, recordReads),
+      contaminationReadPercent: records.length && bundle.postprocessingContaminationMode !== "bypassed"
+        ? percent(contaminationRejectReads, recordReads) : percent(contaminantConsensusReads, consensusReads),
+      panelReadPercent: percent(panelRejectReads, recordReads),
+      functionalReadPercent: percent(functionalRejectReads, recordReads),
     };
   });
 }
@@ -213,6 +239,7 @@ export function parameterSettings(bundle: ResultBundle): ParameterSettingRow[] {
   for (const sample of bundle.config.samples) {
     const add = (parameter: string, value: unknown) => rows.push({ scope: "sample", sample: sample.name, parameter, value: String(value ?? "—") });
     add("cDNA primer", sample.cdnaPrimer); add("second-strand primer", sample.secondStrandPrimer);
+    add("donor_ID", sample.donorId ?? "not configured");
     add("panel", sample.panel); add("functional reference", sample.functionalReference ?? "not configured");
     add("familySizeThreshold (effective)", sample.familySizeOverride ?? bundle.config.parameters.familySizeThreshold);
     add("artefactFraction (effective)", sample.artefactFractionOverride ?? bundle.config.parameters.artefactFraction);

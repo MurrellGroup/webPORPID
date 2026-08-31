@@ -43,6 +43,7 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   text(parameters.deterministicSeed, "config.parameters.deterministicSeed");
   const samples = array(config.samples, "config.samples").map((entry, index) => {
     const sample = object(entry, `config.samples[${index}]`); const name = text(sample.name, `config.samples[${index}].name`);
+    optionalText(sample.donorId, `config.samples[${index}].donorId`);
     text(sample.cdnaPrimer, `config.samples[${index}].cdnaPrimer`); text(sample.secondStrandPrimer, `config.samples[${index}].secondStrandPrimer`);
     text(sample.panel, `config.samples[${index}].panel`); optionalText(sample.functionalReference, `config.samples[${index}].functionalReference`); return name;
   });
@@ -240,7 +241,7 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   });
   if (bundle.runOptions != null) {
     const options = object(bundle.runOptions, "runOptions"); bool(options.deferPhylogeny, "runOptions.deferPhylogeny");
-    for (const key of ["deferContamination", "deferPostprocessing", "deferCollapse"])
+    for (const key of ["deferContamination", "deferPostprocessing", "deferCollapse", "interactiveFiltering"])
       if (options[key] != null) bool(options[key], `runOptions.${key}`);
     if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage")))
       throw new Error("runOptions.spoolStorage is not recognized.");
@@ -321,6 +322,28 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     if (seconds < 0) throw new Error(`timings[${index}].seconds must be non-negative.`);
     if (timing.workItems != null) count(timing.workItems, `timings[${index}].workItems`);
   });
+  if (bundle.thresholdSelections != null) {
+    const ids = new Set<string>();
+    array(bundle.thresholdSelections, "thresholdSelections").forEach((rawEntry, index) => {
+      const entry = object(rawEntry, `thresholdSelections[${index}]`), id = text(entry.id, `thresholdSelections[${index}].id`);
+      if (ids.has(id)) throw new Error("Interactive threshold checkpoint identifiers must be unique."); ids.add(id);
+      const phase = text(entry.phase, `thresholdSelections[${index}].phase`);
+      if (!['umi', 'consensus-filters'].includes(phase)) throw new Error("Interactive threshold phase is not recognized.");
+      text(entry.acceptedUtc, `thresholdSelections[${index}].acceptedUtc`);
+      array(entry.changes, `thresholdSelections[${index}].changes`).forEach((change) => text(change, "threshold change"));
+      const selectedParameters = object(entry.parameters, `thresholdSelections[${index}].parameters`);
+      for (const key of ["ldaThreshold", "familySizeThreshold", "artefactFraction", "outlierQuantile", "agreementThreshold"])
+        if (selectedParameters[key] != null) numeric(selectedParameters[key], `thresholdSelections[${index}].parameters.${key}`);
+      const selectedSamples = new Set<string>();
+      array(entry.samples, `thresholdSelections[${index}].samples`).forEach((rawSample, sampleIndex) => {
+        const selected = object(rawSample, `thresholdSelections[${index}].samples[${sampleIndex}]`);
+        const name = text(selected.sample, "threshold sample"); knownSample(name, "threshold sample");
+        if (selectedSamples.has(name)) throw new Error("An interactive threshold checkpoint contains duplicate sample rows."); selectedSamples.add(name);
+        for (const key of ["familySizeOverride", "artefactFractionOverride", "outlierQuantileOverride", "agreementOverride"])
+          if (selected[key] != null) numeric(selected[key], `threshold sample ${key}`);
+      });
+    });
+  }
   array(bundle.log, "log").forEach((entry, index) => text(entry, `log[${index}]`));
 }
 

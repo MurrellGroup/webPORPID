@@ -1,6 +1,6 @@
 {
   "name": "webporpid",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "private": true,
   "type": "module",
   "scripts": {
@@ -14,6 +14,8 @@
     "test:ts": "node --test tests/ts-core.test.mjs",
     "test:cli": "node scripts/build-cli.mjs && node --test tests/cli-smoke.test.mjs",
     "test": "npm run test:cpp && npm run test:wasm && npm run test:ts && npm run test:cli && npm run check",
+    "benchmark:hotpaths": "node scripts/benchmark-hotpaths.mjs",
+    "benchmark:consensus": "node scripts/benchmark-consensus-grouping.mjs",
     "parity": "bash scripts/parity-consensus.sh && bash scripts/parity-umi.sh && bash scripts/parity-panel.sh && bash scripts/parity-functional.sh && bash scripts/parity-demo.sh"
   },
   "dependencies": {

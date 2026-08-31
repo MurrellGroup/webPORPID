@@ -38,7 +38,7 @@ wasi.initialize(instance);
 const core = instance.exports;
 const versionPointer = core.wpp_version(), versionMemory = new Uint8Array(core.memory.buffer);
 let versionEnd = versionPointer; while (versionMemory[versionEnd]) versionEnd++;
-assert.equal(new TextDecoder().decode(versionMemory.subarray(versionPointer, versionEnd)), "0.3.0");
+assert.equal(new TextDecoder().decode(versionMemory.subarray(versionPointer, versionEnd)), "0.3.8");
 const put = (input) => { const pointer = core.wpp_alloc(input.length); new Uint8Array(core.memory.buffer, pointer, input.length).set(input); return pointer; };
 const takeResult = () => new Uint8Array(core.memory.buffer, core.wpp_result_ptr(), core.wpp_result_len()).slice();
 const one = (input, call) => { const pointer = put(input); try { assert(call(pointer, input.length) >= 0); return takeResult(); } finally { core.wpp_free(pointer); } };

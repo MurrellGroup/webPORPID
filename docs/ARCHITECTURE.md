@@ -40,7 +40,11 @@ Preprocessing batches can finish out of order because spool order is not semanti
 
 The consensus hot path uses sparse exact six-mer profiles, collision-free rolling 60-bit encodings for canonical 30-base seeds, contiguous buffers, and seeded long-read alignment. A seedless region uses an adaptive band whose width includes the complete length difference plus a square-root noise allowance; seeded intervals retain the original full dynamic program. Ambiguous/lower-case seed input keeps the byte-exact fallback path. The core is compiled at `-O3 -msimd128` and the optimized binary contains SIMD vector operations.
 
-Centroid profiles are counted once per read rather than allocating and rescanning a dense 4,096-bin vector. Refinement stops at its deterministic fixed point, and the final fixed-point alignments are reused for agreement counting. Agreement symbols use fixed counters instead of per-position strings. Identical families still bypass alignment without changing their sequence or agreement. The substitution, mixed-indel, high-indel, terminal-overhang, and identical-family Julia parity cases remain exact.
+Centroid profiles are counted once per read rather than allocating and rescanning a dense 4,096-bin vector. Refinement stops at its deterministic fixed point, and the final fixed-point alignments are reused for agreement counting. Agreement symbols use fixed counters instead of per-position strings. Identical families still bypass alignment without changing their sequence or agreement.
+
+When interactive filtering is enabled, orchestration pauses twice without retaining raw reads beyond their normal lifetime. The first checkpoint reuses the completed offspring probabilities and re-encodes the accepted family decisions for the consensus workers. The second is built after consensus and contamination eligibility, so its abundance distribution is the exact downstream input. Both decisions are stored in the project audit and human review time is excluded from computational timing.
+
+Optional sample `donor_ID` values are normalized into biological self-group keys for contamination queries. Run-derived signatures from the same donor are never considered non-self; external contamination references remain non-self. The result explorer can construct an on-demand cross-sample alignment and tree for each donor while retaining sample categories and collapsed family multiplicities.
 
 ## Downstream scale
 

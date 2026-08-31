@@ -35,10 +35,23 @@ function quantile(values: number[], probability: number) {
 
 function alignmentConsensus(rows: string[]) {
   if (!rows.length) return ""; let output = "";
+  const counts = new Uint32Array(128), touched = new Uint8Array(128);
   for (let position = 0; position < rows[0].length; position++) {
-    const counts = new Map<string, { count: number; first: number }>();
-    rows.forEach((row, index) => { const base = row[position].toUpperCase(), value = counts.get(base) ?? { count: 0, first: index }; value.count++; counts.set(base, value); });
-    output += [...counts].sort((a, b) => b[1].count - a[1].count || a[1].first - b[1].first)[0][0];
+    let touchedCount = 0;
+    for (const row of rows) {
+      let code = row.charCodeAt(position); if (code >= 97 && code <= 122) code -= 32;
+      if (code >= counts.length) code = 63;
+      if (counts[code] === 0) touched[touchedCount++] = code;
+      counts[code]++;
+    }
+    let bestCode = touched[0] ?? 45, bestCount = counts[bestCode];
+    // Touched symbols are in first-observed order; strict greater therefore
+    // preserves the original modal tie rule after final counts are known.
+    for (let index = 1; index < touchedCount; index++) if (counts[touched[index]] > bestCount) {
+      bestCode = touched[index]; bestCount = counts[bestCode];
+    }
+    output += String.fromCharCode(bestCode);
+    for (let index = 0; index < touchedCount; index++) counts[touched[index]] = 0;
   }
   return output;
 }
@@ -57,7 +70,7 @@ function matrixExp(matrix: number[]) {
   for (let index = 0; index < scale; index++) result = matrixMultiply(result, result); return result;
 }
 function normalPdf(value: number, mean: number, sd: number) { return Math.exp(-((value - mean) ** 2) / (2 * sd * sd)) / (sd * Math.sqrt(2 * Math.PI)); }
-interface GridPoint { t: number; ga: number; transitions: number[]; prior: number }
+interface GridPoint { t: number; ga: number; logTransitions: number[]; prior: number }
 let gridCache: GridPoint[] | undefined;
 function apobecGrid() {
   if (gridCache) return gridCache; const output: GridPoint[] = [];
@@ -66,7 +79,8 @@ function apobecGrid() {
     const q = [-(1 + tv + 1), 1, tv, 1, 1, -(1 + 1 + tv), 1, tv,
       tv * multiplier, 1, -(tv * multiplier + 1 + 1), 1, 1, tv, 1, -(1 + tv + 1)].map((value) => value * mu);
     const prior = Math.log(normalPdf(t, -5, 1)) + Math.log(0.99 * normalPdf(ga, 0, 0.1) + 0.01 * normalPdf(ga, 0, 1));
-    output.push({ t, ga, transitions: matrixExp(q), prior });
+    const transitions = matrixExp(q);
+    output.push({ t, ga, logTransitions: transitions.map((value) => Math.log(Math.max(value, 1e-300))), prior });
   }
   return (gridCache = output);
 }
@@ -78,12 +92,14 @@ function apobec(consensus: string, sequence: string): ApobecResult {
     const left = baseIndex[consensus[position].toUpperCase()], right = baseIndex[sequence[position].toUpperCase()];
     if (left !== undefined && right !== undefined) counts[left * 4 + right]++;
   }
-  const weights = apobecGrid().map((point) => {
-    let value = point.prior; for (let index = 0; index < 16; index++) if (counts[index]) value += counts[index] * Math.log(Math.max(point.transitions[index], 1e-300)); return value;
-  });
-  const maximum = Math.max(...weights), scaled = weights.map((value) => Math.exp(value - maximum)), total = scaled.reduce((a, b) => a + b, 0);
+  const observed: number[] = []; for (let index = 0; index < 16; index++) if (counts[index]) observed.push(index);
+  const grid = apobecGrid(), logWeight = (point: GridPoint) => {
+    let value = point.prior; for (const index of observed) value += counts[index] * point.logTransitions[index]; return value;
+  };
+  const weights = grid.map(logWeight), maximum = Math.max(...weights);
+  const scaled = weights.map((value) => Math.exp(value - maximum)), total = scaled.reduce((sum, value) => sum + value, 0);
   let t = 0, ga = 0, inflated = 0;
-  apobecGrid().forEach((point, index) => { const probability = scaled[index] / total; t += point.t * probability; ga += point.ga * probability; if (point.ga > 0) inflated += probability; });
+  grid.forEach((point, index) => { const probability = scaled[index] / total; t += point.t * probability; ga += point.ga * probability; if (point.ga > 0) inflated += probability; });
   let totalMutations = 0; for (let a = 0; a < 4; a++) for (let b = 0; b < 4; b++) if (a !== b) totalMutations += counts[a * 4 + b];
   return { posteriorMeanGaMultiplier: Math.exp(ga), posteriorGaInflated: inflated, posteriorMeanMutationRate: Math.exp(t),
     gaMutations: counts[2 * 4], totalMutations };
@@ -228,6 +244,12 @@ export async function postprocess(
 ): Promise<PostprocessOutput> {
   const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
   const outputs: PostprocessOutput[] = Array(config.samples.length); let cursor = 0;
+  const sourceBySample = Array.from({ length: config.samples.length }, () => [] as ConsensusRecord[]);
+  const sampleIndexByName = new Map(config.samples.map((sample, index) => [sample.name, index]));
+  for (const record of consensuses) {
+    const sampleIndex = config.samples[record.sampleIndex]?.name === record.sample ? record.sampleIndex : sampleIndexByName.get(record.sample);
+    if (sampleIndex !== undefined) sourceBySample[sampleIndex].push(record);
+  }
   const sampleProgress = Array(config.samples.length).fill(0);
   const report = (sampleIndex: number, fraction: number, detail: string) => {
     sampleProgress[sampleIndex] = Math.max(sampleProgress[sampleIndex], Math.max(0, Math.min(1, fraction)));
@@ -240,7 +262,8 @@ export async function postprocess(
       const referenceAlignments: Record<string, string> = {}, collapseGroups: PostprocessOutput["collapseGroups"] = {};
     if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
     report(sampleIndex, .03, `Preparing filters for sample ${sample.name}`);
-    const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
+    const source = sourceBySample[sampleIndex], sizes: number[] = []; let discardedInSample = 0;
+    for (const record of source) { if (discarded.has(record.id)) discardedInSample++; else sizes.push(record.familySize); }
     const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile)
       * (sample.artefactFractionOverride ?? config.parameters.artefactFraction));
     const agreementThreshold = sample.agreementOverride ?? config.parameters.agreementThreshold;
@@ -339,7 +362,7 @@ export async function postprocess(
       referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta([{ name: "functional_reference", sequence: functionalReferenceNt }]);
     }
     summaries.push({ sample: sample.name, demultiplexedReads: 0, observedUmis: 0, likelyRealUmis: 0,
-      consensusSequences: source.length, contaminationPassed: source.filter((record) => !discarded.has(record.id)).length,
+      consensusSequences: source.length, contaminationPassed: source.length - discardedInSample,
       postprocPassed: accepted.length,
       functionalPassed: sample.functionalReferenceSequence ? functionalPassed : undefined, artefactCutoff });
       outputs[sampleIndex] = { records, summaries, alignments, referenceAlignments, collapseGroups, collapseSeconds: 0 };

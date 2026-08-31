@@ -3,10 +3,11 @@ import { blankConfig, parseConfigYaml, resolveReferenceFiles, serializeConfigYam
 import { nameMatchingSlot, referenceFileMap, referenceMappingRecords, referenceSlots, type ReferenceSlot } from "./input-mapping";
 import type { ExternalScratchDirectoryHandle } from "./partition-store";
 import { decodeResult, encodeResult, safeDatasetName } from "./result-file";
-import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, ResultBundle } from "./types";
+import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, ResultBundle, ThresholdReview, ThresholdSelection } from "./types";
 import { ResultsExplorer } from "./components/results-explorer";
 import { ConfigForm } from "./components/config-form";
 import { MethodLink } from "./components/method-link";
+import { ThresholdReviewDialog } from "./components/threshold-review";
 import packageInformation from "../package.json";
 
 export const APP_VERSION = packageInformation.version;
@@ -73,6 +74,7 @@ export default function App() {
   const [deferPostprocessing, setDeferPostprocessing] = useState(false);
   const [deferCollapse, setDeferCollapse] = useState(false);
   const [deferPhylogeny, setDeferPhylogeny] = useState(false);
+  const [interactiveFiltering, setInteractiveFiltering] = useState(false);
   const [spoolStorage, setSpoolStorage] = useState<SpoolStorage>(() =>
     typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function" ? "external-directory" : "automatic");
   const [scratchDirectory, setScratchDirectory] = useState<ExternalScratchDirectoryHandle>();
@@ -82,6 +84,7 @@ export default function App() {
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [skippingStage, setSkippingStage] = useState<OptionalStageName>();
+  const [thresholdReview, setThresholdReview] = useState<ThresholdReview>();
   const [navigationBlocked, setNavigationBlocked] = useState(false);
   const workerRef = useRef<Worker | undefined>(undefined);
   const protectWorkRef = useRef(false), historyGuardRef = useRef(false), confirmedLeaveRef = useRef(false);
@@ -258,24 +261,31 @@ export default function App() {
       ];
       const worker = new Worker(new URL("./pipeline-worker.ts", import.meta.url), { type: "module" });
       workerRef.current = worker;
-      worker.onmessage = (event: MessageEvent<{ type: "progress"; progress: PipelineProgress } | { type: "result"; result: ResultBundle } | { type: "error"; message: string }>) => {
+      worker.onmessage = (event: MessageEvent<{ type: "progress"; progress: PipelineProgress } | { type: "threshold-review"; review: ThresholdReview }
+        | { type: "result"; result: ResultBundle } | { type: "error"; message: string }>) => {
         if (event.data.type === "progress") {
           const nextProgress = event.data.progress; setProgress(nextProgress);
           setSkippingStage((current) => current && (nextProgress.stage !== current || nextProgress.fraction >= 1) ? undefined : current);
         }
-        if (event.data.type === "result") { setResult(event.data.result); setRunning(false); setCancelling(false); setSkippingStage(undefined); worker.terminate(); workerRef.current = undefined; }
-        if (event.data.type === "error") { setError(event.data.message); setRunning(false); setCancelling(false); setSkippingStage(undefined); worker.terminate(); workerRef.current = undefined; }
+        if (event.data.type === "threshold-review") setThresholdReview(event.data.review);
+        if (event.data.type === "result") { setResult(event.data.result); setRunning(false); setCancelling(false); setSkippingStage(undefined); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; }
+        if (event.data.type === "error") { setError(event.data.message); setRunning(false); setCancelling(false); setSkippingStage(undefined); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; }
       };
-      worker.onerror = (event) => { setError(event.message || "The pipeline worker failed."); setRunning(false); setCancelling(false); worker.terminate(); workerRef.current = undefined; };
-      worker.postMessage({ type: "run", file: fastq, config, workers, deferContamination, deferPostprocessing, deferCollapse, deferPhylogeny, inputMappings, spoolStorage,
+      worker.onerror = (event) => { setError(event.message || "The pipeline worker failed."); setRunning(false); setCancelling(false); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; };
+      worker.postMessage({ type: "run", file: fastq, config, workers, deferContamination, deferPostprocessing, deferCollapse, deferPhylogeny,
+        interactiveFiltering, inputMappings, spoolStorage,
         scratchDirectory: spoolStorage === "external-directory" ? scratchDirectory : undefined });
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); setRunning(false); setCancelling(false); }
   }
 
   function cancel() {
     workerRef.current?.postMessage({ type: "cancel" });
-    setCancelling(true); setError("");
+    setCancelling(true); setError(""); setThresholdReview(undefined);
     setProgress((current) => current ? { ...current, detail: "Cancelling safely and removing temporary read files…" } : current);
+  }
+
+  function acceptThresholds(selection: ThresholdSelection) {
+    workerRef.current?.postMessage({ type: "threshold-selection", selection }); setThresholdReview(undefined); setError("");
   }
 
   function skipOptionalStage(stage: OptionalStageName) {
@@ -345,7 +355,7 @@ export default function App() {
             </div>
             {noDownsampling && <p className="scratch-recommendation"><strong>No downsampling is enabled.</strong> Every demultiplexed sequence and quality string must survive until the global UMI model and consensus pass. Use an external scratch disk with ample free space; 256 spool partitions is recommended for bounded per-worker memory on very large runs.</p>}
           </section>
-          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Optional stages after consensus</strong><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Contamination can be deferred or skipped without blocking later work; downstream outputs then retain every sequence at that gate and are labelled unfiltered. Collapse requires downstream filtering, and the default phylogeny requires collapse.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}</div></div>
+          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Decision and optional-stage controls</strong><label><input type="checkbox" checked={interactiveFiltering} onChange={(event) => setInteractiveFiltering(event.target.checked)} /><span>Review UMI and consensus thresholds interactively</span></label><small>Pauses after UMI probability fitting, then again after consensus and any applied contamination eligibility are known. Each cutoff has a live plot, slider, unrestricted direct numeric entry, and a persisted audit record.</small><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Contamination can be deferred or skipped without blocking later work; downstream outputs then retain every sequence at that gate and are labelled unfiltered. Collapse requires downstream filtering, and the default phylogeny requires collapse.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}</div></div>
           {progress && running && <StageProgress value={progress} onSkip={skipOptionalStage} skipping={skippingStage === progress.stage} />}
           {error && <div className="error-box" role="alert">{error}</div>}
         </section>
@@ -355,6 +365,7 @@ export default function App() {
     {result && <button className="new-analysis" type="button" onClick={() => { setResult(undefined); setProgress(undefined); }}>← New or load another analysis</button>}
     {slotConflict && <div className="modal-backdrop" role="presentation"><section className="slot-conflict" role="dialog" aria-modal="true" aria-labelledby="slot-conflict-title"><span className="section-kicker">Filename conflict</span><h3 id="slot-conflict-title">This file matches a different YAML slot</h3><p><strong>{slotConflict.file.name}</strong> was dropped onto <strong>{slotConflict.target.expectedName}</strong>, but its filename matches <strong>{slotConflict.matching.expectedName}</strong>.</p><div><button type="button" className="primary" onClick={() => resolveSlotConflict("swap")}>Swap into filename-matching slot</button><button type="button" onClick={() => resolveSlotConflict("matching")}>Use matching slot</button><button type="button" onClick={() => resolveSlotConflict("chosen")}>Keep chosen slot</button><button type="button" onClick={() => setSlotConflict(undefined)}>Cancel</button></div></section></div>}
     {navigationBlocked && <div className="modal-backdrop" role="presentation"><section className="slot-conflict navigation-warning" role="dialog" aria-modal="true" aria-labelledby="navigation-warning-title"><span className="section-kicker">Unsaved local work</span><h3 id="navigation-warning-title">Leave webPORPID?</h3><p>The Back action was paused because leaving now would discard the active analysis, selected input files, or loaded results. Save the results file first if you need to return to this work.</p><div><button type="button" className="primary" autoFocus onClick={() => setNavigationBlocked(false)}>Stay on this page</button><button type="button" className="danger" onClick={confirmPageDeparture}>Leave anyway</button></div></section></div>}
+    {thresholdReview && <ThresholdReviewDialog review={thresholdReview} onAccept={acceptThresholds} onCancel={cancel} />}
     <footer className="site-footer"><span>webPORPID · standalone local analysis</span><span>Deterministic, inspectable processing and session files</span></footer>
   </div>;
 }

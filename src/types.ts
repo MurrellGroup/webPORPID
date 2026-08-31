@@ -25,6 +25,8 @@ export interface NamedSequence { name: string; sequence: string }
 
 export interface SampleConfig {
   name: string;
+  /** Optional biological donor grouping. Samples sharing a donor are self for contamination checks. */
+  donorId?: string;
   cdnaPrimer: string;
   secondStrandPrimer: string;
   panel: string;
@@ -283,6 +285,70 @@ export interface RunOptions {
   deferCollapse?: boolean;
   /** Browser read-spool location; absent in older results and CLI runs. */
   spoolStorage?: "automatic" | "external-directory";
+  /** Pause at inspectable UMI and consensus-filter decision checkpoints. */
+  interactiveFiltering?: boolean;
+}
+
+export type ThresholdReviewPhase = "umi" | "consensus-filters";
+
+export interface ThresholdReviewSample {
+  sample: string;
+  donorId?: string;
+  totalFamilies: number;
+  /** Exact family-size frequency table; pairs are [family size, family count]. */
+  familySizeCounts: Array<[number, number]>;
+  /** Exact 201-bin posterior distribution on [0,1], including both endpoints and excluding the aggregate BPB bucket. */
+  posteriorBins?: number[];
+  /** Exact 101-bin minimum-agreement distribution on [0,1]. */
+  agreementBins?: number[];
+  /** A deterministic display-only sample. Thresholds are always applied to every family. */
+  displayPoints?: Array<{ familySize: number; posteriorProbability?: number; minimumAgreement?: number;
+    umiLength?: number; contaminationEligible?: boolean; disposition: FamilyDisposition }>;
+  current: {
+    familySizeThreshold?: number;
+    artefactFraction?: number;
+    outlierQuantile?: number;
+    agreementThreshold?: number;
+  };
+  usesGlobal: {
+    familySizeThreshold?: boolean;
+    artefactFraction?: boolean;
+    outlierQuantile?: boolean;
+    agreementThreshold?: boolean;
+  };
+}
+
+export interface ThresholdReview {
+  id: string;
+  phase: ThresholdReviewPhase;
+  title: string;
+  detail: string;
+  current: {
+    ldaThreshold?: number;
+    familySizeThreshold?: number;
+    artefactFraction?: number;
+    outlierQuantile?: number;
+    agreementThreshold?: number;
+  };
+  samples: ThresholdReviewSample[];
+}
+
+export interface ThresholdSelection {
+  id: string;
+  phase: ThresholdReviewPhase;
+  parameters: Partial<Pick<PipelineParameters, "ldaThreshold" | "familySizeThreshold" | "artefactFraction" | "outlierQuantile" | "agreementThreshold">>;
+  samples: Array<{
+    sample: string;
+    familySizeOverride?: number;
+    artefactFractionOverride?: number;
+    outlierQuantileOverride?: number;
+    agreementOverride?: number;
+  }>;
+}
+
+export interface ThresholdSelectionRecord extends ThresholdSelection {
+  acceptedUtc: string;
+  changes: string[];
 }
 
 export interface ResultBundle {
@@ -318,6 +384,8 @@ export interface ResultBundle {
   alignmentEditHistory?: AlignmentAuditEntry[];
   /** Optional so results written by webPORPID 0.1.x remain loadable. */
   timings?: PipelineTiming[];
+  /** Accepted interactive decision checkpoints, including exact parameter changes. */
+  thresholdSelections?: ThresholdSelectionRecord[];
   log: string[];
 }
 

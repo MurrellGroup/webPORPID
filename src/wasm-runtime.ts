@@ -1,5 +1,5 @@
 import { WASI } from "@bjorn3/browser_wasi_shim";
-import { BinaryReader, BinaryWriter } from "./binary";
+import { BinaryReader, BinaryWriter } from "./binary.ts";
 import type { ConsensusRecord, FamilyDisposition, PipelineConfig, QualityStats, UmiFamily } from "./types";
 
 interface CoreExports extends WebAssembly.Exports {
@@ -156,6 +156,18 @@ export function decodeFamilyModel(bytes: Uint8Array, config: PipelineConfig): Um
       posteriorProbability: probability, logOffspringProbability: Math.log(1 - probability), disposition });
   }
   if (!reader.done) throw new Error("Family model has trailing bytes."); return output;
+}
+
+/** Re-encode an inspected family model after an interactive cutoff decision. */
+export function encodeFamilyModel(families: readonly UmiFamily[]): Uint8Array {
+  const writer = new BinaryWriter(); writer.magic("WPM1"); writer.u32(families.length);
+  for (const family of families) {
+    const disposition = DISPOSITIONS.indexOf(family.disposition);
+    if (disposition < 0) throw new Error(`Cannot encode unknown UMI-family disposition ${family.disposition}.`);
+    writer.u16(family.sampleIndex); writer.string(family.disposition === "BPB-rejects" ? "REJECTS" : family.umi);
+    writer.string(family.mostLikelyParent); writer.u32(family.familySize); writer.f64(family.posteriorProbability); writer.u8(disposition);
+  }
+  return writer.finish();
 }
 
 export function decodeConsensusOutput(bytes: Uint8Array, config: PipelineConfig): { consensuses: ConsensusRecord[]; heteroduplexes: string[] } {

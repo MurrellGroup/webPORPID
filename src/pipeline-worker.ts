@@ -10,25 +10,42 @@ import { PartitionStore, type ExternalScratchDirectoryHandle } from "./partition
 import { collapsePostprocess, postprocess, type PostprocessOutput } from "./postprocess";
 import { runFastTreeIsolated } from "./biowasm";
 import { downstreamResources, statusRecord } from "./optional-stages";
+import { applyThresholdSelection, buildConsensusThresholdReview, buildUmiThresholdReview } from "./threshold-review";
 import { treeTipNames } from "./tree-names";
-import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, QualityStats, ResultBundle, SampleSummary } from "./types";
+import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, QualityStats, ResultBundle, SampleSummary,
+  ThresholdReview, ThresholdSelection } from "./types";
 import { CoreWorkerPool } from "./worker-pool";
 import {
-  decodeConsensusOutput, decodeFamilyCounts, decodeFamilyModel, makeCutoffs, makeCutoffValues, mergeFamilyCounts,
+  decodeConsensusOutput, decodeFamilyCounts, decodeFamilyModel, encodeFamilyModel, makeCutoffs, makeCutoffValues, mergeFamilyCounts,
   mergeStats,
 } from "./wasm-runtime";
 
 type RunRequest = { type: "run"; file: File; config: PipelineConfig; workers: number; deferPhylogeny?: boolean; deferContamination?: boolean;
-  deferPostprocessing?: boolean; deferCollapse?: boolean; inputMappings?: InputFileMapping[];
+  deferPostprocessing?: boolean; deferCollapse?: boolean; interactiveFiltering?: boolean; inputMappings?: InputFileMapping[];
   spoolStorage?: "automatic" | "external-directory"; scratchDirectory?: ExternalScratchDirectoryHandle };
 type CancelRequest = { type: "cancel" };
 type SkipStageRequest = { type: "skip-stage"; stage: OptionalStageName };
+type ThresholdSelectionRequest = { type: "threshold-selection"; selection: ThresholdSelection };
 let cancellation: AbortController | undefined;
 let activeOptionalStage: OptionalStageName | undefined, optionalStageCancellation: AbortController | undefined;
 let requestedSkip: OptionalStageName | undefined;
+let thresholdWaiter: { id: string; accept(selection: ThresholdSelection): void; cancel(): void } | undefined;
 
 function progress(value: PipelineProgress) { self.postMessage({ type: "progress", progress: value }); }
 const now = () => new Date().toISOString();
+
+function requestThresholdSelection(review: ThresholdReview, signal: AbortSignal): Promise<ThresholdSelection> {
+  if (thresholdWaiter) throw new Error("An interactive threshold checkpoint is already open.");
+  self.postMessage({ type: "threshold-review", review });
+  return new Promise((resolve, reject) => {
+    const cleanup = () => { signal.removeEventListener("abort", abort); thresholdWaiter = undefined; };
+    const abort = () => { cleanup(); reject(new DOMException("Analysis cancelled.", "AbortError")); };
+    thresholdWaiter = { id: review.id,
+      accept(selection) { cleanup(); resolve(selection); },
+      cancel: abort };
+    signal.addEventListener("abort", abort, { once: true });
+  });
+}
 
 function formatBytes(bytes: number) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"]; let value = Math.max(0, bytes), unit = 0;
@@ -73,6 +90,8 @@ async function optionalStage<T>(stage: OptionalStageName, runSignal: AbortSignal
 
 async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBundle> {
   const runStarted = performance.now(), timings: NonNullable<ResultBundle["timings"]> = [];
+  const thresholdSelections: NonNullable<ResultBundle["thresholdSelections"]> = [];
+  let thresholdReviewPauseMs = 0;
   const workers = Math.max(1, Math.floor(request.workers)), compiledConfig = compileConfig(request.config);
   if (request.spoolStorage === "external-directory" && !request.scratchDirectory)
     throw new Error("External scratch storage was selected, but no writable directory handle was provided.");
@@ -90,7 +109,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   } catch (cause) { pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.7 started`,
+  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.8 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}`];
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
@@ -178,10 +197,25 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
     const modelBuffer = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
     progress({ stage: "umi", fraction: .72, detail: "Fitting the global UMI offspring-probability model and classifying families" });
-    const familyModel = new Uint8Array(await pool.at<ArrayBuffer>(0, { type: "buildModel", bytes: modelBuffer }, [modelBuffer]));
+    let familyModel = new Uint8Array(await pool.at<ArrayBuffer>(0, { type: "buildModel", bytes: modelBuffer }, [modelBuffer]));
     progress({ stage: "umi", fraction: .84, detail: "Preparing the inspectable UMI-family decisions" });
     const umiFamilies = decodeFamilyModel(familyModel, request.config);
     quality.bpbRejects = umiFamilies.filter((row) => row.disposition === "BPB-rejects").reduce((sum, row) => sum + row.familySize, 0);
+    if (request.interactiveFiltering) {
+      progress({ stage: "umi", fraction: .86, detail: "UMI probability calculations are complete; waiting for threshold review" });
+      const review = buildUmiThresholdReview(umiFamilies, request.config);
+      const pauseStarted = performance.now();
+      const selection = await requestThresholdSelection(review, signal);
+      const pauseMs = performance.now() - pauseStarted;
+      thresholdReviewPauseMs += pauseMs;
+      stageStarted += pauseMs; // Human review time is not computational UMI time.
+      if (selection.id !== review.id || selection.phase !== review.phase) throw new Error("The interactive UMI-threshold response did not match the open checkpoint.");
+      const accepted = applyThresholdSelection(request.config, umiFamilies, selection); thresholdSelections.push(accepted);
+      familyModel = new Uint8Array(encodeFamilyModel(umiFamilies));
+      log.push(`${now()} interactive UMI threshold values: ${JSON.stringify({ global: accepted.parameters, samples: accepted.samples })}`);
+      for (const change of accepted.changes) log.push(`${now()} interactive UMI threshold: ${change}`);
+      progress({ stage: "umi", fraction: .88, detail: "Accepted UMI thresholds; updating family decisions for every observed UMI" });
+    }
     progress({ stage: "umi", fraction: .9, detail: "Sending the fitted UMI model to the consensus workers" });
     await Promise.all(pool.clients.map((_, index) => {
       const copy = familyModel.slice().buffer; return pool.at(index, { type: "initModel", bytes: copy }, [copy]);
@@ -223,13 +257,19 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "consensus", fraction: 1, detail: `Consensus calling complete: ${consensuses.length.toLocaleString()} sequences retained for downstream checks` });
     stageStarted = recordTiming("consensus", stageStarted, consensuses.length);
 
+    // One pass avoids repeatedly scanning every family and consensus for every sample on large multiplexed runs.
+    const observedBySample = new Uint32Array(request.config.samples.length), likelyBySample = new Uint32Array(request.config.samples.length);
+    const consensusBySample = new Uint32Array(request.config.samples.length);
+    for (const family of umiFamilies) {
+      if (family.disposition !== "BPB-rejects") observedBySample[family.sampleIndex]++;
+      if (family.disposition === "likely_real") likelyBySample[family.sampleIndex]++;
+    }
+    for (const record of consensuses) consensusBySample[record.sampleIndex]++;
     const baseSummaries: SampleSummary[] = request.config.samples.map((sample, index) => ({
       sample: sample.name, demultiplexedReads: quality.perSample[index] ?? 0,
       selectedReads: selectedReadsBySample[index] ?? 0,
       downsampledReads: Math.max(0, (quality.perSample[index] ?? 0) - (selectedReadsBySample[index] ?? 0)),
-      observedUmis: umiFamilies.filter((family) => family.sampleIndex === index && family.disposition !== "BPB-rejects").length,
-      likelyRealUmis: umiFamilies.filter((family) => family.sampleIndex === index && family.disposition === "likely_real").length,
-      consensusSequences: consensuses.filter((record) => record.sampleIndex === index).length,
+      observedUmis: observedBySample[index], likelyRealUmis: likelyBySample[index], consensusSequences: consensusBySample[index],
     }));
     const optionalStages: NonNullable<ResultBundle["optionalStages"]> = {
       contamination: statusRecord("deferred", "Waiting after consensus."),
@@ -259,17 +299,39 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
         log.push(`${now()} contamination: skipped by user; contamination gate bypassed for downstream work`);
       } else {
         contamination = result.value;
+        const discardedBySample = new Uint32Array(request.config.samples.length); let discardedCount = 0, suspectCount = 0;
+        const sampleIndexByName = new Map(request.config.samples.map((sample, index) => [sample.name, index]));
+        for (const call of contamination) {
+          if (call.discarded) { discardedCount++; const sampleIndex = sampleIndexByName.get(call.sample); if (sampleIndex !== undefined) discardedBySample[sampleIndex]++; }
+          if (call.suspectOnly) suspectCount++;
+        }
         optionalStages.contamination = statusRecord("completed", request.config.parameters.contaminationFilter
-          ? `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`
+          ? `${discardedCount} consensus sequences excluded.`
           : "Contamination filtering was disabled in the run configuration.");
-        baseSummaries.forEach((summary) => { summary.contaminationPassed = summary.consensusSequences
-          - contamination.filter((call) => call.sample === summary.sample && call.discarded).length; });
-        progress({ stage: "contamination", fraction: 1, detail: `Contamination checks complete: ${contamination.filter((call) => call.discarded).length.toLocaleString()} sequences excluded` });
-        log.push(`${now()} contamination: ${contamination.filter((call) => call.discarded).length} discarded; ${contamination.filter((call) => call.suspectOnly).length} suspect calls`);
+        baseSummaries.forEach((summary, index) => { summary.contaminationPassed = summary.consensusSequences - discardedBySample[index]; });
+        progress({ stage: "contamination", fraction: 1, detail: `Contamination checks complete: ${discardedCount.toLocaleString()} sequences excluded` });
+        log.push(`${now()} contamination: ${discardedCount} discarded; ${suspectCount} suspect calls`);
       }
     }
 
     const contaminationApplied = optionalStages.contamination.state === "completed" && request.config.parameters.contaminationFilter;
+    if (request.interactiveFiltering) {
+      progress({ stage: "postprocessing", fraction: 0,
+        detail: "Consensus and contamination eligibility are complete; waiting for the downstream threshold review" });
+      const discardedIds = contaminationApplied
+        ? new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId))
+        : new Set<string>();
+      const review = buildConsensusThresholdReview(consensuses, discardedIds, request.config);
+      const pauseStarted = performance.now();
+      const selection = await requestThresholdSelection(review, signal);
+      thresholdReviewPauseMs += performance.now() - pauseStarted;
+      if (selection.id !== review.id || selection.phase !== review.phase) throw new Error("The interactive consensus-filter response did not match the open checkpoint.");
+      const accepted = applyThresholdSelection(request.config, umiFamilies, selection); thresholdSelections.push(accepted);
+      log.push(`${now()} interactive consensus-filter values: ${JSON.stringify({ global: accepted.parameters, samples: accepted.samples })}`);
+      for (const change of accepted.changes) log.push(`${now()} interactive consensus filter: ${change}`);
+      progress({ stage: "postprocessing", fraction: 0,
+        detail: "Accepted consensus-family thresholds; continuing to panel screening and functional analysis" });
+    }
     if (request.deferPostprocessing) {
         optionalStages.postprocessing = statusRecord("deferred", "Deferred by user; panel screening, functional checks, and annotations have not run.");
         optionalStages.collapse = statusRecord("deferred", "Waiting for downstream filtering.");
@@ -371,11 +433,11 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       }
     }
 
-    timings.push({ stage: "analysis-total", seconds: (performance.now() - runStarted) / 1000 });
+    timings.push({ stage: "analysis-total", seconds: Math.max(0, performance.now() - runStarted - thresholdReviewPauseMs) / 1000 });
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.7", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.8", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
@@ -387,18 +449,23 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       inputMappings: request.inputMappings, runOptions: { deferPhylogeny: Boolean(request.deferPhylogeny),
         deferContamination: Boolean(request.deferContamination), deferPostprocessing: Boolean(request.deferPostprocessing),
         deferCollapse: Boolean(request.deferCollapse),
+        interactiveFiltering: Boolean(request.interactiveFiltering),
         spoolStorage: request.spoolStorage === "external-directory" ? "external-directory" : "automatic" },
-      optionalStages, postprocessingContaminationMode, timings, log,
+      optionalStages, postprocessingContaminationMode, timings, thresholdSelections, log,
     };
   } finally {
     pool.close(); try { await store.close(); } catch { /* already closed or best-effort cleanup */ }
   }
 }
 
-self.addEventListener("message", (event: MessageEvent<RunRequest | CancelRequest | SkipStageRequest>) => {
-  if (event.data.type === "cancel") { cancellation?.abort(); optionalStageCancellation?.abort(); return; }
+self.addEventListener("message", (event: MessageEvent<RunRequest | CancelRequest | SkipStageRequest | ThresholdSelectionRequest>) => {
+  if (event.data.type === "cancel") { cancellation?.abort(); optionalStageCancellation?.abort(); thresholdWaiter?.cancel(); return; }
   if (event.data.type === "skip-stage") {
     if (event.data.stage === activeOptionalStage) { requestedSkip = event.data.stage; optionalStageCancellation?.abort(); }
+    return;
+  }
+  if (event.data.type === "threshold-selection") {
+    if (event.data.selection.id === thresholdWaiter?.id) thresholdWaiter.accept(event.data.selection);
     return;
   }
   cancellation?.abort(); cancellation = new AbortController();

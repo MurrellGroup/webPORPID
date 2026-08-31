@@ -4,7 +4,7 @@ interface VectorSummary { squaredNorm: number; rootNorm: number; total: number }
 interface SparseKmers extends VectorSummary { kind: "sparse"; codes: Uint16Array; counts: Uint32Array }
 interface DenseKmers extends VectorSummary { kind: "dense"; values: Float64Array }
 type KmerVector = SparseKmers | DenseKmers;
-interface DatabaseEntry { label: string; sample?: string; vector: KmerVector }
+interface DatabaseEntry { label: string; sample?: string; selfGroup?: string; vector: KmerVector }
 interface DatabaseView { self: DatabaseEntry[]; nonself: DatabaseEntry[] }
 interface DatabaseIndex {
   entries: DatabaseEntry[];
@@ -15,6 +15,12 @@ interface DatabaseIndex {
 }
 interface Cluster { center: KmerVector; memberCount: number }
 interface KmerScratch { counts: Uint32Array; touched: Uint16Array }
+
+/** Samples without donor metadata remain separate biological self groups. */
+export function selfGroupsBySample(config: PipelineConfig): Map<string, string> {
+  return new Map(config.samples.map((sample) => [sample.name,
+    sample.donorId?.trim() ? `donor:${sample.donorId.trim()}` : `sample:${sample.name}`]));
+}
 
 export interface ContaminationProgress {
   fraction: number;
@@ -189,11 +195,14 @@ function clusterMembers(assignments: Int32Array, centers: KmerVector[]): Cluster
   return centers.map((center, index) => ({ center, memberCount: counts[index] })).filter((cluster) => cluster.memberCount);
 }
 
+/** Fixed scientific/runtime trade-off requested for run-derived contamination signatures. */
+export const CONTAMINATION_CLUSTER_PASSES = 3;
+
 function dpMeans(vectors: SparseKmers[], radius: number): Cluster[] {
   if (!vectors.length) return [];
   let centers: KmerVector[] = [vectors[0]];
   const assignments = new Int32Array(vectors.length); assignments.fill(-1);
-  for (let iteration = 0; iteration < 30; iteration++) {
+  for (let iteration = 0; iteration < CONTAMINATION_CLUSTER_PASSES; iteration++) {
     let changed = false, indexed = centerIndex(centers), indexedCount = indexed ? centers.length : 0, canRebuild = Boolean(indexed);
     for (let point = 0; point < vectors.length; point++) {
       if (canRebuild && centers.length - indexedCount >= CENTER_INDEX_REBUILD_TAIL) {
@@ -234,7 +243,7 @@ async function dpMeansAsync(
   if (!vectors.length) return [];
   let centers: KmerVector[] = [vectors[0]];
   const assignments = new Int32Array(vectors.length); assignments.fill(-1);
-  for (let iteration = 0; iteration < 30; iteration++) {
+  for (let iteration = 0; iteration < CONTAMINATION_CLUSTER_PASSES; iteration++) {
     let changed = false, indexed = centerIndex(centers), indexedCount = indexed ? centers.length : 0, canRebuild = Boolean(indexed);
     for (let point = 0; point < vectors.length; point++) {
       scheduler.check();
@@ -258,9 +267,9 @@ async function dpMeansAsync(
   return clusterMembers(assignments, centers);
 }
 
-function databaseView(database: DatabaseEntry[], sample: string): DatabaseView {
+function databaseView(database: DatabaseEntry[], selfGroup: string): DatabaseView {
   const self: DatabaseEntry[] = [], nonself: DatabaseEntry[] = [];
-  for (const entry of database) (entry.sample === sample ? self : nonself).push(entry);
+  for (const entry of database) (entry.selfGroup === selfGroup ? self : nonself).push(entry);
   return { self, nonself };
 }
 
@@ -330,23 +339,23 @@ function scoreDatabase(vector: SparseKmers, index: DatabaseIndex) {
   }
 }
 
-function nearestNonselfIndexed(vector: SparseKmers, sample: string, index: DatabaseIndex, threshold: number) {
+function nearestNonselfIndexed(vector: SparseKmers, selfGroup: string, index: DatabaseIndex, threshold: number) {
   scoreDatabase(vector, index);
   let nearest: DatabaseEntry | undefined, nearestDistance = threshold;
   for (let entry = 0; entry < index.entries.length; entry++) {
-    const candidateEntry = index.entries[entry]; if (candidateEntry.sample === sample) continue;
+    const candidateEntry = index.entries[entry]; if (candidateEntry.selfGroup === selfGroup) continue;
     const candidate = distanceFromDot(vector, candidateEntry.vector, index.dots[entry]);
     if (candidate < nearestDistance) { nearest = candidateEntry; nearestDistance = candidate; }
   }
   return nearest ? { label: nearest.label, distance: nearestDistance } : undefined;
 }
 
-function nearestPrimaryIndexed(vector: SparseKmers, sample: string, index: DatabaseIndex, threshold: number) {
+function nearestPrimaryIndexed(vector: SparseKmers, selfGroup: string, index: DatabaseIndex, threshold: number) {
   scoreDatabase(vector, index);
   let nearest: DatabaseEntry | undefined, nearestDistance = threshold, hasCloseSelf = false;
   for (let entry = 0; entry < index.entries.length; entry++) {
     const candidateEntry = index.entries[entry], candidate = distanceFromDot(vector, candidateEntry.vector, index.dots[entry]);
-    if (candidateEntry.sample === sample) { if (candidate <= threshold) hasCloseSelf = true; }
+    if (candidateEntry.selfGroup === selfGroup) { if (candidate <= threshold) hasCloseSelf = true; }
     else if (candidate < nearestDistance) { nearest = candidateEntry; nearestDistance = candidate; }
   }
   return nearest ? { label: nearest.label, distance: nearestDistance, discard: !hasCloseSelf } : undefined;
@@ -382,15 +391,15 @@ function prepareConsensusVectors(consensuses: ConsensusRecord[], config: Pipelin
   return { bySample, byConsensus };
 }
 
-function addSampleDatabases(sampleName: string, vectors: SparseKmers[], config: PipelineConfig,
+function addSampleDatabases(sampleName: string, selfGroup: string, vectors: SparseKmers[], config: PipelineConfig,
   primary: DatabaseEntry[], suspect: DatabaseEntry[], clusters: Cluster[]) {
   clusters.forEach((cluster, index) => {
     const proportion = cluster.memberCount / vectors.length;
     const percent = Math.round(1000 * proportion) / 10;
-    const entry = { label: `${sampleName}_cluster${index + 1}_${percent}%`, sample: sampleName, vector: cluster.center };
+    const entry = { label: `${sampleName}_cluster${index + 1}_${percent}%`, sample: sampleName, selfGroup, vector: cluster.center };
     suspect.push(entry); if (proportion > config.parameters.contaminationProportionThreshold) primary.push(entry);
   });
-  const all = { label: `${sampleName}_All`, sample: sampleName, vector: meanAll(vectors) };
+  const all = { label: `${sampleName}_All`, sample: sampleName, selfGroup, vector: meanAll(vectors) };
   primary.push(all); suspect.push(all);
 }
 
@@ -399,19 +408,22 @@ function classifyPrepared(consensuses: ConsensusRecord[], prepared: PreparedVect
   const threshold = config.parameters.contaminationDistanceThreshold, output: ContaminationCall[] = [];
   const primaryViews = new Map<string, DatabaseView>(), suspectViews = new Map<string, DatabaseView>();
   const primaryIndex = buildDatabaseIndex(primary), suspectIndex = buildDatabaseIndex(suspect);
+  const selfGroups = selfGroupsBySample(config);
   for (const sample of new Set(consensuses.map((record) => record.sample))) {
-    primaryViews.set(sample, databaseView(primary, sample)); suspectViews.set(sample, databaseView(suspect, sample));
+    const selfGroup = selfGroups.get(sample) ?? `sample:${sample}`;
+    primaryViews.set(sample, databaseView(primary, selfGroup)); suspectViews.set(sample, databaseView(suspect, selfGroup));
   }
   for (let index = 0; index < consensuses.length; index++) {
     const record = consensuses[index];
     const vector = !hasRandomAmbiguity(record.sequence) && prepared.byConsensus[index]
       ? prepared.byConsensus[index]! : kmers(record.sequence, hash(record.id, index), scratch);
-    const call = primaryIndex ? nearestPrimaryIndexed(vector, record.sample, primaryIndex, threshold)
+    const selfGroup = selfGroups.get(record.sample) ?? `sample:${record.sample}`;
+    const call = primaryIndex ? nearestPrimaryIndexed(vector, selfGroup, primaryIndex, threshold)
       : nearestPrimary(vector, primaryViews.get(record.sample)!, threshold);
     if (call) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: call.label,
       nearestNonselfDistance: call.distance, flagged: true, discarded: call.discard, suspectOnly: false });
     else {
-      const possible = suspectIndex ? nearestNonselfIndexed(vector, record.sample, suspectIndex, threshold)
+      const possible = suspectIndex ? nearestNonselfIndexed(vector, selfGroup, suspectIndex, threshold)
         : nearestNonself(vector, suspectViews.get(record.sample)!.nonself, threshold);
       if (possible) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: possible.label,
         nearestNonselfDistance: possible.distance, flagged: true, discarded: false, suspectOnly: true });
@@ -427,9 +439,10 @@ export function classifyContamination(consensuses: ConsensusRecord[], config: Pi
     label: record.name, vector: kmers(record.sequence, hash(record.name, index), scratch),
   }));
   const prepared = prepareConsensusVectors(consensuses, config, scratch), primary: DatabaseEntry[] = [], suspect: DatabaseEntry[] = [];
+  const selfGroups = selfGroupsBySample(config);
   for (const sample of config.samples) {
     const vectors = prepared.bySample.get(sample.name) ?? []; if (!vectors.length) continue;
-    addSampleDatabases(sample.name, vectors, config, primary, suspect, dpMeans(vectors, config.parameters.contaminationClusterThreshold));
+    addSampleDatabases(sample.name, selfGroups.get(sample.name)!, vectors, config, primary, suspect, dpMeans(vectors, config.parameters.contaminationClusterThreshold));
   }
   primary.push(...panel); suspect.push(...panel);
   return classifyPrepared(consensuses, prepared, primary, suspect, config, scratch);
@@ -480,15 +493,16 @@ export async function classifyContaminationAsync(
 
   const primary: DatabaseEntry[] = [], suspect: DatabaseEntry[] = [];
   let clusteredVectors = 0;
+  const selfGroups = selfGroupsBySample(config);
   for (const sample of config.samples) {
     const vectors = bySample.get(sample.name) ?? [], before = clusteredVectors; let clusterCount = 0;
     if (vectors.length) {
       const clusters = await dpMeansAsync(vectors, config.parameters.contaminationClusterThreshold, scheduler,
-        (iteration, assigned, total) => report(.2 + .35 * (before + vectors.length * Math.min(.95, (iteration + assigned / Math.max(1, total)) / 30)) / Math.max(1, consensuses.length),
+        (iteration, assigned, total) => report(.2 + .35 * (before + vectors.length * Math.min(.95, (iteration + assigned / Math.max(1, total)) / CONTAMINATION_CLUSTER_PASSES)) / Math.max(1, consensuses.length),
           `Clustering ${sample.name}: iteration ${iteration + 1}, ${assigned.toLocaleString()} of ${total.toLocaleString()} signatures assigned`,
           before + assigned, consensuses.length, "clustering"));
       clusterCount = clusters.length;
-      addSampleDatabases(sample.name, vectors, config, primary, suspect, clusters);
+      addSampleDatabases(sample.name, selfGroups.get(sample.name)!, vectors, config, primary, suspect, clusters);
     }
     clusteredVectors += vectors.length;
     report(.2 + .35 * clusteredVectors / Math.max(1, consensuses.length),
@@ -502,19 +516,21 @@ export async function classifyContaminationAsync(
   const primaryViews = new Map<string, DatabaseView>(), suspectViews = new Map<string, DatabaseView>();
   const primaryIndex = buildDatabaseIndex(primary), suspectIndex = buildDatabaseIndex(suspect);
   for (const sample of new Set(consensuses.map((record) => record.sample))) {
-    primaryViews.set(sample, databaseView(primary, sample)); suspectViews.set(sample, databaseView(suspect, sample));
+    const selfGroup = selfGroups.get(sample) ?? `sample:${sample}`;
+    primaryViews.set(sample, databaseView(primary, selfGroup)); suspectViews.set(sample, databaseView(suspect, selfGroup));
   }
   for (let index = 0; index < consensuses.length; index++) {
     scheduler.check();
     const record = consensuses[index];
     const vector = !hasRandomAmbiguity(record.sequence) && prepared.byConsensus[index]
       ? prepared.byConsensus[index]! : kmers(record.sequence, hash(record.id, index), scratch);
-    const call = primaryIndex ? nearestPrimaryIndexed(vector, record.sample, primaryIndex, threshold)
+    const selfGroup = selfGroups.get(record.sample) ?? `sample:${record.sample}`;
+    const call = primaryIndex ? nearestPrimaryIndexed(vector, selfGroup, primaryIndex, threshold)
       : nearestPrimary(vector, primaryViews.get(record.sample)!, threshold);
     if (call) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: call.label,
       nearestNonselfDistance: call.distance, flagged: true, discarded: call.discard, suspectOnly: false });
     else {
-      const possible = suspectIndex ? nearestNonselfIndexed(vector, record.sample, suspectIndex, threshold)
+      const possible = suspectIndex ? nearestNonselfIndexed(vector, selfGroup, suspectIndex, threshold)
         : nearestNonself(vector, suspectViews.get(record.sample)!.nonself, threshold);
       if (possible) output.push({ sample: record.sample, sequenceId: record.id, nearestNonselfVariant: possible.label,
         nearestNonselfDistance: possible.distance, flagged: true, discarded: false, suspectOnly: true });

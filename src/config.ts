@@ -1,5 +1,5 @@
 import YAML from "yaml";
-import { BinaryWriter } from "./binary";
+import { BinaryWriter } from "./binary.ts";
 import type { NamedSequence, PipelineConfig, PipelineParameters, ResultConfig, SampleConfig } from "./types";
 
 export const DEFAULT_PARAMETERS: PipelineParameters = {
@@ -96,6 +96,7 @@ function parseSamples(source: Mapping): SampleConfig[] {
     const value = mapping(raw, `Sample ${name}`);
     return {
       name,
+      donorId: text(pick(value, "donor_ID", "donor_id", "donorId"), `${name}.donor_ID`, true).trim() || undefined,
       cdnaPrimer: text(pick(value, "cDNA_primer", "cdna_primer", "cdnaPrimer"), `${name}.cDNA_primer`),
       secondStrandPrimer: text(pick(value, "sec_str_primer", "secondStrandPrimer"), `${name}.sec_str_primer`),
       panel: text(value.panel, `${name}.panel`),
@@ -129,6 +130,7 @@ export function parseConfigYaml(source: string): PipelineConfig {
   const assays = new Set<string>();
   for (const sample of config.samples) {
     if (!sample.name.trim()) throw new Error("Every sample needs a non-empty name.");
+    if (sample.donorId !== undefined && !sample.donorId.trim()) throw new Error(`${sample.name}.donor_ID cannot be blank.`);
     const id = sample.cdnaPrimer.match(/[a-z]+/)?.[0].toUpperCase();
     if (!id) throw new Error(`${sample.name} cDNA_primer has no lower-case sample ID.`);
     const assay = `${sample.secondStrandPrimer.toUpperCase()}\0${sample.cdnaPrimer.toUpperCase()}`;
@@ -228,6 +230,7 @@ export function serializeConfigYaml(config: PipelineConfig): string {
       sec_str_primer: sample.secondStrandPrimer,
       panel: sample.panel,
     };
+    if (sample.donorId) row.donor_ID = sample.donorId;
     if (sample.functionalReference) row.ff_ref = sample.functionalReference;
     if (sample.familySizeOverride !== undefined) row.fs_override = sample.familySizeOverride;
     if (sample.artefactFractionOverride !== undefined) row.af_override = sample.artefactFractionOverride;

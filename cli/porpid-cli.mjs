@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-0FV66vte.mjs";
+import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-8Kw3hjMk.mjs";
 import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
 import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-izZLhWZ1.mjs";
 import { createHash } from "node:crypto";
@@ -11,6 +11,10 @@ import { createInterface } from "node:readline";
 import { createGunzip } from "node:zlib";
 import { Worker as Worker$1 } from "node:worker_threads";
 //#region src/contamination.ts
+/** Samples without donor metadata remain separate biological self groups. */
+function selfGroupsBySample(config) {
+	return new Map(config.samples.map((sample) => [sample.name, sample.donorId?.trim() ? `donor:${sample.donorId.trim()}` : `sample:${sample.name}`]));
+}
 function hash(text, ordinal = 0) {
 	let value = (2166136261 ^ ordinal) >>> 0;
 	for (let index = 0; index < text.length; index++) value = Math.imul(value ^ text.charCodeAt(index), 16777619) >>> 0;
@@ -269,7 +273,7 @@ function dpMeans(vectors, radius) {
 	let centers = [vectors[0]];
 	const assignments = new Int32Array(vectors.length);
 	assignments.fill(-1);
-	for (let iteration = 0; iteration < 30; iteration++) {
+	for (let iteration = 0; iteration < 3; iteration++) {
 		let changed = false, indexed = centerIndex(centers), indexedCount = indexed ? centers.length : 0, canRebuild = Boolean(indexed);
 		for (let point = 0; point < vectors.length; point++) {
 			if (canRebuild && centers.length - indexedCount >= CENTER_INDEX_REBUILD_TAIL) {
@@ -294,9 +298,9 @@ function dpMeans(vectors, radius) {
 	}
 	return clusterMembers(assignments, centers);
 }
-function databaseView(database, sample) {
+function databaseView(database, selfGroup) {
 	const self = [], nonself = [];
-	for (const entry of database) (entry.sample === sample ? self : nonself).push(entry);
+	for (const entry of database) (entry.selfGroup === selfGroup ? self : nonself).push(entry);
 	return {
 		self,
 		nonself
@@ -375,12 +379,12 @@ function scoreDatabase(vector, index) {
 		for (let position = index.offsets[code]; position < index.offsets[code + 1]; position++) index.dots[index.entryIds[position]] += queryCount * index.values[position];
 	}
 }
-function nearestNonselfIndexed(vector, sample, index, threshold) {
+function nearestNonselfIndexed(vector, selfGroup, index, threshold) {
 	scoreDatabase(vector, index);
 	let nearest, nearestDistance = threshold;
 	for (let entry = 0; entry < index.entries.length; entry++) {
 		const candidateEntry = index.entries[entry];
-		if (candidateEntry.sample === sample) continue;
+		if (candidateEntry.selfGroup === selfGroup) continue;
 		const candidate = distanceFromDot(vector, candidateEntry.vector, index.dots[entry]);
 		if (candidate < nearestDistance) {
 			nearest = candidateEntry;
@@ -392,12 +396,12 @@ function nearestNonselfIndexed(vector, sample, index, threshold) {
 		distance: nearestDistance
 	} : void 0;
 }
-function nearestPrimaryIndexed(vector, sample, index, threshold) {
+function nearestPrimaryIndexed(vector, selfGroup, index, threshold) {
 	scoreDatabase(vector, index);
 	let nearest, nearestDistance = threshold, hasCloseSelf = false;
 	for (let entry = 0; entry < index.entries.length; entry++) {
 		const candidateEntry = index.entries[entry], candidate = distanceFromDot(vector, candidateEntry.vector, index.dots[entry]);
-		if (candidateEntry.sample === sample) {
+		if (candidateEntry.selfGroup === selfGroup) {
 			if (candidate <= threshold) hasCloseSelf = true;
 		} else if (candidate < nearestDistance) {
 			nearest = candidateEntry;
@@ -434,13 +438,14 @@ function prepareConsensusVectors(consensuses, config, scratch) {
 		byConsensus
 	};
 }
-function addSampleDatabases(sampleName, vectors, config, primary, suspect, clusters) {
+function addSampleDatabases(sampleName, selfGroup, vectors, config, primary, suspect, clusters) {
 	clusters.forEach((cluster, index) => {
 		const proportion = cluster.memberCount / vectors.length;
 		const percent = Math.round(1e3 * proportion) / 10;
 		const entry = {
 			label: `${sampleName}_cluster${index + 1}_${percent}%`,
 			sample: sampleName,
+			selfGroup,
 			vector: cluster.center
 		};
 		suspect.push(entry);
@@ -449,6 +454,7 @@ function addSampleDatabases(sampleName, vectors, config, primary, suspect, clust
 	const all = {
 		label: `${sampleName}_All`,
 		sample: sampleName,
+		selfGroup,
 		vector: meanAll(vectors)
 	};
 	primary.push(all);
@@ -458,14 +464,17 @@ function classifyPrepared(consensuses, prepared, primary, suspect, config, scrat
 	const threshold = config.parameters.contaminationDistanceThreshold, output = [];
 	const primaryViews = /* @__PURE__ */ new Map(), suspectViews = /* @__PURE__ */ new Map();
 	const primaryIndex = buildDatabaseIndex(primary), suspectIndex = buildDatabaseIndex(suspect);
+	const selfGroups = selfGroupsBySample(config);
 	for (const sample of new Set(consensuses.map((record) => record.sample))) {
-		primaryViews.set(sample, databaseView(primary, sample));
-		suspectViews.set(sample, databaseView(suspect, sample));
+		const selfGroup = selfGroups.get(sample) ?? `sample:${sample}`;
+		primaryViews.set(sample, databaseView(primary, selfGroup));
+		suspectViews.set(sample, databaseView(suspect, selfGroup));
 	}
 	for (let index = 0; index < consensuses.length; index++) {
 		const record = consensuses[index];
 		const vector = !hasRandomAmbiguity(record.sequence) && prepared.byConsensus[index] ? prepared.byConsensus[index] : kmers(record.sequence, hash(record.id, index), scratch);
-		const call = primaryIndex ? nearestPrimaryIndexed(vector, record.sample, primaryIndex, threshold) : nearestPrimary(vector, primaryViews.get(record.sample), threshold);
+		const selfGroup = selfGroups.get(record.sample) ?? `sample:${record.sample}`;
+		const call = primaryIndex ? nearestPrimaryIndexed(vector, selfGroup, primaryIndex, threshold) : nearestPrimary(vector, primaryViews.get(record.sample), threshold);
 		if (call) output.push({
 			sample: record.sample,
 			sequenceId: record.id,
@@ -476,7 +485,7 @@ function classifyPrepared(consensuses, prepared, primary, suspect, config, scrat
 			suspectOnly: false
 		});
 		else {
-			const possible = suspectIndex ? nearestNonselfIndexed(vector, record.sample, suspectIndex, threshold) : nearestNonself(vector, suspectViews.get(record.sample).nonself, threshold);
+			const possible = suspectIndex ? nearestNonselfIndexed(vector, selfGroup, suspectIndex, threshold) : nearestNonself(vector, suspectViews.get(record.sample).nonself, threshold);
 			if (possible) output.push({
 				sample: record.sample,
 				sequenceId: record.id,
@@ -498,10 +507,11 @@ function classifyContamination(consensuses, config) {
 		vector: kmers(record.sequence, hash(record.name, index), scratch)
 	}));
 	const prepared = prepareConsensusVectors(consensuses, config, scratch), primary = [], suspect = [];
+	const selfGroups = selfGroupsBySample(config);
 	for (const sample of config.samples) {
 		const vectors = prepared.bySample.get(sample.name) ?? [];
 		if (!vectors.length) continue;
-		addSampleDatabases(sample.name, vectors, config, primary, suspect, dpMeans(vectors, config.parameters.contaminationClusterThreshold));
+		addSampleDatabases(sample.name, selfGroups.get(sample.name), vectors, config, primary, suspect, dpMeans(vectors, config.parameters.contaminationClusterThreshold));
 	}
 	primary.push(...panel);
 	suspect.push(...panel);
@@ -1053,17 +1063,23 @@ function quantile(values, probability) {
 function alignmentConsensus(rows) {
 	if (!rows.length) return "";
 	let output = "";
+	const counts = new Uint32Array(128), touched = new Uint8Array(128);
 	for (let position = 0; position < rows[0].length; position++) {
-		const counts = /* @__PURE__ */ new Map();
-		rows.forEach((row, index) => {
-			const base = row[position].toUpperCase(), value = counts.get(base) ?? {
-				count: 0,
-				first: index
-			};
-			value.count++;
-			counts.set(base, value);
-		});
-		output += [...counts].sort((a, b) => b[1].count - a[1].count || a[1].first - b[1].first)[0][0];
+		let touchedCount = 0;
+		for (const row of rows) {
+			let code = row.charCodeAt(position);
+			if (code >= 97 && code <= 122) code -= 32;
+			if (code >= counts.length) code = 63;
+			if (counts[code] === 0) touched[touchedCount++] = code;
+			counts[code]++;
+		}
+		let bestCode = touched[0] ?? 45, bestCount = counts[bestCode];
+		for (let index = 1; index < touchedCount; index++) if (counts[touched[index]] > bestCount) {
+			bestCode = touched[index];
+			bestCount = counts[bestCode];
+		}
+		output += String.fromCharCode(bestCode);
+		for (let index = 0; index < touchedCount; index++) counts[touched[index]] = 0;
 	}
 	return output;
 }
@@ -1135,10 +1151,11 @@ function apobecGrid() {
 			-(1 + tv + 1)
 		].map((value) => value * mu);
 		const prior = Math.log(normalPdf(t, -5, 1)) + Math.log(.99 * normalPdf(ga, 0, .1) + .01 * normalPdf(ga, 0, 1));
+		const transitions = matrixExp(q);
 		output.push({
 			t,
 			ga,
-			transitions: matrixExp(q),
+			logTransitions: transitions.map((value) => Math.log(Math.max(value, 1e-300))),
 			prior
 		});
 	}
@@ -1156,14 +1173,17 @@ function apobec(consensus, sequence) {
 		const left = baseIndex[consensus[position].toUpperCase()], right = baseIndex[sequence[position].toUpperCase()];
 		if (left !== void 0 && right !== void 0) counts[left * 4 + right]++;
 	}
-	const weights = apobecGrid().map((point) => {
+	const observed = [];
+	for (let index = 0; index < 16; index++) if (counts[index]) observed.push(index);
+	const grid = apobecGrid(), logWeight = (point) => {
 		let value = point.prior;
-		for (let index = 0; index < 16; index++) if (counts[index]) value += counts[index] * Math.log(Math.max(point.transitions[index], 1e-300));
+		for (const index of observed) value += counts[index] * point.logTransitions[index];
 		return value;
-	});
-	const maximum = Math.max(...weights), scaled = weights.map((value) => Math.exp(value - maximum)), total = scaled.reduce((a, b) => a + b, 0);
+	};
+	const weights = grid.map(logWeight), maximum = Math.max(...weights);
+	const scaled = weights.map((value) => Math.exp(value - maximum)), total = scaled.reduce((sum, value) => sum + value, 0);
 	let t = 0, ga = 0, inflated = 0;
-	apobecGrid().forEach((point, index) => {
+	grid.forEach((point, index) => {
 		const probability = scaled[index] / total;
 		t += point.t * probability;
 		ga += point.ga * probability;
@@ -1335,6 +1355,12 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 	const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
 	const outputs = Array(config.samples.length);
 	let cursor = 0;
+	const sourceBySample = Array.from({ length: config.samples.length }, () => []);
+	const sampleIndexByName = new Map(config.samples.map((sample, index) => [sample.name, index]));
+	for (const record of consensuses) {
+		const sampleIndex = config.samples[record.sampleIndex]?.name === record.sample ? record.sampleIndex : sampleIndexByName.get(record.sample);
+		if (sampleIndex !== void 0) sourceBySample[sampleIndex].push(record);
+	}
 	const sampleProgress = Array(config.samples.length).fill(0);
 	const report = (sampleIndex, fraction, detail) => {
 		sampleProgress[sampleIndex] = Math.max(sampleProgress[sampleIndex], Math.max(0, Math.min(1, fraction)));
@@ -1351,7 +1377,10 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			const referenceAlignments = {}, collapseGroups = {};
 			if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
 			report(sampleIndex, .03, `Preparing filters for sample ${sample.name}`);
-			const source = consensuses.filter((record) => record.sample === sample.name), sizes = source.filter((record) => !discarded.has(record.id)).map((record) => record.familySize);
+			const source = sourceBySample[sampleIndex], sizes = [];
+			let discardedInSample = 0;
+			for (const record of source) if (discarded.has(record.id)) discardedInSample++;
+			else sizes.push(record.familySize);
 			const artefactCutoff = Math.ceil(quantile(sizes, sample.outlierQuantileOverride ?? config.parameters.outlierQuantile) * (sample.artefactFractionOverride ?? config.parameters.artefactFraction));
 			const agreementThreshold = sample.agreementOverride ?? config.parameters.agreementThreshold;
 			const preliminary = source.map((record, index) => ({
@@ -1485,7 +1514,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				observedUmis: 0,
 				likelyRealUmis: 0,
 				consensusSequences: source.length,
-				contaminationPassed: source.filter((record) => !discarded.has(record.id)).length,
+				contaminationPassed: source.length - discardedInSample,
 				postprocPassed: accepted.length,
 				functionalPassed: sample.functionalReferenceSequence ? functionalPassed : void 0,
 				artefactCutoff
@@ -3546,6 +3575,7 @@ function validateResult(value) {
 	const samples = array(config.samples, "config.samples").map((entry, index) => {
 		const sample = object(entry, `config.samples[${index}]`);
 		const name = text(sample.name, `config.samples[${index}].name`);
+		optionalText(sample.donorId, `config.samples[${index}].donorId`);
 		text(sample.cdnaPrimer, `config.samples[${index}].cdnaPrimer`);
 		text(sample.secondStrandPrimer, `config.samples[${index}].secondStrandPrimer`);
 		text(sample.panel, `config.samples[${index}].panel`);
@@ -3794,7 +3824,8 @@ function validateResult(value) {
 		for (const key of [
 			"deferContamination",
 			"deferPostprocessing",
-			"deferCollapse"
+			"deferCollapse",
+			"interactiveFiltering"
 		]) if (options[key] != null) bool(options[key], `runOptions.${key}`);
 		if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage"))) throw new Error("runOptions.spoolStorage is not recognized.");
 	}
@@ -3923,6 +3954,40 @@ function validateResult(value) {
 		if (numeric(timing.seconds, `timings[${index}].seconds`) < 0) throw new Error(`timings[${index}].seconds must be non-negative.`);
 		if (timing.workItems != null) count(timing.workItems, `timings[${index}].workItems`);
 	});
+	if (bundle.thresholdSelections != null) {
+		const ids = /* @__PURE__ */ new Set();
+		array(bundle.thresholdSelections, "thresholdSelections").forEach((rawEntry, index) => {
+			const entry = object(rawEntry, `thresholdSelections[${index}]`), id = text(entry.id, `thresholdSelections[${index}].id`);
+			if (ids.has(id)) throw new Error("Interactive threshold checkpoint identifiers must be unique.");
+			ids.add(id);
+			const phase = text(entry.phase, `thresholdSelections[${index}].phase`);
+			if (!["umi", "consensus-filters"].includes(phase)) throw new Error("Interactive threshold phase is not recognized.");
+			text(entry.acceptedUtc, `thresholdSelections[${index}].acceptedUtc`);
+			array(entry.changes, `thresholdSelections[${index}].changes`).forEach((change) => text(change, "threshold change"));
+			const selectedParameters = object(entry.parameters, `thresholdSelections[${index}].parameters`);
+			for (const key of [
+				"ldaThreshold",
+				"familySizeThreshold",
+				"artefactFraction",
+				"outlierQuantile",
+				"agreementThreshold"
+			]) if (selectedParameters[key] != null) numeric(selectedParameters[key], `thresholdSelections[${index}].parameters.${key}`);
+			const selectedSamples = /* @__PURE__ */ new Set();
+			array(entry.samples, `thresholdSelections[${index}].samples`).forEach((rawSample, sampleIndex) => {
+				const selected = object(rawSample, `thresholdSelections[${index}].samples[${sampleIndex}]`);
+				const name = text(selected.sample, "threshold sample");
+				knownSample(name, "threshold sample");
+				if (selectedSamples.has(name)) throw new Error("An interactive threshold checkpoint contains duplicate sample rows.");
+				selectedSamples.add(name);
+				for (const key of [
+					"familySizeOverride",
+					"artefactFractionOverride",
+					"outlierQuantileOverride",
+					"agreementOverride"
+				]) if (selected[key] != null) numeric(selected[key], `threshold sample ${key}`);
+			});
+		});
+	}
 	array(bundle.log, "log").forEach((entry, index) => text(entry, `log[${index}]`));
 }
 function encodeResult(bundle) {
@@ -4258,7 +4323,7 @@ function concatenateSpoolRecords(records) {
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.7";
+const VERSION = "0.3.8";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

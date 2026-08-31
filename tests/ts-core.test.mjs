@@ -15,7 +15,7 @@ import {
   loadAlivibeNucleotideFasta, readAlivibeNucleotideFasta,
 } from "../src/alivibe-roundtrip.ts";
 import { decodeResult, encodeResult, exportComponent } from "../src/result-file.ts";
-import { classifyContamination, classifyContaminationAsync, deduplicateContaminationCalls } from "../src/contamination.ts";
+import { classifyContamination, classifyContaminationAsync, CONTAMINATION_CLUSTER_PASSES, deduplicateContaminationCalls } from "../src/contamination.ts";
 import { markOptionalStageSkipped } from "../src/optional-stages.ts";
 import { collapseAlignment } from "../src/collapse.ts";
 import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
@@ -28,6 +28,7 @@ import { runScalableMsa } from "../src/scalable-msa.ts";
 import { parseSpoolRecordHeader, selectSpoolChunks } from "../src/spool-record.ts";
 import { layoutTree, midpointRoot, parseNewick, rootOnOutgroup } from "../src/tree.ts";
 import { treeTipNames } from "../src/tree-names.ts";
+import { applyThresholdSelection, buildConsensusThresholdReview, buildUmiThresholdReview } from "../src/threshold-review.ts";
 
 function spoolRecord(sample, hash, umi = "AACCGGTT", name = "read", sequence = "ACGT") {
   const encoder = new TextEncoder(), umiBytes = encoder.encode(umi), nameBytes = encoder.encode(name), sequenceBytes = encoder.encode(sequence);
@@ -192,10 +193,11 @@ test("original single-dataset PORPID YAML remains accepted", async () => {
   try {
     const output = join(directory, "config.mjs");
     await build({ input: resolve("src/config.ts"), output: { file: output, format: "es" } });
-    const { parseConfigYaml, resolveReferenceFiles } = await import(pathToFileURL(output).href);
-    const config = parseConfigYaml(`legacy_run:\n  sample_A:\n    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fa\n    af_override: 0.4\n`);
+    const { parseConfigYaml, resolveReferenceFiles, serializeConfigYaml } = await import(pathToFileURL(output).href);
+    const config = parseConfigYaml(`legacy_run:\n  sample_A:\n    cDNA_primer: CCGCTacgtaaNNNNNNNNGTCA\n    sec_str_primer: TAGG\n    panel: panels/panel.fa\n    donor_ID: donor-7\n    af_override: 0.4\n`);
     assert.equal(config.dataset, "legacy_run"); assert.equal(config.samples[0].name, "sample_A");
-    assert.equal(config.samples[0].artefactFractionOverride, 0.4); assert.equal(config.parameters.ldaThreshold, 0.995);
+    assert.equal(config.samples[0].artefactFractionOverride, 0.4); assert.equal(config.samples[0].donorId, "donor-7"); assert.equal(config.parameters.ldaThreshold, 0.995);
+    assert.match(serializeConfigYaml(config), /donor_ID: donor-7/);
     config.parameters.contaminationFilter = false;
     const resolved = await resolveReferenceFiles(config, new Map([
       ["panels/panel.fa", async () => ">correct\nACGT\n"], ["archive/panel.fa", async () => ">wrong\nTGCA\n"],
@@ -328,8 +330,9 @@ test("report figures and the Swig-derived viewer render from a result payload", 
       alphabet: "nt", highlighter: false, bubbleAreaPerFamily: 25, showAbundanceScale: true, colorByAgreement: false, mutations: new Map(), mutationLimit: 2, tipLegend: [] });
     assert.match(combined, /Tree coordinated with aligned leaf sequences/); assert.match(combined, /<rect[^>]+fill="#78c679"/); assert.match(combined, />A<\/text>/); assert.match(combined, /no radius floor, cap, or dataset normalization/);
     const collapsedViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);", collapsed: true,
-      leafMetadata: { a: { familyCount: 3, minimumAgreement: .7 } } }));
+      leafMetadata: { a: { familyCount: 3, minimumAgreement: .7, color: "#123456", category: "sample A" } } }));
     assert.doesNotMatch(collapsedViewer, /Tip color|family minimum agreement/i, "legacy agreement metadata must not appear as a collapsed-haplotype property");
+    assert.match(collapsedViewer, /fill="#123456"/, "collapsed donor tips must retain their sample color while agreement metadata stays hidden");
     const familyViewer = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0);",
       leafMetadata: { a: { familyCount: 1, minimumAgreement: .7 } } }));
     assert.match(familyViewer, /Family minimum agreement/i);
@@ -391,6 +394,45 @@ test("chunked contamination checks preserve synchronous decisions and emit live 
   const asynchronous = await classifyContaminationAsync(consensuses, config, undefined, (state) => updates.push(state));
   assert.deepEqual(asynchronous, synchronous); assert(updates.length >= 4); assert.equal(updates.at(-1).fraction, 1);
   assert(updates.some((state) => state.phase === "clustering")); assert(updates.some((state) => state.phase === "classification"));
+});
+
+test("contamination clustering is capped at three passes and donor peers are biological self", () => {
+  assert.equal(CONTAMINATION_CLUSTER_PASSES, 3);
+  const base = resultBundle(), parameters = { ...base.config.parameters, deterministicSeed: 1n, contaminationFilter: true,
+    contaminationDistanceThreshold: 1, contaminationClusterThreshold: 0.015 };
+  const sample = (name, donorId) => ({ name, donorId, cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG",
+    panel: "panel.fa", panelSequences: [] });
+  const consensuses = [
+    { ...base.consensuses[0], id: "s1-a", sample: "s1", sampleIndex: 0, sequence: "ACGTACGTACGTACGT" },
+    { ...base.consensuses[0], id: "s2-a", sample: "s2", sampleIndex: 1, sequence: "ACGTACGTACGTACGT" },
+  ];
+  const sameDonor = { dataset: "donor-self", samples: [sample("s1", "d1"), sample("s2", "d1")],
+    contaminationPanel: "contam.fa", contaminationPanelSequences: [], parameters };
+  assert.deepEqual(classifyContamination(consensuses, sameDonor), [], "same-donor signatures must not enter the non-self candidate set");
+  const differentDonors = { ...sameDonor, samples: [sample("s1", "d1"), sample("s2", "d2")] };
+  assert(classifyContamination(consensuses, differentDonors).length > 0, "different donors must remain eligible non-self comparisons");
+});
+
+test("interactive threshold checkpoints reclassify every family and preserve an audit record", () => {
+  const base = resultBundle(), config = { dataset: base.config.dataset, contaminationPanel: base.config.contaminationPanel,
+    contaminationPanelSequences: [], parameters: { ...base.config.parameters, deterministicSeed: 1n },
+    samples: base.config.samples.map((sample) => ({ ...sample, panelSequences: [] })) };
+  const families = [
+    { ...base.umiFamilies[0], posteriorProbability: .999, familySize: 3, disposition: "likely_real" },
+    { ...base.umiFamilies[0], umi: "TTTTGGGG", posteriorProbability: .8, familySize: 9, disposition: "LDA-rejects" },
+    { ...base.umiFamilies[0], umi: "CCCCAAAA", posteriorProbability: .999, familySize: 1, disposition: "likely_real" },
+  ];
+  const review = buildUmiThresholdReview(families, config); assert.equal(review.samples[0].totalFamilies, 3);
+  const record = applyThresholdSelection(config, families, { id: review.id, phase: "umi",
+    parameters: { ldaThreshold: .75, familySizeThreshold: 2 }, samples: [{ sample: "sample_1" }] });
+  assert.equal(families[1].disposition, "likely_real"); assert.equal(families[2].disposition, "family-size-reject");
+  assert(record.changes.some((change) => change.startsWith("ldaThreshold:")));
+  const consensusReview = buildConsensusThresholdReview(base.consensuses, new Set(), config);
+  assert.equal(consensusReview.samples[0].agreementBins.reduce((sum, count) => sum + count, 0), 1);
+  const project = resultBundle(); project.config.samples[0].donorId = "donor-7";
+  project.config.parameters.ldaThreshold = .75; project.config.parameters.familySizeThreshold = 2;
+  project.runOptions.interactiveFiltering = true; project.thresholdSelections = [record];
+  assert.deepEqual(decodeResult(encodeResult(project)), project, "donor metadata and threshold decisions must persist in the project file");
 });
 
 test("skipped contamination remains an independent bypass while true downstream prerequisites stay explicit", () => {
@@ -548,12 +590,14 @@ test("result bundles round-trip, export, and reject structural corruption", () =
 
 test("export all is one gzip-compressed tar with every sample output in its sample directory", () => {
   const bundle = resultBundle(), entries = tarEntries(buildExportArchive(bundle)), decoder = new TextDecoder();
-  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 11);
+  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 12);
   assert(entries.has("README.txt")); assert(entries.has("test.webporpid")); assert(entries.has("run.log.txt"));
   assert.equal(decoder.decode(entries.get("sample_1/trimmed-aa.fasta")), exportComponent(bundle, "trimmed-aa-fasta", "sample_1").text);
   assert.equal(decoder.decode(entries.get("sample_1/families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
   assert.match(decoder.decode(entries.get("cross-sample-overview/parameters.csv")), /maxReadsPerSample/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/sample-summary.csv")), /sample_1/);
+  assert.match(decoder.decode(entries.get("cross-sample-overview/interactive-threshold-decisions.csv")),
+    /checkpoint_id,phase,accepted_utc,scope,sample,parameter,value,change/);
   assert.deepEqual(decodeResult(entries.get("test.webporpid")), bundle);
 });
 
@@ -571,6 +615,19 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(styles, /overscroll-behavior-x:\s*none/);
   assert.match(app, /className="app-version"/); assert.match(app, /packageInformation\.version/);
   assert.match(styles, /\.app-version/);
+});
+
+test("interactive threshold and donor-level controls stay wired into the project UI", async () => {
+  const [app, thresholdDialog, configForm, results] = await Promise.all([
+    readFile("src/App.tsx", "utf8"), readFile("src/components/threshold-review.tsx", "utf8"),
+    readFile("src/components/config-form.tsx", "utf8"), readFile("src/components/results-explorer.tsx", "utf8"),
+  ]);
+  assert.match(app, /Review UMI and consensus thresholds interactively/); assert.match(app, /type: "threshold-selection"/);
+  assert.match(thresholdDialog, /type="range"/); assert.match(thresholdDialog, /className="threshold-direct" type="text"/);
+  assert.match(thresholdDialog, /passes current guides/); assert.match(thresholdDialog, /Accept thresholds and continue/);
+  assert.match(configForm, /label="Donor ID"/); assert.match(configForm, /same ID are treated as self/);
+  assert.match(results, /Donor-level view/); assert.match(results, /Post-collapse haplotypes/); assert.match(results, /Functional-filter passes/);
+  assert.match(results, /category: row\.sample/); assert.match(results, /collapsed bubble area remains exactly linear/);
 });
 
 test("landing, configuration, and result sections link to built detailed Methods pages", async () => {

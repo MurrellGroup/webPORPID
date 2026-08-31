@@ -333,7 +333,9 @@ export function AlignmentTreeViewer({ fasta, newick, alphabet = "nt", onAlphabet
   const sequencesByTip = useMemo(() => Object.fromEntries(displayedRecords.map((record, index) => [safeNames[index], record.sequence])), [displayedRecords, safeNames]);
   const normalizedLeafMetadata = useMemo(() => Object.fromEntries(nucleotideRecords.map((record, index) => {
     const metadata = leafMetadata[record.name] ?? {};
-    return [safeNames[index], collapsed ? { familyCount: metadata.familyCount } : metadata];
+    return [safeNames[index], collapsed
+      ? { familyCount: metadata.familyCount, color: metadata.color, category: metadata.category }
+      : metadata];
   })), [collapsed, leafMetadata, nucleotideRecords, safeNames]);
   const ntByName = useMemo(() => new Map(nucleotideRecords.map((record, index) => [safeNames[index], record.sequence])), [nucleotideRecords, safeNames]);
   const parsimony = useMemo(() => {
