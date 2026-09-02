@@ -70,7 +70,7 @@ export async function computeThrough(bundle: ResultBundle, target: OptionalStage
     && config.parameters.contaminationFilter;
   if (targetIndex >= 1 && (!stageCompleted(current, "postprocessing") || shouldReapply)) {
     const contaminationApplied = stageCompleted(current, "contamination") && config.parameters.contaminationFilter;
-    const started = performance.now(); report(options, "postprocessing", 0, `Starting panel screening, alignments, functional checks, and annotations${contaminationApplied ? " with contamination decisions applied" : " without contamination filtering"}`);
+    const started = performance.now(); report(options, "postprocessing", 0, `Starting panel screening, retained-family alignments, and annotations${contaminationApplied ? " with contamination decisions applied" : " without contamination filtering"}`);
     const downstream = await postprocess(current.consensuses, contaminationApplied ? current.contamination : [], config, options.signal, runAlivibeMsa,
       Math.max(1, current.provenance.workers), (state) => report(options, "postprocessing", state.fraction, state.detail), { collapse: false });
     downstream.summaries.forEach((summary, index) => {
@@ -95,11 +95,12 @@ export async function computeThrough(bundle: ResultBundle, target: OptionalStage
     const collapsed = await collapsePostprocess(input, config, options.signal,
       (state) => report(options, "collapse", state.fraction, state.detail));
     const count = Object.values(collapsed.collapseGroups).reduce((sum, groups) => sum + groups.length, 0), stamp = new Date().toISOString();
-    const statuses = explicitStatuses(current); statuses.collapse = statusRecord("completed", `${count} haplotypes; multiplicities count UMI families.`, stamp);
+    const functionalCount = collapsed.summaries.reduce((sum, summary) => sum + (summary.functionalPassed ?? 0), 0);
+    const statuses = explicitStatuses(current); statuses.collapse = statusRecord("completed", `${count} haplotypes; ${functionalCount} collapsed variants passed configured functional filters; multiplicities count UMI families.`, stamp);
     current = checkpoint(options, { ...current, summaries: collapsed.summaries, alignments: collapsed.alignments,
       referenceAlignments: collapsed.referenceAlignments, collapseGroups: collapsed.collapseGroups, optionalStages: statuses,
       timings: timing(current.timings, "collapse", (performance.now() - started) / 1000, count),
-      log: [...current.log, `${stamp} on-demand collapse: ${count} haplotypes; multiplicities count UMI families`] });
+      log: [...current.log, `${stamp} on-demand collapse: ${count} haplotypes; ${functionalCount} collapsed functional passes; multiplicities count UMI families`] });
   }
   if (targetIndex >= 3 && !stageCompleted(current, "tree")) {
     const inputs = config.samples.flatMap((sample) => {

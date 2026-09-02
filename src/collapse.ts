@@ -18,7 +18,7 @@ function exactFasta(rows: Array<{ name: string; sequence: string }>): string {
  */
 export function collapseAlignment(fasta: string, sample: string): CollapsedAlignment {
   const alignment = inspectAlignment(fasta, 1);
-  const bySequence = new Map<string, { name: string; sequence: string; members: string[] }>();
+  const bySequence = new Map<string, { haplotype: string; sequence: string; members: string[] }>();
   for (const row of alignment.records) {
     // A haplotype is defined by nucleotide content. Equivalent residues can
     // acquire different but equally scoring gap placements in a large MSA;
@@ -26,19 +26,21 @@ export function collapseAlignment(fasta: string, sample: string): CollapsedAlign
     const haplotype = row.sequence.replaceAll("-", "");
     let group = bySequence.get(haplotype);
     if (!group) {
-      group = { name: row.name, sequence: row.sequence, members: [] };
+      group = { haplotype, sequence: row.sequence, members: [] };
       bySequence.set(haplotype, group);
     }
     group.members.push(row.name);
   }
-  const groups: CollapseGroup[] = [...bySequence.values()].map((group) => ({
-    sample,
-    representativeId: group.name,
-    memberIds: group.members,
-    familyCount: group.members.length,
+  // Variant numbers are scientific identifiers, so make both abundance order
+  // and tie-breaking deterministic. Multiplicity is UMI-family count only.
+  const variants = [...bySequence.values()].sort((left, right) =>
+    right.members.length - left.members.length || left.haplotype.localeCompare(right.haplotype));
+  const groups: CollapseGroup[] = variants.map((group, index) => ({
+    sample, representativeId: `${sample}_v${index + 1}_${group.members.length}`,
+    memberIds: group.members, familyCount: group.members.length,
   }));
   return {
-    fasta: exactFasta([...bySequence.values()].map((group) => ({ name: group.name, sequence: group.sequence }))),
+    fasta: exactFasta(variants.map((group, index) => ({ name: groups[index].representativeId, sequence: group.sequence }))),
     groups,
   };
 }

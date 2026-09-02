@@ -127,8 +127,28 @@ export function functionalWasEvaluated(record: PostprocRecord): boolean {
 export function functionalFilterStats(bundle: ResultBundle, sample: string): DualCountStat[] {
   const records = bundle.records.filter((row) => row.sample === sample);
   const configured = Boolean(bundle.config.samples.find((row) => row.name === sample)?.functionalReference);
-  if (!configured) return [dualRow("not-configured", "No functional filter configured", records, records,
-    "Nucleotide and amino-acid alignment views remain available without a functional reference.")];
+  const groups = bundle.collapseGroups?.[sample] ?? [];
+  if (!configured) {
+    const variants = groups.map((group) => ({ familySize: group.familyCount }));
+    return [dualRow("not-configured", "No functional filter configured", variants, variants,
+      "Collapsed nucleotide and amino-acid alignment views remain available without a functional reference.")];
+  }
+  const hasCollapsedCalls = groups.some((group) => group.functionalPass != null || group.functionalRejectionReasons != null);
+  const hasLegacyCalls = records.some(functionalWasEvaluated);
+  if (hasCollapsedCalls || (!hasLegacyCalls && bundle.collapseGroups?.[sample] !== undefined)) {
+    const variants = groups.map((group) => ({ familySize: group.familyCount, functionalPass: group.functionalPass,
+      rejectionReasons: group.functionalRejectionReasons ?? [] }));
+    const evaluated = variants.filter((row) => row.functionalPass != null), notEvaluated = variants.filter((row) => row.functionalPass == null);
+    return [
+      dualRow("all", "All collapsed variants", variants, variants, "Variant percentages count unique haplotypes. The second percentage weights each variant by represented UMI families, never by reads."),
+      dualRow("not-evaluated", "Collapsed variants not evaluated", notEvaluated, variants),
+      dualRow("evaluated", "Evaluated against functional reference", evaluated, variants),
+      dualRow("passed", "Functional-filter passes", evaluated.filter((row) => row.functionalPass === true), variants),
+      dualRow("rejected", "Any functional-filter reject", evaluated.filter((row) => row.functionalPass === false), variants),
+      ...FUNCTIONAL_REASONS.map((category) => dualRow(category.key, category.label,
+        evaluated.filter((row) => row.rejectionReasons.some(category.matches)), variants)),
+    ];
+  }
   const evaluated = records.filter(functionalWasEvaluated), notEvaluated = records.filter((row) => !functionalWasEvaluated(row));
   return [
     dualRow("all", "All consensus families", records, records, "Denominator for both percentage columns; reason rows can overlap."),
@@ -173,13 +193,25 @@ export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] 
     const demultiplexedReads = summary?.demultiplexedReads ?? 0, selectedReads = summary?.selectedReads ?? familyReads;
     const downsampledReads = summary?.downsampledReads ?? Math.max(0, demultiplexedReads - selectedReads);
     let recordReads = 0, artefactRejectReads = 0, agreementRejectReads = 0, contaminationRejectReads = 0, panelRejectReads = 0;
-    let functionalRejectReads = 0, retainedFamilies = 0, functionalEvaluatedFamilies = 0, functionalPassedFamilies = 0;
+    let functionalRejectReads = 0, functionalDenominator = 0, retainedFamilies = 0, functionalEvaluatedFamilies = 0, functionalPassedFamilies = 0;
     for (const row of records) {
       recordReads += row.familySize; if (!row.artefactPass) artefactRejectReads += row.familySize;
       if (!row.agreementPass) agreementRejectReads += row.familySize; if (!row.contaminationPass) contaminationRejectReads += row.familySize;
       if (!row.panelPass) panelRejectReads += row.familySize; if (passedPostproc(row)) retainedFamilies++;
       if (functionalWasEvaluated(row)) { functionalEvaluatedFamilies++; if (row.functionalPass) functionalPassedFamilies++; else functionalRejectReads += row.familySize; }
     }
+    const collapsedGroups = bundle.collapseGroups?.[sample] ?? [];
+    if (collapsedGroups.some((group) => group.functionalPass != null || group.functionalRejectionReasons != null)
+      || (!records.some(functionalWasEvaluated) && bundle.collapseGroups?.[sample] !== undefined)) {
+      functionalEvaluatedFamilies = 0; functionalPassedFamilies = 0; functionalRejectReads = 0;
+      for (const group of collapsedGroups) {
+        functionalDenominator += group.familyCount;
+        if (group.functionalPass != null) {
+          functionalEvaluatedFamilies++;
+          if (group.functionalPass) functionalPassedFamilies++; else functionalRejectReads += group.familyCount;
+        }
+      }
+    } else functionalDenominator = recordReads;
     const dispositionPercent = (disposition: FamilyDisposition) => percent(dispositionReads.get(disposition) ?? 0, familyReads);
     let consensusReads = 0, contaminantConsensusReads = 0;
     for (const row of consensuses) { consensusReads += row.familySize; if (contaminantIds.has(row.id)) contaminantConsensusReads += row.familySize; }
@@ -203,7 +235,7 @@ export function sampleOverviewStats(bundle: ResultBundle): SampleOverviewStat[] 
       contaminationReadPercent: records.length && bundle.postprocessingContaminationMode !== "bypassed"
         ? percent(contaminationRejectReads, recordReads) : percent(contaminantConsensusReads, consensusReads),
       panelReadPercent: percent(panelRejectReads, recordReads),
-      functionalReadPercent: percent(functionalRejectReads, recordReads),
+      functionalReadPercent: percent(functionalRejectReads, functionalDenominator),
     };
   });
 }

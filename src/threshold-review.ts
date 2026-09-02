@@ -39,7 +39,7 @@ export function buildUmiThresholdReview(families: readonly UmiFamily[], config: 
       const rows = rowsBySample[sampleIndex];
       return { sample: sample.name, donorId: sample.donorId, totalFamilies: rows.length,
         familySizeCounts: frequencyTable(rows.map((row) => row.familySize)), posteriorBins: bins(rows.map((row) => row.posteriorProbability), 200),
-        displayPoints: stableDisplaySample(rows).map((row) => ({ familySize: row.familySize,
+        displayPoints: stableDisplaySample(rows).map((row) => ({ umi: row.umi, familySize: row.familySize,
           posteriorProbability: row.posteriorProbability, disposition: row.disposition })),
         current: { familySizeThreshold: sample.familySizeOverride ?? config.parameters.familySizeThreshold },
         usesGlobal: { familySizeThreshold: sample.familySizeOverride === undefined } };
@@ -48,7 +48,7 @@ export function buildUmiThresholdReview(families: readonly UmiFamily[], config: 
 }
 
 export function buildConsensusThresholdReview(consensuses: readonly ConsensusRecord[], discardedIds: ReadonlySet<string>,
-  config: PipelineConfig): ThresholdReview {
+  config: PipelineConfig, families?: readonly UmiFamily[]): ThresholdReview {
   const rowsBySample = Array.from({ length: config.samples.length }, () => [] as ConsensusRecord[]);
   const abundanceRowsBySample = Array.from({ length: config.samples.length }, () => [] as ConsensusRecord[]);
   for (const row of consensuses) if (rowsBySample[row.sampleIndex]) {
@@ -57,16 +57,24 @@ export function buildConsensusThresholdReview(consensuses: readonly ConsensusRec
   }
   return {
     id: reviewId("consensus-filters"), phase: "consensus-filters", title: "Review consensus-family filters",
-    detail: "Consensus agreement and family abundance are complete. Adjust the agreement, outlier-quantile, and artefact-fraction thresholds before reference-panel and functional analysis.",
+    detail: "Consensus agreement and family abundance are complete. Adjust the agreement, outlier-quantile, and artefact-fraction thresholds before reference-panel screening and retained-family alignment.",
     current: { artefactFraction: config.parameters.artefactFraction, outlierQuantile: config.parameters.outlierQuantile,
       agreementThreshold: config.parameters.agreementThreshold },
     samples: config.samples.map((sample, sampleIndex) => {
       const allRows = rowsBySample[sampleIndex], abundanceRows = abundanceRowsBySample[sampleIndex];
-      return { sample: sample.name, donorId: sample.donorId, totalFamilies: allRows.length,
+      const agreementByUmi = new Map(allRows.map((row) => [row.umi, row.minimumAgreement]));
+      const decisionFamilies = families?.filter((row) => row.sampleIndex === sampleIndex
+        && (row.disposition === "likely_real" || row.disposition === "family-size-reject"));
+      const displayPoints = families
+        ? stableDisplaySample(decisionFamilies ?? []).map((row) => ({
+            umi: row.umi, familySize: row.familySize, minimumAgreement: agreementByUmi.get(row.umi), disposition: row.disposition,
+          }))
+        : stableDisplaySample(allRows).map((row) => ({ umi: row.umi, familySize: row.familySize,
+          minimumAgreement: row.minimumAgreement, disposition: "likely_real" as const }));
+      return { sample: sample.name, donorId: sample.donorId, totalFamilies: decisionFamilies?.length ?? allRows.length,
         familySizeCounts: frequencyTable(abundanceRows.map((row) => row.familySize)),
         agreementBins: bins(allRows.map((row) => row.minimumAgreement), 100),
-        displayPoints: stableDisplaySample(allRows).map((row) => ({ familySize: row.familySize,
-          minimumAgreement: row.minimumAgreement, disposition: "likely_real" as const })),
+        displayPoints,
         current: { artefactFraction: sample.artefactFractionOverride ?? config.parameters.artefactFraction,
           outlierQuantile: sample.outlierQuantileOverride ?? config.parameters.outlierQuantile,
           agreementThreshold: sample.agreementOverride ?? config.parameters.agreementThreshold },

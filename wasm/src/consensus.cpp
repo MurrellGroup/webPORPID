@@ -246,13 +246,6 @@ bool selected(const SpoolRecord& record, const std::vector<std::uint64_t>& value
   return record.sample >= values.size() || record.sampling_hash <= values[record.sample];
 }
 
-std::string fixed_two(double value) {
-  const auto hundredths = static_cast<unsigned>(std::lround(std::clamp(value, 0.0, 1.0) * 100.0));
-  std::string output = std::to_string(hundredths / 100);
-  output.push_back('.'); output.push_back(static_cast<char>('0' + (hundredths / 10) % 10));
-  output.push_back(static_cast<char>('0' + hundredths % 10)); return output;
-}
-
 double mean(std::span<const double> values) {
   return values.empty() ? 0.0 : std::accumulate(values.begin(), values.end(), 0.0) / values.size();
 }
@@ -473,8 +466,7 @@ std::vector<std::uint8_t> process_consensus_partition(std::span<const std::uint8
     std::string trim_primer(start, full_primer.end());
     std::transform(trim_primer.begin(), trim_primer.end(), trim_primer.begin(), [](unsigned char value) { return std::toupper(value); });
     record.sequence = reverse_complement(primer_trim(raw, trim_primer));
-    record.id = config.samples[sample_index].name + umi + " fs=" + std::to_string(record.family_size)
-      + " minag=" + fixed_two(record.minimum_agreement);
+    record.id = config.samples[sample_index].name + "_" + umi;
     consensuses.push_back(std::move(record));
   }
   std::vector<std::uint8_t> output; binary::magic(output, "WPO1");

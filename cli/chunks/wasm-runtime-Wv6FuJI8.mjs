@@ -155,7 +155,9 @@ function decodeConsensusOutput(bytes, config) {
 	const count = reader.u32();
 	const consensuses = [];
 	for (let index = 0; index < count; index++) {
-		const sampleIndex = reader.u16(), id = reader.string(), umi = reader.string(), familySize = reader.u32();
+		const sampleIndex = reader.u16();
+		reader.string();
+		const umi = reader.string(), familySize = reader.u32();
 		const minimumAgreement = reader.f64(), sequence = reader.string(), lowCount = reader.u32();
 		const lowAgreementSites = Array.from({ length: lowCount }, () => ({
 			position: reader.u32(),
@@ -163,9 +165,10 @@ function decodeConsensusOutput(bytes, config) {
 			modalReadBase: String.fromCharCode(reader.u8()),
 			modalRunLength: reader.u32()
 		}));
+		const sample = config.samples[sampleIndex]?.name ?? String(sampleIndex);
 		consensuses.push({
-			id,
-			sample: config.samples[sampleIndex]?.name ?? String(sampleIndex),
+			id: `${sample}_${umi}`,
+			sample,
 			sampleIndex,
 			umi,
 			familySize,

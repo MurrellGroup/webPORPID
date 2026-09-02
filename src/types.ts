@@ -127,13 +127,16 @@ export interface PostprocRecord {
   minimumAgreement: number;
   consensusNt: string;
   alignedNt?: string;
+  /** Legacy project compatibility only; new functional outputs live on CollapseGroup. */
   trimmedNt?: string;
+  /** Legacy project compatibility only; new functional outputs live on CollapseGroup. */
   trimmedAa?: string;
   panelScore: number;
   artefactPass: boolean;
   agreementPass: boolean;
   contaminationPass: boolean;
   panelPass: boolean;
+  /** Legacy project compatibility only; new functional decisions live on CollapseGroup. */
   functionalPass?: boolean;
   rejectionReasons: string[];
   apobec?: ApobecResult;
@@ -240,10 +243,19 @@ export interface AlignmentAuditEntry {
 
 export interface CollapseGroup {
   sample: string;
+  /** Stable collapsed-variant name: sample_vN_K (N abundance rank, K UMI-family count). */
   representativeId: string;
   memberIds: string[];
   /** One count per retained UMI family; deliberately not a read count. */
   familyCount: number;
+  /** Functional filtering is evaluated on this collapsed variant, never on its member families. */
+  functionalPass?: boolean;
+  /** Reference-trimmed coding sequence retained for a functional variant. */
+  trimmedNt?: string;
+  /** Translation of trimmedNt retained for a functional variant. */
+  trimmedAa?: string;
+  /** Functional-filter decisions for this collapsed variant. */
+  functionalRejectionReasons?: string[];
   /**
    * Legacy (<=0.3.2) conservative summary: the lowest minimumAgreement among
    * member UMI families. New results omit it because agreement is a family
@@ -306,7 +318,7 @@ export interface ThresholdReviewSample {
   /** Exact 101-bin minimum-agreement distribution on [0,1]. */
   agreementBins?: number[];
   /** A deterministic display-only sample. Thresholds are always applied to every family. */
-  displayPoints?: Array<{ familySize: number; posteriorProbability?: number; minimumAgreement?: number; disposition: FamilyDisposition }>;
+  displayPoints?: Array<{ umi?: string; familySize: number; posteriorProbability?: number; minimumAgreement?: number; disposition: FamilyDisposition }>;
   current: {
     familySizeThreshold?: number;
     artefactFraction?: number;
@@ -399,4 +411,6 @@ export interface PipelineProgress {
   reads?: number;
   /** Live demultiplexed-read counts in configuration sample order. */
   sampleAssignments?: Array<{ sample: string; reads: number }>;
+  /** Read-partition lifecycle used by the UMI/consensus block monitor. */
+  readBlocks?: Array<"waiting" | "loaded" | "complete">;
 }

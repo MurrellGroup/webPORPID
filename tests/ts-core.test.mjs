@@ -355,7 +355,12 @@ test("collapse counts retained UMI families without assigning family agreement t
   assert.equal(collapsed.groups[0].familyCount, 2);
   assert.equal("minimumAgreement" in collapsed.groups[0], false);
   assert.deepEqual(collapsed.groups[0].memberIds, ["family_a", "family_b"]);
-  assert.match(collapsed.fasta, /^>family_a\nAC-GT\n>family_c\nAT-GT\n$/);
+  assert.equal(collapsed.groups[0].representativeId, "sample_1_v1_2");
+  assert.equal(collapsed.groups[1].representativeId, "sample_1_v2_1");
+  assert.match(collapsed.fasta, /^>sample_1_v1_2\nAC-GT\n>sample_1_v2_1\nAT-GT\n$/);
+  const abundanceRanked = collapseAlignment(">rare\nTTTT\n>common_a\nAAAA\n>common_b\nAAAA\n", "donor_sample");
+  assert.equal(abundanceRanked.groups[0].representativeId, "donor_sample_v1_2");
+  assert.deepEqual(abundanceRanked.groups[0].memberIds, ["common_a", "common_b"]);
 });
 
 test("overview statistics expose family- and read-level rejection proportions", () => {
@@ -432,8 +437,9 @@ test("interactive threshold checkpoints reclassify every family and preserve an 
     parameters: { ldaThreshold: .75, familySizeThreshold: 2 }, samples: [{ sample: "sample_1" }] });
   assert.equal(families[1].disposition, "likely_real"); assert.equal(families[2].disposition, "family-size-reject");
   assert(record.changes.some((change) => change.startsWith("ldaThreshold:")));
-  const consensusReview = buildConsensusThresholdReview(base.consensuses, new Set(), config);
+  const consensusReview = buildConsensusThresholdReview(base.consensuses, new Set(), config, families);
   assert.equal(consensusReview.samples[0].agreementBins.reduce((sum, count) => sum + count, 0), 1);
+  assert(consensusReview.samples[0].displayPoints.some((point) => point.disposition === "family-size-reject"));
   const project = resultBundle(); project.config.samples[0].donorId = "donor-7";
   project.config.parameters.ldaThreshold = .75; project.config.parameters.familySizeThreshold = 2;
   project.runOptions.interactiveFiltering = true; project.thresholdSelections = [record];
@@ -470,12 +476,15 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   const consensus = [{ ...base.consensuses[0], sequence: query }];
   const runner = async (sequences, _signal, _iterations, mode) => mode === "amino-acid"
     ? ["MKK*--", "MKKAA*"] : [`${sequences[0]}------`, sequences[1]];
-  const output = await postprocess(consensus, [], config, undefined, runner, 1, undefined, { collapse: false });
+  const output = await postprocess(consensus, [], config, undefined, runner, 1);
   const functional = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1);
   const functionalReference = inspectAlignment(output.referenceAlignments["sample_1/functional-nucleotide"], 1);
   assert.equal(functional.columns, reference.length); assert.equal(functionalReference.columns, reference.length);
+  assert.equal(functional.records[0].name, "sample_1_v1_1");
   assert.equal(functional.records[0].sequence, query.slice(0, reference.length));
-  assert.equal(output.records[0].functionalPass, true);
+  assert.equal(output.records[0].functionalPass, undefined, "uncollapsed family records must never carry functional decisions");
+  assert.equal(output.collapseGroups.sample_1[0].functionalPass, true);
+  assert.equal(output.collapseGroups.sample_1[0].trimmedNt, query.slice(0, reference.length));
 });
 
 test("independent panel alignment preserves exact scoring, query order, and large indels", () => {
@@ -578,7 +587,7 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   const bundle = resultBundle(), encoded = encodeResult(bundle), decoded = decodeResult(encoded);
   assert.deepEqual(decoded, bundle);
   assert.equal(exportComponent(decoded, "trimmed-aa-fasta", "sample_1").text, ">c1\nM*\n");
-  assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /representative_id,family_count,member_ids\nsample_1,c1,1,c1/);
+  assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /representative_id,family_count,functional_pass,functional_rejection_reasons,member_ids\nsample_1,c1,1,,,c1/);
   assert.equal(exportComponent(decoded, "uncollapsed-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
   assert.equal(exportComponent(decoded, "functional-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
   assert.equal(exportComponent(decoded, "functional-protein-alignment", "sample_1").text, ">c1\nM*\n");
@@ -628,10 +637,13 @@ test("result bundles round-trip, export, and reject structural corruption", () =
 
 test("export all is one gzip-compressed tar with every sample output in its sample directory", () => {
   const bundle = resultBundle(), entries = tarEntries(buildExportArchive(bundle)), decoder = new TextDecoder();
-  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 12);
+  assert.equal(entries.size, SAMPLE_EXPORT_KINDS.length + 19);
   assert(entries.has("README.txt")); assert(entries.has("test.webporpid")); assert(entries.has("run.log.txt"));
-  assert.equal(decoder.decode(entries.get("sample_1/trimmed-aa.fasta")), exportComponent(bundle, "trimmed-aa-fasta", "sample_1").text);
-  assert.equal(decoder.decode(entries.get("sample_1/families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
+  assert.equal(decoder.decode(entries.get("sample_1/sample_1_trimmed-aa.fasta")), exportComponent(bundle, "trimmed-aa-fasta", "sample_1").text);
+  assert.equal(decoder.decode(entries.get("sample_1/sample_1_families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
+  for (const plot of ["umi-family-decisions.svg", "artefact-cutoff.svg", "low-agreement-positions.svg", "mds-apobec.svg",
+    "collapsed-highlighter.svg", "uncollapsed-highlighter.svg", "functional-highlighter.svg"])
+    assert.match(decoder.decode(entries.get(`sample_1/sample_1_${plot}`)), /^<svg/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/parameters.csv")), /maxReadsPerSample/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/sample-summary.csv")), /sample_1/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/interactive-threshold-decisions.csv")), /checkpoint_id,phase,accepted_utc,change/);
@@ -644,6 +656,9 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   ]);
   assert.match(pipeline, /sampleAssignments:\s*sampleAssignments\(\)/);
   assert.match(app, /Live sample assignments/); assert.match(app, /last pipeline update/);
+  assert.match(pipeline, /readBlocks\[partition\] = "loaded"/); assert.match(pipeline, /readBlocks\[partition\] = "complete"/);
+  assert.match(app, /Read blocks/); assert.match(styles, /\.read-block-grid/);
+  assert.match(app, /wakeLock/); assert.match(app, /addEventListener\("visibilitychange", visibilityChanged\)/);
   assert.match(app, /addEventListener\("beforeunload", warnBeforeLeaving\)/);
   assert.match(app, /addEventListener\("popstate", interceptHistoryDeparture\)/);
   assert.match(app, /Leave anyway/); assert.match(app, /history\.go\(-2\)/);

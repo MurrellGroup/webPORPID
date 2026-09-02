@@ -1,6 +1,7 @@
 import { gzipSync } from "fflate";
 import { encodeResult, exportComponent, safeDatasetName, type ExportKind } from "./result-file.ts";
 import { buildOverviewExports } from "./overview-export.ts";
+import { reportPlotSvgs } from "./report-svg.ts";
 import type { ResultBundle } from "./types";
 
 export const SAMPLE_EXPORT_KINDS: readonly ExportKind[] = [
@@ -28,7 +29,13 @@ function writeOctal(target: Uint8Array, offset: number, length: number, value: n
 
 function tarHeader(path: string, size: number, modifiedSeconds: number) {
   const header = new Uint8Array(512);
-  writeAscii(header, 0, 100, path);
+  if (encoder.encode(path).byteLength <= 100) writeAscii(header, 0, 100, path);
+  else {
+    const split = path.lastIndexOf("/");
+    if (split < 1) throw new Error(`Archive path is too long: ${path}`);
+    const prefix = path.slice(0, split), name = path.slice(split + 1);
+    writeAscii(header, 0, 100, name); writeAscii(header, 345, 155, prefix);
+  }
   writeOctal(header, 100, 8, 0o644);
   writeOctal(header, 108, 8, 0);
   writeOctal(header, 116, 8, 0);
@@ -75,7 +82,8 @@ export function buildExportArchive(bundle: ResultBundle): Uint8Array {
   const manifest = [
     `webPORPID export bundle for ${bundle.config.dataset}`,
     "",
-    "Each sample directory contains the same sample-filtered components offered by the individual Export control.",
+    "Each sample directory contains the same sample-filtered components offered by the individual Export control, plus static SVG jitter, scatter, and modal-highlighter plots.",
+    "Every filename inside a sample directory begins with that sample's filesystem-safe name and an underscore.",
     "The complete editable .webporpid project and run log are stored at the archive root.",
     "cross-sample-overview/ contains the overview, parameter, provenance, stage-status, timing, and input-mapping tables.",
     "An empty alignment or Newick file means that component was unavailable or phylogeny inference was deferred.",
@@ -89,10 +97,14 @@ export function buildExportArchive(bundle: ResultBundle): Uint8Array {
   for (const overview of buildOverviewExports(bundle))
     entries.push({ path: `cross-sample-overview/${overview.name}`, bytes: encoder.encode(overview.text) });
   samples.forEach((sample, index) => {
+    const prefix = safeDatasetName(sample).slice(0, 72);
+    const sampleFile = (extension: string) => `${prefix.slice(0, Math.max(1, 99 - extension.length))}_${extension}`;
     for (const kind of SAMPLE_EXPORT_KINDS) {
       const component = exportComponent(bundle, kind, sample);
-      entries.push({ path: `${directories[index]}/${component.extension}`, bytes: encoder.encode(component.text) });
+      entries.push({ path: `${directories[index]}/${sampleFile(component.extension)}`, bytes: encoder.encode(component.text) });
     }
+    for (const plot of reportPlotSvgs(bundle, sample))
+      entries.push({ path: `${directories[index]}/${sampleFile(plot.extension)}`, bytes: encoder.encode(plot.text) });
   });
   const timestamp = Math.max(0, Math.floor((Date.parse(bundle.provenance.createdUtc) || 0) / 1000));
   return gzipSync(makeTar(entries, timestamp), { level: 6 });

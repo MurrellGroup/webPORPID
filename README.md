@@ -11,21 +11,22 @@ The repository contains a neutral simulated demo only. Raw reads are processed l
 - Sparse two-edit UMI offspring likelihoods, LDA assignment, family-size gates, and heteroduplex detection.
 - Indel-tolerant family consensus, minimum-agreement calculation, and low-agreement-site logging.
 - Run-aware contamination clustering and filtering with three-pass DP-means, exact sparse six-mer kernels, bounded inverted posting indexes, donor-aware self groups, threshold-safe distance pruning, and time-budgeted progress updates for large runs.
-- Artefact, agreement, and functional filters plus APOBEC summaries. Reference-panel filtering defaults to bundled MAFFT 7.520 FFT-NS-2 and also offers a multi-worker independent-query affine profile aligner for very large family sets.
-- Post-filter haplotype collapse with one multiplicity per retained UMI family, collapsed-tree abundance bubbles, and optional on-demand family-level trees.
+- Artefact and agreement filters plus APOBEC summaries. Reference-panel filtering defaults to bundled MAFFT 7.520 FFT-NS-2 and also offers a multi-worker independent-query affine profile aligner for very large family sets.
+- Post-filter haplotype collapse with abundance-ranked `sample_vN_K` names, one multiplicity per retained UMI family, collapsed-only functional filtering, collapsed-tree abundance bubbles, and optional on-demand family-level trees. Uncollapsed consensus names are `sample_UMI`.
 - Exact abundance geometry: bubble area is strictly linear in retained UMI-family count with no radius cap or floor, and the display slider is expressed as area per family.
-- Live, scrollable per-sample demultiplexing counts and phase-specific feedback with an independent working heartbeat for long operations.
+- Live, scrollable per-sample demultiplexing counts, a blue/loaded-red/consensus-green read-block grid, and phase-specific feedback with an independent working heartbeat for long operations.
+- Dedicated pipeline workers and a best-effort Screen Wake Lock allow work to continue when another tab has focus. Browser/OS suspension of a minimized window cannot be overridden; use the CLI for guaranteed unattended runs.
 - Browser-history protection and unload warnings while selected inputs, an active run, or loaded results would otherwise be lost.
 - Optional contamination, downstream-filtering, collapse, and tree stages can be deferred before a run or skipped while active. Contamination is independently bypassable: downstream work continues without excluding anything at that gate and is explicitly labelled unfiltered. Collapse still requires post-processing, and the default tree still requires collapse.
 - Optional interactive decision checkpoints after offspring-model fitting and consensus statistics, with live threshold plots, sliders, unrestricted direct numeric entry, per-sample overrides, complete-family reclassification, and persisted audit records.
-- One-click `.tar.gz` export containing the editable project, every donor-specific component under its sample-ID directory, and a `cross-sample-overview/` directory of CSV status, parameter, provenance, timing, mapping, and summary tables.
+- One-click `.tar.gz` export containing the editable project, every sample-prefixed component and static jitter/scatter/modal-highlighter SVG under its sample-ID directory, and a `cross-sample-overview/` directory of CSV status, parameter, provenance, timing, mapping, and summary tables.
 - An across-sample sortable overview with explicit demultiplexing/subsampling counts and family- and read/CCS-level percentages for every UMI and consensus filter, including heteroduplex, LDA, and every functional category.
 - Direct frame-selectable translation plus a Swig-derived linked tree/alignment viewer with prominent nucleotide/amino-acid switching, explicitly applied reference-coordinate regions, modal highlighting, mutation mapping, hideable names, and both tree-only and coordinated tree+alignment SVG exports. Trees open rooted on the zero-length edge to the UMI-family-weighted modal tip, with a topology- and distance-preserving midpoint-root control.
 - A contamination workbench with one decision per family and on-demand alignment/tree inference for contamination-panel references, discarded donor contaminants, and retained donor sequences using three categorical tip colors.
 - Optional YAML/UI `donor_ID`, same-donor contamination protection, and a donor-level combined collapsed/functional alignment and phylogeny workbench with sample-colored tips.
 - A bundled Alivibe pop-out editor with permissive biological-edit warnings, validated return, explicit tree recalculation, separately persisted alignment/frame/tree edits, and a detailed append-only edit audit.
 - Interactive UMI, artefact, agreement, MDS/APOBEC, and dinucleotide figures with labelled axes and SVG export.
-- Reference-clipped codon-aware nucleotide/protein alignments for every functional-filter pass, with per-sample FASTA/Newick exports and the same editable tree/alignment workbench used by other sequence views.
+- Reference-clipped codon-aware nucleotide/protein alignments for every functional-filtered collapsed variant, retaining collapsed identifiers and family counts, with per-sample FASTA/Newick exports and the same editable tree/alignment workbench used by other sequence views.
 - A single compressed `.webporpid` result file, component exports, and a complete gzip-compressed tar bundle.
 - A subtle package-derived version label in the page header, so a deployed build can be identified immediately.
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-CuMSsXhU.mjs";
 import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
-import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-izZLhWZ1.mjs";
+import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-Wv6FuJI8.mjs";
 import { n as createMafftRunner } from "./chunks/direct-mafft-IVivIuqW.mjs";
 import { t as filterQueriesAgainstPanel } from "./chunks/independent-panel-filter-DmDC1Ts9.mjs";
 import { createHash } from "node:crypto";
@@ -972,7 +972,7 @@ function collapseAlignment(fasta, sample) {
 		let group = bySequence.get(haplotype);
 		if (!group) {
 			group = {
-				name: row.name,
+				haplotype,
 				sequence: row.sequence,
 				members: []
 			};
@@ -980,15 +980,16 @@ function collapseAlignment(fasta, sample) {
 		}
 		group.members.push(row.name);
 	}
-	const groups = [...bySequence.values()].map((group) => ({
+	const variants = [...bySequence.values()].sort((left, right) => right.members.length - left.members.length || left.haplotype.localeCompare(right.haplotype));
+	const groups = variants.map((group, index) => ({
 		sample,
-		representativeId: group.name,
+		representativeId: `${sample}_v${index + 1}_${group.members.length}`,
 		memberIds: group.members,
 		familyCount: group.members.length
 	}));
 	return {
-		fasta: exactFasta([...bySequence.values()].map((group) => ({
-			name: group.name,
+		fasta: exactFasta(variants.map((group, index) => ({
+			name: groups[index].representativeId,
 			sequence: group.sequence
 		}))),
 		groups
@@ -1549,19 +1550,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 			report(sampleIndex, .66, `Retained-sequence alignment complete for sample ${sample.name}`);
 			const alignmentByIndex = new Map(accepted.map(({ index }, position) => [index, acceptedAlignment[position]]));
 			const consensus = alignmentConsensus(acceptedAlignment), nucleotideRows = [];
-			const functionalNucleotideRows = [];
-			const functionalProteinRows = [];
-			const functionalByIndex = /* @__PURE__ */ new Map();
-			let functionalReferenceNt = "";
-			if (sample.functionalReferenceSequence && accepted.length) {
-				report(sampleIndex, .72, `Checking coding-frame and functional-reference requirements for sample ${sample.name}`);
-				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, accepted.map(({ index }) => extracted.get(index)), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
-				functionalReferenceNt = batch.referenceNt;
-				batch.referenceAa;
-				accepted.forEach(({ index }, position) => functionalByIndex.set(index, batch.outcomes[position]));
-			}
-			report(sampleIndex, .84, `Calculating sequence annotations and filter decisions for sample ${sample.name}`);
-			let functionalPassed = 0;
+			report(sampleIndex, .72, `Calculating family-level annotations and filter decisions for sample ${sample.name}`);
 			for (const [index, record] of source.entries()) {
 				if (signal?.aborted) throw new DOMException("Downstream filtering skipped.", "AbortError");
 				const artefactPass = record.familySize >= artefactCutoff, agreementPass = record.minimumAgreement >= agreementThreshold;
@@ -1570,29 +1559,6 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				if (!agreementPass) rejectionReasons.push(`minimum_agreement < ${agreementThreshold}`);
 				if (!contaminationPass) rejectionReasons.push("contamination filter");
 				if (!panelPass[index]) rejectionReasons.push(`distance_from_panel >= ${config.parameters.panelThreshold}`);
-				let trimmedNt, trimmedAa, functionalPass;
-				if (sample.functionalReferenceSequence) {
-					if (acceptedRow) {
-						const outcome = functionalByIndex.get(index);
-						functionalPass = outcome.passed;
-						trimmedNt = outcome.nt;
-						trimmedAa = outcome.aa;
-						rejectionReasons.push(...outcome.reasons);
-						if (outcome.passed) {
-							functionalPassed++;
-							if (outcome.alignedNt && outcome.alignedAa) {
-								functionalNucleotideRows.push({
-									name: record.id,
-									sequence: outcome.alignedNt
-								});
-								functionalProteinRows.push({
-									name: record.id,
-									sequence: outcome.alignedAa
-								});
-							}
-						}
-					}
-				}
 				if (acceptedRow) nucleotideRows.push({
 					name: record.id,
 					sequence: acceptedRow
@@ -1605,14 +1571,11 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 					minimumAgreement: record.minimumAgreement,
 					consensusNt: record.sequence,
 					alignedNt: acceptedRow,
-					trimmedNt,
-					trimmedAa,
 					panelScore: scores[index],
 					artefactPass,
 					agreementPass,
 					contaminationPass,
 					panelPass: panelPass[index],
-					functionalPass,
 					rejectionReasons,
 					apobec: acceptedRow ? apobec(consensus, acceptedRow) : void 0
 				});
@@ -1633,14 +1596,6 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 					sequence: alignedReference
 				}]);
 			}
-			if (functionalNucleotideRows.length) {
-				alignments[`${sample.name}/functional-nucleotide`] = fasta$1(functionalNucleotideRows);
-				alignments[`${sample.name}/functional-protein`] = fasta$1(functionalProteinRows);
-				referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta$1([{
-					name: "functional_reference",
-					sequence: functionalReferenceNt
-				}]);
-			}
 			summaries.push({
 				sample: sample.name,
 				demultiplexedReads: 0,
@@ -1649,7 +1604,6 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				consensusSequences: source.length,
 				contaminationPassed: source.length - discardedInSample,
 				postprocPassed: accepted.length,
-				functionalPassed: sample.functionalReferenceSequence ? functionalPassed : void 0,
 				artefactCutoff
 			});
 			outputs[sampleIndex] = {
@@ -1671,10 +1625,10 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 		collapseGroups: Object.assign({}, ...outputs.map((output) => output.collapseGroups)),
 		collapseSeconds: 0
 	};
-	return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress);
+	return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress, runMsa);
 }
 /** Run family-count-preserving haplotype collapse as its own resumable stage. */
-async function collapsePostprocess(output, config, signal, onProgress) {
+async function collapsePostprocess(output, config, signal, onProgress, runMsa = runAlivibeMsa) {
 	const started = performance.now(), alignments = { ...output.alignments }, referenceAlignments = { ...output.referenceAlignments };
 	const collapseGroups = { ...output.collapseGroups }, summaries = output.summaries.map((summary) => ({ ...summary }));
 	for (const [index, sample] of config.samples.entries()) {
@@ -1685,28 +1639,68 @@ async function collapsePostprocess(output, config, signal, onProgress) {
 		});
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
 		const uncollapsed = alignments[`${sample.name}/uncollapsed-nucleotide`];
-		let collapsedCount = 0;
+		let collapsedCount = 0, functionalPassed;
+		collapseGroups[sample.name] = [];
 		if (uncollapsed) {
 			const collapsed = collapseAlignment(uncollapsed, sample.name);
 			collapsedCount = collapsed.groups.length;
 			alignments[`${sample.name}/nucleotide`] = collapsed.fasta;
 			collapseGroups[sample.name] = collapsed.groups;
-			const rows = new Map(uncollapsed.split(/^>/m).filter(Boolean).map((block) => {
-				const [name, ...sequence] = block.trimEnd().split(/\r?\n/);
-				return [name, sequence.join("")];
-			}));
-			alignments[`${sample.name}/protein`] = fasta$1(collapsed.groups.map((group) => ({
-				name: group.representativeId,
-				sequence: translateAlignedNucleotides(rows.get(group.representativeId) ?? "", 0)
+			const collapsedRows = inspectAlignment(collapsed.fasta, 1).records;
+			alignments[`${sample.name}/protein`] = fasta$1(collapsedRows.map((row) => ({
+				name: row.name,
+				sequence: translateAlignedNucleotides(row.sequence, 0)
 			})));
 			const reference = referenceAlignments[`${sample.name}/uncollapsed-nucleotide`];
 			if (reference) referenceAlignments[`${sample.name}/nucleotide`] = reference;
+			if (sample.functionalReferenceSequence && collapsedRows.length) {
+				onProgress?.({
+					fraction: (index + .45) / Math.max(1, config.samples.length),
+					detail: `Checking ${collapsedRows.length.toLocaleString()} collapsed variants against the functional reference for ${sample.name}`
+				});
+				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+				const functionalNucleotideRows = [];
+				const functionalProteinRows = [];
+				let passedCount = 0;
+				collapsed.groups.forEach((group, position) => {
+					const outcome = batch.outcomes[position];
+					group.functionalPass = outcome.passed;
+					group.trimmedNt = outcome.nt;
+					group.trimmedAa = outcome.aa;
+					group.functionalRejectionReasons = outcome.reasons;
+					if (outcome.passed) {
+						passedCount++;
+						if (outcome.alignedNt && outcome.alignedAa) {
+							functionalNucleotideRows.push({
+								name: group.representativeId,
+								sequence: outcome.alignedNt
+							});
+							functionalProteinRows.push({
+								name: group.representativeId,
+								sequence: outcome.alignedAa
+							});
+						}
+					}
+				});
+				functionalPassed = passedCount;
+				if (functionalNucleotideRows.length) {
+					alignments[`${sample.name}/functional-nucleotide`] = fasta$1(functionalNucleotideRows);
+					alignments[`${sample.name}/functional-protein`] = fasta$1(functionalProteinRows);
+					referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta$1([{
+						name: "functional_reference",
+						sequence: batch.referenceNt
+					}]);
+				}
+			} else if (sample.functionalReferenceSequence) functionalPassed = 0;
 		}
 		const summary = summaries.find((row) => row.sample === sample.name);
-		if (summary) summary.collapsedSequences = collapsedCount;
+		if (summary) {
+			summary.collapsedSequences = collapsedCount;
+			summary.functionalPassed = functionalPassed;
+		}
 		onProgress?.({
 			fraction: (index + 1) / Math.max(1, config.samples.length),
-			detail: `Collapsed ${sample.name} into ${collapsedCount.toLocaleString()} haplotypes; counts represent UMI families`
+			detail: `Collapsed ${sample.name} into ${collapsedCount.toLocaleString()} variants${functionalPassed === void 0 ? "" : `; ${functionalPassed.toLocaleString()} passed functional filtering`}; counts represent UMI families`
 		});
 	}
 	return {
@@ -3912,6 +3906,9 @@ function validateResult(value) {
 		const uncollapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/uncollapsed-nucleotide`], `alignments.${sample}/uncollapsed-nucleotide`), 1);
 		const collapsedByName = new Map(collapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
 		const uncollapsedByName = new Map(uncollapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+		const functionalSource = object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`];
+		const functionalNames = functionalSource == null ? /* @__PURE__ */ new Set() : new Set(inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records.map((record) => record.name));
+		let hasCollapsedFunctionalCalls = false, collapsedFunctionalPasses = 0;
 		array(rawGroups, `collapseGroups.${sample}`).forEach((rawGroup, index) => {
 			const group = object(rawGroup, `collapseGroups.${sample}[${index}]`);
 			if (text(group.sample, "collapse group sample") !== sample) throw new Error("A collapse group has an inconsistent sample.");
@@ -3919,7 +3916,6 @@ function validateResult(value) {
 			if (representatives.has(representative)) throw new Error("Collapse representative identifiers must be unique.");
 			representatives.add(representative);
 			const members = array(group.memberIds, "collapse members").map((entry) => text(entry, "collapse member"));
-			if (!members.includes(representative)) throw new Error("A collapse group must include its representative.");
 			if (count(group.familyCount, "collapse family count") !== members.length) throw new Error("Collapse counts must count UMI families.");
 			const representativeSequence = collapsedByName.get(representative);
 			if (representativeSequence == null) throw new Error("A collapse representative is missing from the collapsed alignment.");
@@ -3933,10 +3929,20 @@ function validateResult(value) {
 				agreements.push(metadata.minimumAgreement);
 			}
 			if (group.minimumAgreement != null && numeric(group.minimumAgreement, "legacy collapse minimum agreement") !== Math.min(...agreements)) throw new Error("A legacy collapse group has inconsistent family-agreement metadata.");
+			optionalText(group.trimmedNt, "collapsed functional nucleotide");
+			optionalText(group.trimmedAa, "collapsed functional protein");
+			if (group.functionalRejectionReasons != null) array(group.functionalRejectionReasons, "collapsed functional reasons").forEach((reason) => text(reason, "collapsed functional reason"));
+			if (group.functionalPass != null) {
+				hasCollapsedFunctionalCalls = true;
+				const functionalPass = bool(group.functionalPass, "collapsed functionalPass");
+				if (functionalPass) collapsedFunctionalPasses++;
+				if (functionalNames.has(representative) !== functionalPass) throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
+			}
 		});
 		if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length) throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
 		const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
 		if (summary?.collapsedSequences != null && count(summary.collapsedSequences, "summary collapsed count") !== representatives.size) throw new Error("A summary has an inconsistent collapsed haplotype count.");
+		if (hasCollapsedFunctionalCalls && summary?.functionalPassed != null && count(summary.functionalPassed, "summary functional count") !== collapsedFunctionalPasses) throw new Error("A summary has an inconsistent collapsed functional-pass count.");
 	}
 	if (bundle.inputMappings != null) array(bundle.inputMappings, "inputMappings").forEach((rawMapping, index) => {
 		const mapping = object(rawMapping, `inputMappings[${index}]`);
@@ -4168,6 +4174,7 @@ function alignmentSample(bundle, sample) {
 function exportComponent(bundle, kind, sample) {
 	const consensuses = bundle.consensuses.filter((record) => !sample || record.sample === sample);
 	const records = bundle.records.filter((record) => !sample || record.sample === sample);
+	const collapsedFunctional = Object.entries(bundle.collapseGroups ?? {}).flatMap(([groupSample, groups]) => !sample || groupSample === sample ? groups.filter((group) => group.functionalPass) : []);
 	switch (kind) {
 		case "consensus-fasta": return {
 			extension: "consensus.fasta",
@@ -4196,18 +4203,24 @@ function exportComponent(bundle, kind, sample) {
 		case "trimmed-nt-fasta": return {
 			extension: "trimmed-nt.fasta",
 			mime: "text/x-fasta",
-			text: fasta(records.filter((record) => record.functionalPass && record.trimmedNt).map((record) => ({
+			text: fasta((collapsedFunctional.length ? collapsedFunctional.map((group) => ({
+				id: group.representativeId,
+				sequence: group.trimmedNt ?? ""
+			})) : records.filter((record) => record.functionalPass && record.trimmedNt).map((record) => ({
 				id: record.id,
 				sequence: record.trimmedNt
-			})))
+			}))).filter((row) => row.sequence))
 		};
 		case "trimmed-aa-fasta": return {
 			extension: "trimmed-aa.fasta",
 			mime: "text/x-fasta",
-			text: fasta(records.filter((record) => record.functionalPass && record.trimmedAa).map((record) => ({
+			text: fasta((collapsedFunctional.length ? collapsedFunctional.map((group) => ({
+				id: group.representativeId,
+				sequence: group.trimmedAa ?? ""
+			})) : records.filter((record) => record.functionalPass && record.trimmedAa).map((record) => ({
 				id: record.id,
 				sequence: record.trimmedAa
-			})))
+			}))).filter((row) => row.sequence))
 		};
 		case "family-csv": return {
 			extension: "families.csv",
@@ -4286,7 +4299,6 @@ function exportComponent(bundle, kind, sample) {
 				"agreement_pass",
 				"contamination_pass",
 				"panel_pass",
-				"functional_pass",
 				"rejection_reasons"
 			], records.map((row) => [
 				row.sample,
@@ -4299,7 +4311,6 @@ function exportComponent(bundle, kind, sample) {
 				row.agreementPass,
 				row.contaminationPass,
 				row.panelPass,
-				row.functionalPass,
 				row.rejectionReasons.join(";")
 			]))
 		};
@@ -4333,11 +4344,15 @@ function exportComponent(bundle, kind, sample) {
 					"sample",
 					"representative_id",
 					"family_count",
+					"functional_pass",
+					"functional_rejection_reasons",
 					"member_ids"
 				], (bundle.collapseGroups?.[selected] ?? []).map((group) => [
 					selected,
 					group.representativeId,
 					group.familyCount,
+					group.functionalPass,
+					group.functionalRejectionReasons?.join(";"),
 					group.memberIds.join(";")
 				]))
 			};
@@ -4537,7 +4552,7 @@ function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-pane
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.9";
+const VERSION = "0.3.10";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -4969,9 +4984,10 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 		const collapseSeconds = Math.max(0, Math.min(downstreamSeconds, downstream.collapseSeconds));
 		storeTiming("postprocessing", downstreamSeconds - collapseSeconds, downstream.records.length);
 		const collapsedHaplotypes = Object.values(downstream.collapseGroups).reduce((sum, groups) => sum + groups.length, 0);
+		const functionalHaplotypes = downstream.summaries.reduce((sum, summary) => sum + (summary.functionalPassed ?? 0), 0);
 		storeTiming("collapse", collapseSeconds, collapsedHaplotypes);
 		stageStarted = downstreamFinished;
-		log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; multiplicities count families, not reads`);
+		log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; ${functionalHaplotypes} collapsed functional passes; multiplicities count families, not reads`);
 		const treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
 		let treeEntries = [];
 		if (!deferPhylogeny) {
@@ -5029,7 +5045,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 			optionalStages: {
 				contamination: statusRecord("completed", `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`),
 				postprocessing: statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`),
-				collapse: statusRecord("completed", `${collapsedHaplotypes} haplotypes; multiplicities count UMI families.`),
+				collapse: statusRecord("completed", `${collapsedHaplotypes} haplotypes; ${functionalHaplotypes} collapsed variants passed configured functional filters; multiplicities count UMI families.`),
 				tree: statusRecord(deferPhylogeny ? "deferred" : "completed", deferPhylogeny ? "Deferred by user; collapsed alignments are stored for on-demand inference." : `${Object.keys(trees).length} collapsed phylogenies inferred.`)
 			},
 			timings,

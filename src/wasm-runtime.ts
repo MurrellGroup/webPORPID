@@ -173,11 +173,13 @@ export function encodeFamilyModel(families: readonly UmiFamily[]): Uint8Array {
 export function decodeConsensusOutput(bytes: Uint8Array, config: PipelineConfig): { consensuses: ConsensusRecord[]; heteroduplexes: string[] } {
   const reader = new BinaryReader(bytes); reader.magic("WPO1"); const count = reader.u32(); const consensuses: ConsensusRecord[] = [];
   for (let index = 0; index < count; index++) {
-    const sampleIndex = reader.u16(), id = reader.string(), umi = reader.string(), familySize = reader.u32();
+    const sampleIndex = reader.u16(); reader.string(); // Legacy core-rendered label; normalize the public ID below.
+    const umi = reader.string(), familySize = reader.u32();
     const minimumAgreement = reader.f64(), sequence = reader.string(), lowCount = reader.u32();
     const lowAgreementSites = Array.from({ length: lowCount }, () => ({ position: reader.u32(), agreement: reader.f32(),
       modalReadBase: String.fromCharCode(reader.u8()), modalRunLength: reader.u32() }));
-    consensuses.push({ id, sample: config.samples[sampleIndex]?.name ?? String(sampleIndex), sampleIndex, umi,
+    const sample = config.samples[sampleIndex]?.name ?? String(sampleIndex);
+    consensuses.push({ id: `${sample}_${umi}`, sample, sampleIndex, umi,
       familySize, minimumAgreement, sequence, lowAgreementSites });
   }
   const heteroduplexCount = reader.u32(), heteroduplexes: string[] = [];

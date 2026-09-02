@@ -47,26 +47,83 @@ function quantileFromCounts(counts: Array<[number, number]>, probability: number
   return valueAt(counts, lower) * (1 - fraction) + valueAt(counts, Math.min(lower + 1, total - 1)) * fraction;
 }
 
+const DECISION_COLORS: Record<string, string> = {
+  "family-size-reject": "#6ba3ca", "maybe-artefact": "#f29b4b", likely_real: "#45a849",
+  "UMI_len != 8": "#df6767", "LDA-rejects": "#a988c7", "minag-reject": "#9e766d", heteroduplex: "#df92c6",
+};
+const DECISION_ORDER = ["family-size-reject", "maybe-artefact", "likely_real", "UMI_len != 8", "LDA-rejects", "minag-reject", "heteroduplex"];
+
+function hashFraction(value: string) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index++) hash = Math.imul(hash ^ value.charCodeAt(index), 16777619);
+  return (hash >>> 0) / 0xffffffff;
+}
+
+function liveUmiCategory(point: NonNullable<ThresholdReview["samples"][number]["displayPoints"]>[number], thresholds: Partial<Record<string, number>>) {
+  if (point.disposition === "heteroduplex" || point.disposition === "BPB-rejects") return point.disposition;
+  if ((point.posteriorProbability ?? 0) < (thresholds.ldaThreshold ?? 0)) return "LDA-rejects";
+  if ((point.umi?.length ?? 8) !== 8) return "UMI_len != 8";
+  if (point.familySize < (thresholds.familySizeThreshold ?? 0)) return "family-size-reject";
+  return "likely_real";
+}
+
+function liveConsensusCategory(point: NonNullable<ThresholdReview["samples"][number]["displayPoints"]>[number], artefactCutoff: number, agreement: number) {
+  if (point.disposition === "family-size-reject") return "family-size-reject";
+  if (point.disposition !== "likely_real") return point.disposition;
+  if (point.familySize < artefactCutoff) return "maybe-artefact";
+  if ((point.minimumAgreement ?? 1) < agreement) return "minag-reject";
+  return "likely_real";
+}
+
+function PlotLegend({ categories, x = 530, y = 25 }: { categories: string[]; x?: number; y?: number }) {
+  return <g>{categories.map((category, index) => <g key={category} transform={`translate(${x},${y + index * 18})`}>
+    <circle r="4" fill={DECISION_COLORS[category] ?? "#777"} /><text x="10" y="3">{category}</text>
+  </g>)}</g>;
+}
+
 function DecisionPlot({ review, sample, thresholds }: { review: ThresholdReview; sample: ThresholdReview["samples"][number]; thresholds: Partial<Record<string, number>> }) {
-  const points = sample.displayPoints ?? [], width = 760, height = 300, left = 56, right = 18, top = 16, bottom = 44;
-  const maximumFamily = Math.max(1, ...sample.familySizeCounts.map(([size]) => size));
-  const x = (size: number) => left + Math.log1p(Math.max(0, Math.min(maximumFamily, size))) / Math.log1p(maximumFamily) * (width - left - right);
-  const y = (value: number) => top + (1 - Math.max(0, Math.min(1, value))) * (height - top - bottom);
-  const yValue = review.phase === "umi" ? "posteriorProbability" : "minimumAgreement";
-  const horizontal = review.phase === "umi" ? thresholds.ldaThreshold ?? 0 : thresholds.agreementThreshold ?? 0;
-  const vertical = review.phase === "umi" ? thresholds.familySizeThreshold ?? 0
-    : Math.ceil(quantileFromCounts(sample.familySizeCounts, thresholds.outlierQuantile ?? 0) * (thresholds.artefactFraction ?? 0));
-  return <figure className="threshold-plot"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`${review.phase === "umi" ? "UMI probability" : "Consensus agreement"} cutoff plot for ${sample.sample}`}>
-    <rect x={left} y={top} width={width - left - right} height={height - top - bottom} fill="#fbfcfb" stroke="#c8d3cf" />
-    {[0, .25, .5, .75, 1].map((tick) => <g key={tick}><line x1={left - 4} x2={width - right} y1={y(tick)} y2={y(tick)} stroke={tick ? "#e2e8e5" : "#879992"} /><text x={left - 9} y={y(tick) + 4} textAnchor="end">{tick}</text></g>)}
-    {points.map((point, index) => <circle key={index} cx={x(point.familySize)} cy={y(Number(point[yValue]))} r="2.4" fill={point.disposition === "likely_real" ? "#08796f" : "#c5534f"} opacity=".45" />)}
-    <line x1={left} x2={width - right} y1={y(horizontal)} y2={y(horizontal)} stroke="#b13c45" strokeWidth="2" strokeDasharray="7 5" />
-    <line x1={x(vertical)} x2={x(vertical)} y1={top} y2={height - bottom} stroke="#4b3e91" strokeWidth="2" strokeDasharray="7 5" />
-    <text x={(left + width - right) / 2} y={height - 8} textAnchor="middle">UMI family size (log scale)</text>
-    <text transform={`translate(15 ${(top + height - bottom) / 2}) rotate(-90)`} textAnchor="middle">{review.phase === "umi" ? "Offspring probability" : "Minimum agreement"}</text>
-    <text x={Math.min(width - 150, x(vertical) + 5)} y={top + 14} fill="#4b3e91">family cutoff {vertical}</text>
-    <text x={left + 6} y={Math.max(top + 14, y(horizontal) - 6)} fill="#b13c45">{review.phase === "umi" ? "probability" : "agreement"} {horizontal}</text>
-  </svg><figcaption>{points.length.toLocaleString()} display points from {sample.totalFamilies.toLocaleString()} families. Threshold decisions run over the complete family table.</figcaption></figure>;
+  const points = sample.displayPoints ?? [], width = 720, height = 210, left = 45, plotRight = 500, top = 18, bottom = 155;
+  if (review.phase === "umi") {
+    const familyCutoff = thresholds.familySizeThreshold ?? 0;
+    const maximumLog = Math.max(1, ...points.map((point) => Math.log2(Math.max(1, point.familySize))), Math.log2(Math.max(1, familyCutoff)));
+    const minimumUmi = Math.min(6.5, ...points.map((point) => (point.umi?.length ?? 8) - .5));
+    const maximumUmi = Math.max(9.5, ...points.map((point) => (point.umi?.length ?? 8) + .5));
+    const x = (value: number) => left + value / maximumLog * (plotRight - left);
+    const y = (value: number) => bottom - (value - minimumUmi) / Math.max(1, maximumUmi - minimumUmi) * (bottom - top);
+    const categorized = points.map((point) => ({ point, category: liveUmiCategory(point, thresholds) }));
+    const categories = DECISION_ORDER.filter((category) => categorized.some((row) => row.category === category));
+    return <figure className="threshold-plot"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Interactive UMI family-size decision plot for ${sample.sample}`}>
+      <line x1={left} y1={top} x2={left} y2={bottom} /><line x1={left} y1={bottom} x2={plotRight} y2={bottom} />
+      {[7, 8, 9].filter((value) => value >= minimumUmi && value <= maximumUmi).map((value) => <g key={value}><line x1={left} x2={plotRight} y1={y(value)} y2={y(value)} stroke="#e2e8e5" /><text x={left - 9} y={y(value) + 4} textAnchor="end">{value}</text></g>)}
+      {Array.from({ length: Math.floor(maximumLog) + 1 }, (_, value) => <g key={value}><line x1={x(value)} x2={x(value)} y1={top} y2={bottom} stroke="#e2e8e5" /><text x={x(value)} y="171" textAnchor="middle">{value}</text></g>)}
+      <line x1={x(Math.log2(Math.max(1, familyCutoff)))} x2={x(Math.log2(Math.max(1, familyCutoff)))} y1={top} y2={bottom} stroke="#e41a1c" strokeWidth="2" />
+      {categorized.map(({ point, category }, index) => <circle key={`${point.umi ?? index}-${index}`} cx={x(Math.log2(Math.max(1, point.familySize)))}
+        cy={y((point.umi?.length ?? 8) + (hashFraction(`${sample.sample}\0${point.umi ?? index}`) - .5) * .35)} r="3.2"
+        fill={DECISION_COLORS[category] ?? "#777"} fillOpacity=".7"><title>{`${category}; family size ${point.familySize}; UMI length ${point.umi?.length ?? 8}; offspring probability ${(point.posteriorProbability ?? 0).toFixed(4)}`}</title></circle>)}
+      <PlotLegend categories={categories} /><g transform="translate(530,160)"><line x1="0" x2="20" stroke="#e41a1c" strokeWidth="2" /><text x="27" y="4">family-size threshold {familyCutoff}</text></g>
+      <text x="272" y="202" textAnchor="middle">log₂ UMI family size</text><text transform="translate(13,95) rotate(-90)" textAnchor="middle">UMI length</text>
+      <text x="530" y="145">offspring probability ≥ {(thresholds.ldaThreshold ?? 0).toFixed(4)}</text>
+    </svg><figcaption>{points.length.toLocaleString()} deterministic display points from {sample.totalFamilies.toLocaleString()} families. Colors update with the live thresholds and decisions are applied to the complete table. Heteroduplex status is computed during consensus, so it is not yet available at this pre-consensus checkpoint.</figcaption></figure>;
+  }
+  const quantileValue = Math.ceil(quantileFromCounts(sample.familySizeCounts, thresholds.outlierQuantile ?? 0));
+  const artefactCutoff = Math.ceil(quantileFromCounts(sample.familySizeCounts, thresholds.outlierQuantile ?? 0) * (thresholds.artefactFraction ?? 0));
+  const agreement = thresholds.agreementThreshold ?? 0, maximum = Math.max(1, quantileValue);
+  const x = (value: number) => left + value / maximum * (plotRight - left);
+  const allowed = new Set(["family-size-reject", "maybe-artefact", "likely_real", "minag-reject"]);
+  const categorized = points.map((point) => ({ point, category: liveConsensusCategory(point, artefactCutoff, agreement) }))
+    .filter(({ point, category }) => point.familySize <= quantileValue && allowed.has(category));
+  const categories = DECISION_ORDER.filter((category) => categorized.some((row) => row.category === category));
+  return <figure className="threshold-plot"><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label={`Interactive artefact and minimum-agreement decision plot for ${sample.sample}`}>
+    <line x1={left} y1="20" x2={left} y2="150" /><line x1={left} y1="150" x2={plotRight} y2="150" />
+    {Array.from({ length: 6 }, (_, index) => maximum * index / 5).map((value, index) => <g key={index}><line x1={x(value)} x2={x(value)} y1="145" y2="155" /><text x={x(value)} y="167" textAnchor="middle">{Math.round(value)}</text></g>)}
+    {Array.from({ length: 10 }, (_, index) => (index + .5) / 10).map((fraction) => <line key={fraction} x1={x(quantileValue * fraction)} x2={x(quantileValue * fraction)} y1="20" y2="150" stroke="#287bb2" strokeWidth="1.4" />)}
+    <line x1={x(artefactCutoff)} x2={x(artefactCutoff)} y1="20" y2="150" stroke="#e41a1c" strokeWidth="2" /><line x1={x(quantileValue)} x2={x(quantileValue)} y1="20" y2="150" stroke="#ff9800" strokeWidth="2" />
+    {categorized.map(({ point, category }, index) => <circle key={`${point.umi ?? index}-${index}`} cx={x(point.familySize)}
+      cy={84 + (hashFraction(`artefact\0${sample.sample}\0${point.umi ?? index}`) - .5) * 92} r="3.1"
+      fill={DECISION_COLORS[category] ?? "#777"} fillOpacity=".72"><title>{`${category}; family size ${point.familySize}; minimum agreement ${point.minimumAgreement ?? "not called"}`}</title></circle>)}
+    <PlotLegend categories={categories} /><text x="272" y="177" textAnchor="middle">UMI family size</text>
+    <text x="270" y="199" textAnchor="middle">artefact fraction {(thresholds.artefactFraction ?? 0).toFixed(3)} → cutoff {artefactCutoff}; quantile {(thresholds.outlierQuantile ?? 0).toFixed(3)} → {quantileValue}; min agreement {agreement.toFixed(3)}</text>
+  </svg><figcaption>{categorized.length.toLocaleString()} deterministic display points. Family-size, artefact, and minimum-agreement classes update live; accepted thresholds are applied to every eligible consensus family.</figcaption></figure>;
 }
 
 export function ThresholdReviewDialog({ review, onAccept, onCancel }: {

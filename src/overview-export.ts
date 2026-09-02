@@ -14,8 +14,8 @@ export interface OverviewExport { name: string; text: string }
 export function buildOverviewExports(bundle: ResultBundle): OverviewExport[] {
   const overview = sampleOverviewStats(bundle), input = inputFilterStats(bundle), parameters = parameterSettings(bundle);
   const contaminationComplete = stageCompleted(bundle, "contamination"), postprocessingComplete = stageCompleted(bundle, "postprocessing"), collapseComplete = stageCompleted(bundle, "collapse");
-  const postprocessingFields = new Set(["retainedFamilies", "functionalEvaluatedFamilies", "functionalPassedFamilies", "artefactReadPercent",
-    "agreementReadPercent", "panelReadPercent", "functionalReadPercent"]);
+  const postprocessingFields = new Set(["retainedFamilies", "artefactReadPercent", "agreementReadPercent", "panelReadPercent"]);
+  const collapseFields = new Set(["functionalEvaluatedFamilies", "functionalPassedFamilies", "functionalReadPercent"]);
   const summaryKeys = ["sample", "donorId", "demultiplexedReads", "selectedReads", "downsampledReads", "downsampledPercent", "observedFamilies",
     "consensusFamilies", "retainedFamilies", "functionalConfigured", "functionalEvaluatedFamilies", "functionalPassedFamilies",
     "collapsedHaplotypes", "bpbReadPercent", "umiLengthReadPercent", "familySizeReadPercent", "ldaReadPercent",
@@ -25,7 +25,7 @@ export function buildOverviewExports(bundle: ResultBundle): OverviewExport[] {
     { name: "README.txt", text: "Cross-sample tables from the webPORPID overview. Percentage columns are percentages (0–100), not fractions. Optional-stage status distinguishes zero results from work that was not computed.\n" },
     { name: "sample-summary.csv", text: csv([...summaryKeys], overview.map((row) => summaryKeys.map((key) =>
       key === "contaminationReadPercent" && !contaminationComplete ? undefined
-        : key === "collapsedHaplotypes" && !collapseComplete ? undefined
+        : (key === "collapsedHaplotypes" || collapseFields.has(key)) && !collapseComplete ? undefined
           : postprocessingFields.has(key) && !postprocessingComplete ? undefined : row[key]))) },
     { name: "input-filtering.csv", text: csv(["key", "label", "count", "percent", "note"], input.map((row) => [row.key, row.label, row.count, row.percent, row.note])) },
     { name: "parameters.csv", text: csv(["scope", "sample", "parameter", "value"], parameters.map((row) => [row.scope, row.sample, row.parameter, row.value])) },

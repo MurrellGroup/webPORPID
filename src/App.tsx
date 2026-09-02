@@ -23,13 +23,17 @@ function download(name: string, data: string | Uint8Array, mime: string) {
 interface SlotConflict { file: File; target: ReferenceSlot; matching: ReferenceSlot }
 type SpoolStorage = "automatic" | "external-directory";
 type DirectoryPickerWindow = Window & { showDirectoryPicker?: (options?: { id?: string; mode?: "read" | "readwrite" }) => Promise<ExternalScratchDirectoryHandle> };
+interface WakeLockSentinelLike extends EventTarget { readonly released: boolean; release(): Promise<void> }
+type WakeLockNavigator = Navigator & { wakeLock?: { request(type: "screen"): Promise<WakeLockSentinelLike> } };
 
 const fileKey = (file: File) => `${file.name}\0${file.size}\0${file.lastModified}`;
 const isYaml = (file: File) => /\.ya?ml$/i.test(file.name);
 const isFastq = (file: File) => /\.(?:fastq|fq)(?:\.gz)?$/i.test(file.name);
 const isResult = (file: File) => /\.webporpid$/i.test(file.name);
 
-function StageProgress({ value, onSkip, skipping }: { value: PipelineProgress; onSkip?(stage: OptionalStageName): void; skipping?: boolean }) {
+function StageProgress({ value, onSkip, skipping, backgroundStatus }: {
+  value: PipelineProgress; onSkip?(stage: OptionalStageName): void; skipping?: boolean; backgroundStatus?: string;
+}) {
   const [clock, setClock] = useState(() => Date.now()), started = useRef(Date.now()), lastChange = useRef(Date.now());
   const signature = `${value.stage}\0${value.fraction}\0${value.detail}`;
   useEffect(() => { lastChange.current = Date.now(); }, [signature]);
@@ -42,6 +46,9 @@ function StageProgress({ value, onSkip, skipping }: { value: PipelineProgress; o
   };
   const elapsed = Math.max(0, Math.floor((clock - started.current) / 1000)), quiet = Math.max(0, Math.floor((clock - lastChange.current) / 1000));
   const assignments = value.sampleAssignments ?? [], maximum = Math.max(1, ...assignments.map((row) => row.reads));
+  const blocks = value.readBlocks ?? [], blockCounts = blocks.reduce((counts, state) => {
+    counts[state]++; return counts;
+  }, { waiting: 0, loaded: 0, complete: 0 });
   const optional = (["contamination", "postprocessing", "collapse", "tree"] as const).includes(value.stage as OptionalStageName)
     ? value.stage as OptionalStageName : undefined;
   return <section className="run-progress" aria-live="polite">
@@ -49,6 +56,14 @@ function StageProgress({ value, onSkip, skipping }: { value: PipelineProgress; o
     <progress max="100" value={percent} />
     <p>{value.detail}</p>
     <div className="working-heartbeat"><i /><span>{quiet >= 3 ? `Still working · last pipeline update ${quiet.toLocaleString()} s ago` : "Working"}</span><em>Elapsed {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}</em></div>
+    {backgroundStatus && <div className="background-compute-status"><span aria-hidden="true">◉</span>{backgroundStatus}</div>}
+    {blocks.length > 0 && <section className="read-block-monitor" aria-label="Read block progress">
+      <header><strong>Read blocks</strong><span>{blockCounts.complete.toLocaleString()} of {blocks.length.toLocaleString()} consensus blocks complete</span></header>
+      <div className="read-block-grid">{blocks.map((state, index) => <span key={index} className={state}
+        title={`Block ${index + 1}: ${state === "waiting" ? "waiting" : state === "loaded" ? "loaded for UMI/consensus work" : "consensus complete"}`}
+        aria-label={`Block ${index + 1}: ${state}`}><b>{index + 1}</b></span>)}</div>
+      <footer><span><i className="waiting" />Waiting</span><span><i className="loaded" />Loaded</span><span><i className="complete" />Consensus complete</span></footer>
+    </section>}
     {value.stage === "preprocessing" && assignments.length > 0 && <section className="demux-live" aria-label="Live reads assigned to each sample">
       <header><strong>Live sample assignments</strong><span>{assignments.reduce((sum, row) => sum + row.reads, 0).toLocaleString()} reads assigned</span></header>
       <div className="demux-bars">{assignments.map((row) => <div className="demux-row" key={row.sample}>
@@ -85,8 +100,10 @@ export default function App() {
   const [cancelling, setCancelling] = useState(false);
   const [skippingStage, setSkippingStage] = useState<OptionalStageName>();
   const [thresholdReview, setThresholdReview] = useState<ThresholdReview>();
+  const [backgroundStatus, setBackgroundStatus] = useState("");
   const [navigationBlocked, setNavigationBlocked] = useState(false);
   const workerRef = useRef<Worker | undefined>(undefined);
+  const wakeLockRef = useRef<WakeLockSentinelLike | undefined>(undefined);
   const protectWorkRef = useRef(false), historyGuardRef = useRef(false), confirmedLeaveRef = useRef(false);
   const maxWorkers = useMemo(() => Math.max(1, navigator.hardwareConcurrency || 1), []);
   const externalScratchSupported = typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function";
@@ -96,6 +113,41 @@ export default function App() {
     || Object.keys(referenceAssignments).length || unassignedReferences.length);
 
   useEffect(() => { protectWorkRef.current = hasWorkToProtect; }, [hasWorkToProtect]);
+
+  useEffect(() => {
+    let disposed = false;
+    const releaseWakeLock = async () => {
+      const sentinel = wakeLockRef.current; wakeLockRef.current = undefined;
+      if (sentinel && !sentinel.released) try { await sentinel.release(); } catch { /* best effort */ }
+    };
+    if (!running) { void releaseWakeLock(); setBackgroundStatus(""); return; }
+    const acquireWakeLock = async () => {
+      if (disposed || document.visibilityState !== "visible" || wakeLockRef.current && !wakeLockRef.current.released) return;
+      const api = (navigator as WakeLockNavigator).wakeLock;
+      if (!api) {
+        setBackgroundStatus("Dedicated workers are active. This browser does not expose a screen wake lock, so the OS may suspend a minimized window.");
+        return;
+      }
+      try {
+        const sentinel = await api.request("screen");
+        if (disposed) { await sentinel.release(); return; }
+        wakeLockRef.current = sentinel;
+        sentinel.addEventListener("release", () => {
+          if (!disposed && document.visibilityState === "visible") setBackgroundStatus("Workers remain active, but the wake lock was released by the browser or OS.");
+        });
+        setBackgroundStatus("Dedicated workers are active and a screen wake lock is held while this tab remains visible.");
+      } catch {
+        if (!disposed) setBackgroundStatus("Dedicated workers are active. The browser declined the wake lock and may throttle or suspend a minimized window.");
+      }
+    };
+    const visibilityChanged = () => {
+      if (document.visibilityState === "hidden") {
+        setBackgroundStatus("Tab is hidden. Workers continue where the browser permits, but the browser or OS can suspend background computation.");
+      } else void acquireWakeLock();
+    };
+    document.addEventListener("visibilitychange", visibilityChanged); void acquireWakeLock();
+    return () => { disposed = true; document.removeEventListener("visibilitychange", visibilityChanged); void releaseWakeLock(); };
+  }, [running]);
 
   useEffect(() => {
     if (!hasWorkToProtect) return;
@@ -355,8 +407,8 @@ export default function App() {
             </div>
             {noDownsampling && <p className="scratch-recommendation"><strong>No downsampling is enabled.</strong> Every demultiplexed sequence and quality string must survive until the global UMI model and consensus pass. Use an external scratch disk with ample free space; 256 spool partitions is recommended for bounded per-worker memory on very large runs.</p>}
           </section>
-          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Decision and optional-stage controls</strong><label><input type="checkbox" checked={interactiveFiltering} onChange={(event) => setInteractiveFiltering(event.target.checked)} /><span>Review UMI and consensus thresholds interactively</span></label><small>Pauses after UMI probability fitting, then again after consensus and any applied contamination eligibility are known. Each cutoff has a live plot, slider, unrestricted direct numeric entry, and a persisted audit record.</small><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Contamination can be deferred or skipped without blocking later work; downstream outputs then retain every sequence at that gate and are labelled unfiltered. Collapse requires downstream filtering, and the default phylogeny requires collapse.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}</div></div>
-          {progress && running && <StageProgress value={progress} onSkip={skipOptionalStage} skipping={skippingStage === progress.stage} />}
+          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Decision and optional-stage controls</strong><label><input type="checkbox" checked={interactiveFiltering} onChange={(event) => setInteractiveFiltering(event.target.checked)} /><span>Review UMI and consensus thresholds interactively</span></label><small>Pauses after UMI probability fitting, then again after consensus and any applied contamination eligibility are known. Each cutoff has a live plot, slider, unrestricted direct numeric entry, and a persisted audit record.</small><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse + functional filtering</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Contamination can be deferred or skipped without blocking later work; downstream outputs then retain every sequence at that gate and are labelled unfiltered. Functional filtering runs only on collapsed variants, so it is deferred with collapse. The default phylogeny also requires collapse.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}<small className="background-compute-note">Runs use dedicated workers and request a wake lock. Keep the browser open; minimized/background execution remains subject to browser and OS suspension.</small></div></div>
+          {progress && running && <StageProgress value={progress} onSkip={skipOptionalStage} skipping={skippingStage === progress.stage} backgroundStatus={backgroundStatus} />}
           {error && <div className="error-box" role="alert">{error}</div>}
         </section>
         <section className="method-strip" id="about"><article><span>01</span><h3>Stream &amp; demultiplex</h3><p>Gzip chunks are decoded incrementally. Read-quality, primer, orientation, sample-ID and BPB logic follows the nanopore branch.</p><MethodLink topic="streaming" label="Detailed preprocessing methods" /></article><article><span>02</span><h3>Group &amp; call consensus</h3><p>Sparse two-error offspring likelihoods, LDA decisions, heteroduplex QC, seeded alignment and minimum-agreement counting.</p><MethodLink topic="consensus" label="Detailed consensus methods" /></article><article><span>03</span><h3>Filter &amp; explore</h3><p>Run-aware contamination, panel and functional filters, APOBEC model, aligned variants, phylogeny and component exports.</p><MethodLink topic="contamination" label="Detailed downstream methods" /></article></section>

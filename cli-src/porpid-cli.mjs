@@ -22,7 +22,7 @@ import { createMafftRunner } from "./direct-mafft.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 import { createIndependentPanelFilterRunner } from "./direct-panel-filter.mjs";
 
-const VERSION = "0.3.9";
+const VERSION = "0.3.10";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
@@ -303,8 +303,9 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
     const collapseSeconds = Math.max(0, Math.min(downstreamSeconds, downstream.collapseSeconds));
     storeTiming("postprocessing", downstreamSeconds - collapseSeconds, downstream.records.length);
     const collapsedHaplotypes = Object.values(downstream.collapseGroups).reduce((sum, groups) => sum + groups.length, 0);
+    const functionalHaplotypes = downstream.summaries.reduce((sum, summary) => sum + (summary.functionalPassed ?? 0), 0);
     storeTiming("collapse", collapseSeconds, collapsedHaplotypes); stageStarted = downstreamFinished;
-    log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; multiplicities count families, not reads`);
+    log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; ${functionalHaplotypes} collapsed functional passes; multiplicities count families, not reads`);
     const treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
     let treeEntries = [];
     if (!deferPhylogeny) {
@@ -330,7 +331,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
       collapseGroups: downstream.collapseGroups, inputMappings, runOptions: { deferPhylogeny, deferContamination: false, deferPostprocessing: false, deferCollapse: false },
       optionalStages: { contamination: statusRecord("completed", `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`),
         postprocessing: statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`),
-        collapse: statusRecord("completed", `${collapsedHaplotypes} haplotypes; multiplicities count UMI families.`),
+        collapse: statusRecord("completed", `${collapsedHaplotypes} haplotypes; ${functionalHaplotypes} collapsed variants passed configured functional filters; multiplicities count UMI families.`),
         tree: statusRecord(deferPhylogeny ? "deferred" : "completed", deferPhylogeny ? "Deferred by user; collapsed alignments are stored for on-demand inference." : `${Object.keys(trees).length} collapsed phylogenies inferred.`) },
       timings, log };
     await mkdir(dirname(resolve(outputPath)), { recursive: true }); await writeFile(outputPath, encodeResult(result));

@@ -201,6 +201,10 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     const uncollapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/uncollapsed-nucleotide`], `alignments.${sample}/uncollapsed-nucleotide`), 1);
     const collapsedByName = new Map(collapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
     const uncollapsedByName = new Map(uncollapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+    const functionalSource = object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`];
+    const functionalNames = functionalSource == null ? new Set<string>()
+      : new Set(inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records.map((record) => record.name));
+    let hasCollapsedFunctionalCalls = false, collapsedFunctionalPasses = 0;
     array(rawGroups, `collapseGroups.${sample}`).forEach((rawGroup, index) => {
       const group = object(rawGroup, `collapseGroups.${sample}[${index}]`);
       if (text(group.sample, "collapse group sample") !== sample) throw new Error("A collapse group has an inconsistent sample.");
@@ -208,7 +212,6 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       if (representatives.has(representative)) throw new Error("Collapse representative identifiers must be unique.");
       representatives.add(representative);
       const members = array(group.memberIds, "collapse members").map((entry) => text(entry, "collapse member"));
-      if (!members.includes(representative)) throw new Error("A collapse group must include its representative.");
       if (count(group.familyCount, "collapse family count") !== members.length) throw new Error("Collapse counts must count UMI families.");
       const representativeSequence = collapsedByName.get(representative);
       if (representativeSequence == null) throw new Error("A collapse representative is missing from the collapsed alignment.");
@@ -226,12 +229,24 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       // that legacy field without treating it as a haplotype property.
       if (group.minimumAgreement != null && numeric(group.minimumAgreement, "legacy collapse minimum agreement") !== Math.min(...agreements))
         throw new Error("A legacy collapse group has inconsistent family-agreement metadata.");
+      optionalText(group.trimmedNt, "collapsed functional nucleotide"); optionalText(group.trimmedAa, "collapsed functional protein");
+      if (group.functionalRejectionReasons != null) array(group.functionalRejectionReasons, "collapsed functional reasons")
+        .forEach((reason) => text(reason, "collapsed functional reason"));
+      if (group.functionalPass != null) {
+        hasCollapsedFunctionalCalls = true; const functionalPass = bool(group.functionalPass, "collapsed functionalPass");
+        if (functionalPass) collapsedFunctionalPasses++;
+        if (functionalNames.has(representative) !== functionalPass)
+          throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
+      }
     });
     if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length)
       throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
     const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
     if (summary?.collapsedSequences != null && count(summary.collapsedSequences, "summary collapsed count") !== representatives.size)
       throw new Error("A summary has an inconsistent collapsed haplotype count.");
+    if (hasCollapsedFunctionalCalls && summary?.functionalPassed != null
+      && count(summary.functionalPassed, "summary functional count") !== collapsedFunctionalPasses)
+      throw new Error("A summary has an inconsistent collapsed functional-pass count.");
   }
   if (bundle.inputMappings != null) array(bundle.inputMappings, "inputMappings").forEach((rawMapping, index) => {
     const mapping = object(rawMapping, `inputMappings[${index}]`);
@@ -391,12 +406,20 @@ function alignmentSample(bundle: ResultBundle, sample?: string) {
 export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?: string): { extension: string; mime: string; text: string } {
   const consensuses = bundle.consensuses.filter((record) => !sample || record.sample === sample);
   const records = bundle.records.filter((record) => !sample || record.sample === sample);
+  const collapsedFunctional = Object.entries(bundle.collapseGroups ?? {}).flatMap(([groupSample, groups]) =>
+    (!sample || groupSample === sample) ? groups.filter((group) => group.functionalPass) : []);
   switch (kind) {
     case "consensus-fasta": return { extension: "consensus.fasta", mime: "text/x-fasta", text: fasta(consensuses.map((record) => ({ id: record.id, sequence: record.sequence }))) };
     case "passed-consensus-fasta": return { extension: "passed-consensus.fasta", mime: "text/x-fasta", text: fasta(records.filter(passed).map((record) => ({ id: record.id, sequence: record.consensusNt }))) };
     case "rejected-consensus-fasta": return { extension: "rejected-consensus.fasta", mime: "text/x-fasta", text: fasta(records.filter((record) => !passed(record)).map((record) => ({ id: record.id, sequence: record.consensusNt }))) };
-    case "trimmed-nt-fasta": return { extension: "trimmed-nt.fasta", mime: "text/x-fasta", text: fasta(records.filter((record) => record.functionalPass && record.trimmedNt).map((record) => ({ id: record.id, sequence: record.trimmedNt! }))) };
-    case "trimmed-aa-fasta": return { extension: "trimmed-aa.fasta", mime: "text/x-fasta", text: fasta(records.filter((record) => record.functionalPass && record.trimmedAa).map((record) => ({ id: record.id, sequence: record.trimmedAa! }))) };
+    case "trimmed-nt-fasta": return { extension: "trimmed-nt.fasta", mime: "text/x-fasta", text: fasta(
+      (collapsedFunctional.length ? collapsedFunctional.map((group) => ({ id: group.representativeId, sequence: group.trimmedNt ?? "" }))
+        : records.filter((record) => record.functionalPass && record.trimmedNt).map((record) => ({ id: record.id, sequence: record.trimmedNt! })))
+        .filter((row) => row.sequence)) };
+    case "trimmed-aa-fasta": return { extension: "trimmed-aa.fasta", mime: "text/x-fasta", text: fasta(
+      (collapsedFunctional.length ? collapsedFunctional.map((group) => ({ id: group.representativeId, sequence: group.trimmedAa ?? "" }))
+        : records.filter((record) => record.functionalPass && record.trimmedAa).map((record) => ({ id: record.id, sequence: record.trimmedAa! })))
+        .filter((row) => row.sequence)) };
     case "family-csv": return { extension: "families.csv", mime: "text/csv", text: csv(
       ["sample", "UMI", "fs", "tags", "posterior_probability", "log_offspring_probability", "minag"],
       bundle.umiFamilies.filter((row) => !sample || row.sample === sample).map((row) => [row.sample, row.umi, row.familySize, row.disposition, row.posteriorProbability, row.logOffspringProbability, row.minimumAgreement]),
@@ -410,8 +433,8 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
       deduplicateContaminationCalls(bundle.contamination).filter((row) => !sample || row.sample === sample).map((row) => [row.sample, row.sequenceId, row.nearestNonselfVariant, row.nearestNonselfDistance, row.flagged, row.discarded, row.suspectOnly]),
     ) };
     case "postproc-csv": return { extension: "postproc.csv", mime: "text/csv", text: csv(
-      ["sample", "id", "UMI", "fs", "minag", "panel_score", "artefact_pass", "agreement_pass", "contamination_pass", "panel_pass", "functional_pass", "rejection_reasons"],
-      records.map((row) => [row.sample, row.id, row.umi, row.familySize, row.minimumAgreement, row.panelScore, row.artefactPass, row.agreementPass, row.contaminationPass, row.panelPass, row.functionalPass, row.rejectionReasons.join(";")]),
+      ["sample", "id", "UMI", "fs", "minag", "panel_score", "artefact_pass", "agreement_pass", "contamination_pass", "panel_pass", "rejection_reasons"],
+      records.map((row) => [row.sample, row.id, row.umi, row.familySize, row.minimumAgreement, row.panelScore, row.artefactPass, row.agreementPass, row.contaminationPass, row.panelPass, row.rejectionReasons.join(";")]),
     ) };
     case "apobec-csv": return { extension: "apobec.csv", mime: "text/csv", text: csv(
       ["sample", "id", "posterior_mean_GA_multiplier", "posterior_probability_GA_inflated", "posterior_mean_mutation_rate", "GA_mutations", "total_mutations"],
@@ -420,8 +443,9 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
     case "collapse-csv": {
       const selected = alignmentSample(bundle, sample);
       return { extension: "collapsed-families.csv", mime: "text/csv", text: csv(
-        ["sample", "representative_id", "family_count", "member_ids"],
-        (bundle.collapseGroups?.[selected] ?? []).map((group) => [selected, group.representativeId, group.familyCount, group.memberIds.join(";")]),
+        ["sample", "representative_id", "family_count", "functional_pass", "functional_rejection_reasons", "member_ids"],
+        (bundle.collapseGroups?.[selected] ?? []).map((group) => [selected, group.representativeId, group.familyCount,
+          group.functionalPass, group.functionalRejectionReasons?.join(";"), group.memberIds.join(";")]),
       ) };
     }
     case "nucleotide-alignment": {
