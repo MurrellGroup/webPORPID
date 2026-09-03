@@ -58,7 +58,10 @@ export function chooseModalRootTip(
   records.forEach((record, index) => {
     const sequence = record.sequence.toUpperCase();
     const rawWeight = metadata[record.name]?.familyCount ?? 1;
-    const weight = Number.isFinite(rawWeight) && rawWeight > 0 ? rawWeight : 1;
+    // A functional-reference row represents zero sampled UMI families. Keep it
+    // visible without allowing it to determine the abundance-weighted modal
+    // root. Missing/invalid weights still retain the ordinary one-row weight.
+    const weight = Number.isFinite(rawWeight) && rawWeight >= 0 ? rawWeight : 1;
     const group = groups.get(sequence);
     if (group) { group.representedFamilies += weight; group.matchingTips += 1; }
     else groups.set(sequence, { firstIndex: index, representedFamilies: weight, matchingTips: 1 });
@@ -333,7 +336,7 @@ export function AlignmentTreeViewer({ fasta, newick, alphabet = "nt", onAlphabet
   const sequencesByTip = useMemo(() => Object.fromEntries(displayedRecords.map((record, index) => [safeNames[index], record.sequence])), [displayedRecords, safeNames]);
   const normalizedLeafMetadata = useMemo(() => Object.fromEntries(nucleotideRecords.map((record, index) => {
     const metadata = leafMetadata[record.name] ?? {};
-    return [safeNames[index], collapsed ? { familyCount: metadata.familyCount } : metadata];
+    return [safeNames[index], collapsed ? { familyCount: metadata.familyCount, color: metadata.color, category: metadata.category } : metadata];
   })), [collapsed, leafMetadata, nucleotideRecords, safeNames]);
   const ntByName = useMemo(() => new Map(nucleotideRecords.map((record, index) => [safeNames[index], record.sequence])), [nucleotideRecords, safeNames]);
   const parsimony = useMemo(() => {

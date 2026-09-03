@@ -6,6 +6,7 @@ import { inspectAlignment, translateAlignedNucleotides } from "./alignment-utils
 import { collapseAlignment } from "./collapse.ts";
 import { extractAndScorePanel } from "./panel-profile.ts";
 import { runScalableMsa } from "./scalable-msa.ts";
+import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceName } from "./sequence-names.ts";
 import type { ApobecResult, ConsensusRecord, ContaminationCall, PipelineConfig, PostprocRecord, SampleSummary } from "./types.ts";
 
 export interface PostprocessOutput {
@@ -136,7 +137,7 @@ function longestOrf(sequence: string) {
       const offset = aa.indexOf("*", start); if (offset >= 0 && (!best || offset + 1 - start > best.length)) best = { length: offset + 1 - start, start: frame + start * 3, end: frame + (offset + 1) * 3 };
     }
   }
-  return best ? sequence.slice(best.start, best.end) : sequence.slice(0, Math.floor(sequence.length / 3) * 3);
+  return best ? sequence.slice(best.start, best.end) : undefined;
 }
 
 function pairwise(reference: string, query: string) {
@@ -161,7 +162,8 @@ function pairwise(reference: string, query: string) {
 export function functionalFilter(reference: string, sequence: string, threshold: number) {
   sequence = degap(sequence); const reasons: string[] = [];
   if (/[^ACGT]/.test(sequence)) return { passed: false, reasons: ["ambiguousSymbols-reject"] };
-  const coding = longestOrf(sequence); if (!coding || coding.length % 3) return { passed: false, reasons: ["frameshift-reject"] };
+  const coding = longestOrf(sequence); if (!coding) return { passed: false, reasons: ["noORF-reject"] };
+  if (coding.length % 3) return { passed: false, reasons: ["frameshift-reject"] };
   const aligned = pairwise(degap(reference), coding), first = aligned.reference.search(/[^-]/);
   let last = aligned.reference.length - 1; while (last >= first && aligned.reference[last] === "-") last--;
   const referenceRegion = aligned.reference.slice(first, last + 1), queryRegion = aligned.query.slice(first, last + 1);
@@ -181,7 +183,7 @@ export function functionalFilter(reference: string, sequence: string, threshold:
   const digits = rawRatio === 0 ? 3 : 3 - Math.floor(Math.log10(Math.abs(rawRatio))) - 1;
   const ratio = Number(rawRatio.toFixed(Math.max(0, digits)));
   if (ratio < threshold) reasons.push(`badMatch-reject (match=${ratio})`);
-  return { passed: !reasons.length, reasons, nt: trimmed, aa };
+  return { passed: !reasons.length, reasons, nt: trimmed, aa, referenceMatch: Number(rawRatio.toFixed(2)) };
 }
 
 interface FunctionalOutcome {
@@ -189,6 +191,8 @@ interface FunctionalOutcome {
   reasons: string[];
   nt?: string;
   aa?: string;
+  /** Exact-position identity to the clipped aligned reference, rounded to two decimal places. */
+  referenceMatch?: number;
   /** Codon-aware alignment, clipped to the first/last reference residue. */
   alignedNt?: string;
   alignedAa?: string;
@@ -224,7 +228,11 @@ async function functionalFilterBatch(
   sequences.forEach((raw, index) => {
     const sequence = degap(raw);
     if (/[^ACGT]/.test(sequence)) outcomes[index] = { passed: false, reasons: ["ambiguousSymbols-reject"] };
-    else coding.push({ index, sequence: longestOrf(sequence) });
+    else {
+      const orf = longestOrf(sequence);
+      if (orf) coding.push({ index, sequence: orf });
+      else outcomes[index] = { passed: false, reasons: ["noORF-reject"] };
+    }
   });
   const referenceCoding = degap(reference).slice(0, Math.floor(degap(reference).length / 3) * 3);
   if (!coding.length) return { outcomes, referenceNt: referenceCoding, referenceAa: translate(referenceCoding) };
@@ -244,7 +252,7 @@ async function functionalFilterBatch(
     const ratio = Number(rawRatio.toFixed(Math.max(0, digits)));
     if (ratio < threshold) reasons.push(`badMatch-reject (match=${ratio})`);
     outcomes[entry.index] = { passed: !reasons.length, reasons, nt: trimmed, aa,
-      alignedNt: queryRegion, alignedAa: translateAlignedNucleotides(queryRegion, 0) };
+      alignedNt: queryRegion, alignedAa: translateAlignedNucleotides(queryRegion, 0), referenceMatch: Number(rawRatio.toFixed(2)) };
   });
   return { outcomes, referenceNt: referenceRegion, referenceAa: translateAlignedNucleotides(referenceRegion, 0) };
 }
@@ -334,7 +342,7 @@ export async function postprocess(
       if (!artefactPass) rejectionReasons.push(`ccs_count < artefact cutoff (${artefactCutoff})`);
       if (!agreementPass) rejectionReasons.push(`minimum_agreement < ${agreementThreshold}`);
       if (!contaminationPass) rejectionReasons.push("contamination filter"); if (!panelPass[index]) rejectionReasons.push(`distance_from_panel >= ${config.parameters.panelThreshold}`);
-      if (acceptedRow) nucleotideRows.push({ name: record.id, sequence: acceptedRow });
+      if (acceptedRow) nucleotideRows.push({ name: uncollapsedSequenceName(record), sequence: acceptedRow });
       records.push({ id: record.id, sample: sample.name, umi: record.umi, familySize: record.familySize,
         minimumAgreement: record.minimumAgreement, consensusNt: record.sequence, alignedNt: acceptedRow,
         panelScore: scores[index], artefactPass, agreementPass, contaminationPass, panelPass: panelPass[index],
@@ -401,26 +409,32 @@ export async function collapsePostprocess(
           detail: `Checking ${collapsedRows.length.toLocaleString()} collapsed variants against the functional reference for ${sample.name}` });
         const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence,
           collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
-        const functionalNucleotideRows: Array<{ name: string; sequence: string }> = [];
-        const functionalProteinRows: Array<{ name: string; sequence: string }> = [];
+        const functionalNucleotideRows: Array<{ name: string; sequence: string }> = [
+          { name: FUNCTIONAL_REFERENCE_NAME, sequence: batch.referenceNt },
+        ];
+        const functionalProteinRows: Array<{ name: string; sequence: string }> = [
+          { name: FUNCTIONAL_REFERENCE_NAME, sequence: batch.referenceAa },
+        ];
         let passedCount = 0;
         collapsed.groups.forEach((group, position) => {
           const outcome = batch.outcomes[position];
           group.functionalPass = outcome.passed; group.trimmedNt = outcome.nt; group.trimmedAa = outcome.aa;
+          group.referenceMatch = outcome.referenceMatch;
           group.functionalRejectionReasons = outcome.reasons;
           if (outcome.passed) {
             passedCount++;
             if (outcome.alignedNt && outcome.alignedAa) {
-              functionalNucleotideRows.push({ name: group.representativeId, sequence: outcome.alignedNt });
-              functionalProteinRows.push({ name: group.representativeId, sequence: outcome.alignedAa });
+              const name = functionalSequenceName(group);
+              functionalNucleotideRows.push({ name, sequence: outcome.alignedNt });
+              functionalProteinRows.push({ name, sequence: outcome.alignedAa });
             }
           }
         });
         functionalPassed = passedCount;
-        if (functionalNucleotideRows.length) {
+        if (passedCount) {
           alignments[`${sample.name}/functional-nucleotide`] = fasta(functionalNucleotideRows);
           alignments[`${sample.name}/functional-protein`] = fasta(functionalProteinRows);
-          referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta([{ name: "functional_reference", sequence: batch.referenceNt }]);
+          referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta([{ name: FUNCTIONAL_REFERENCE_NAME, sequence: batch.referenceNt }]);
         }
       } else if (sample.functionalReferenceSequence) functionalPassed = 0;
     }

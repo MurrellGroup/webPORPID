@@ -254,6 +254,8 @@ export interface CollapseGroup {
   trimmedNt?: string;
   /** Translation of trimmedNt retained for a functional variant. */
   trimmedAa?: string;
+  /** Exact-position identity to the aligned functional reference, stored at two-decimal precision. */
+  referenceMatch?: number;
   /** Functional-filter decisions for this collapsed variant. */
   functionalRejectionReasons?: string[];
   /**

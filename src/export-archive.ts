@@ -13,6 +13,7 @@ export const SAMPLE_EXPORT_KINDS: readonly ExportKind[] = [
 ];
 
 interface TarEntry { path: string; bytes: Uint8Array }
+export interface ExportArchiveOptions { includeStaticTreeHighlighters?: boolean }
 const encoder = new TextEncoder();
 
 function writeAscii(target: Uint8Array, offset: number, length: number, value: string) {
@@ -76,13 +77,14 @@ function uniqueSampleDirectories(samples: readonly string[]) {
  * donor outputs are generated through exportComponent, so Export all cannot
  * silently diverge from the corresponding one-at-a-time downloads.
  */
-export function buildExportArchive(bundle: ResultBundle): Uint8Array {
+export function buildExportArchive(bundle: ResultBundle, options: ExportArchiveOptions = {}): Uint8Array {
+  const includeStaticTreeHighlighters = options.includeStaticTreeHighlighters ?? true;
   const entries: TarEntry[] = [], dataset = safeDatasetName(bundle.config.dataset).slice(0, 72);
   const samples = bundle.config.samples.map((sample) => sample.name), directories = uniqueSampleDirectories(samples);
   const manifest = [
     `webPORPID export bundle for ${bundle.config.dataset}`,
     "",
-    "Each sample directory contains the same sample-filtered components offered by the individual Export control, plus static SVG jitter, scatter, and modal-highlighter plots.",
+    `Each sample directory contains the same sample-filtered components offered by the individual Export control, plus static SVG jitter and scatter plots${includeStaticTreeHighlighters ? ", and balanced-width phylogram + modal-highlighter figures" : ""}.`,
     "Every filename inside a sample directory begins with that sample's filesystem-safe name and an underscore.",
     "The complete editable .webporpid project and run log are stored at the archive root.",
     "cross-sample-overview/ contains the overview, parameter, provenance, stage-status, timing, and input-mapping tables.",
@@ -103,7 +105,7 @@ export function buildExportArchive(bundle: ResultBundle): Uint8Array {
       const component = exportComponent(bundle, kind, sample);
       entries.push({ path: `${directories[index]}/${sampleFile(component.extension)}`, bytes: encoder.encode(component.text) });
     }
-    for (const plot of reportPlotSvgs(bundle, sample))
+    for (const plot of reportPlotSvgs(bundle, sample, includeStaticTreeHighlighters))
       entries.push({ path: `${directories[index]}/${sampleFile(plot.extension)}`, bytes: encoder.encode(plot.text) });
   });
   const timestamp = Math.max(0, Math.floor((Date.parse(bundle.provenance.createdUtc) || 0) / 1000));

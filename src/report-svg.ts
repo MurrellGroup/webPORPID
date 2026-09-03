@@ -1,7 +1,7 @@
-import { effectiveAlignment, inspectAlignment, type AlignmentVariant } from "./alignment-utils.ts";
-import { modalSequence } from "./alignment-regions.ts";
+import type { AlignmentVariant } from "./alignment-utils.ts";
 import type { PostprocRecord, ResultBundle, UmiFamily } from "./types.ts";
 import { classicalMds } from "./mds.ts";
+import { staticTreeHighlighterSvg } from "./static-tree-highlighter.ts";
 
 export interface ReportSvg { extension: string; text: string }
 
@@ -126,30 +126,12 @@ function mds(bundle: ResultBundle, sample: string): ReportSvg {
   return { extension: "mds-apobec.svg", text: document(720, 230, `${sample} classical MDS`, body) };
 }
 
-function highlighter(bundle: ResultBundle, sample: string, variant: AlignmentVariant): ReportSvg {
-  const active = effectiveAlignment(bundle, sample, variant).fasta, label = variant === "collapsed" ? "collapsed" : variant === "uncollapsed" ? "uncollapsed" : "functional";
-  if (!active) return { extension: `${label}-highlighter.svg`, text: empty(`${label} alignment highlighter`, `No ${label} alignment is available.`) };
-  const records = inspectAlignment(active, 1).records, modal = modalSequence(records.map((row) => row.sequence)), cell = 6, rowHeight = 10, labelWidth = 230;
-  const width = labelWidth + (records[0]?.sequence.length ?? 0) * cell + 20, height = 42 + records.length * rowHeight;
-  let body = `<text x="8" y="16" class="label">${xml(sample)} · ${label} alignment · differences from modal</text>`;
-  for (let column = 0; column < modal.length; column += 100) body += `<text x="${labelWidth + column * cell}" y="31">${column + 1}</text>`;
-  records.forEach((record, rowIndex) => {
-    const y = 35 + rowIndex * rowHeight; body += `<text x="${labelWidth - 6}" y="${y + 7}" text-anchor="end" font-family="monospace" font-size="7">${xml(record.name)}</text>`;
-    let start = 0, fill = "";
-    const colorAt = (column: number) => {
-      const base = record.sequence[column]?.toUpperCase() ?? "-", same = base === (modal[column]?.toUpperCase() ?? "-");
-      return same ? base === "-" ? "#ffffff" : "#eceeea" : BASE_COLORS[base] ?? "#9aa2a0";
-    };
-    while (start < record.sequence.length) {
-      fill = colorAt(start); let end = start + 1; while (end < record.sequence.length && colorAt(end) === fill) end++;
-      body += `<rect x="${labelWidth + start * cell}" y="${y}" width="${(end - start) * cell}" height="${rowHeight - 1}" fill="${fill}"/>`; start = end;
-    }
-  });
-  return { extension: `${label}-highlighter.svg`, text: document(width, height, `${sample} ${label} alignment highlighter`, body) };
-}
-
 /** Static, editable plot exports generated from the exact stored sample data. */
-export function reportPlotSvgs(bundle: ResultBundle, sample: string): ReportSvg[] {
-  return [umiJitter(bundle, sample), artefactJitter(bundle, sample), lowAgreement(bundle, sample), mds(bundle, sample),
-    highlighter(bundle, sample, "collapsed"), highlighter(bundle, sample, "uncollapsed"), highlighter(bundle, sample, "functional")];
+export function reportPlotSvgs(bundle: ResultBundle, sample: string, includeStaticTreeHighlighters = true): ReportSvg[] {
+  const plots = [umiJitter(bundle, sample), artefactJitter(bundle, sample), lowAgreement(bundle, sample), mds(bundle, sample)];
+  if (includeStaticTreeHighlighters) for (const variant of ["collapsed", "uncollapsed", "functional"] as AlignmentVariant[]) {
+    const label = variant === "collapsed" ? "collapsed" : variant === "uncollapsed" ? "uncollapsed" : "functional";
+    plots.push({ extension: `${label}-tree-highlighter.svg`, text: staticTreeHighlighterSvg(bundle, sample, variant) });
+  }
+  return plots;
 }

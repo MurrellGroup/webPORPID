@@ -37,6 +37,8 @@ code, pre { font-family: "SFMono-Regular", Consolas, "Liberation Mono", ui-monos
 .section-heading, .results-hero, .table-heading, .alignment-switch { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; }
 .section-heading h2 { font-size: clamp(28px, 3vw, 45px); letter-spacing: -.045em; margin: 8px 0 0; }
 .runner-shortcuts, .result-actions, .export-menu { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.export-figure-option { display: inline-flex; align-items: center; gap: 6px; font-size: 0.78rem; color: var(--ink-muted); white-space: nowrap; }
+.export-figure-option input { width: auto; margin: 0; }
 button, .button-like { border: 1px solid var(--line); color: var(--ink); background: transparent; border-radius: 4px; padding: 10px 14px; font-weight: 650; font-size: 12px; }
 button:hover, .button-like:hover { border-color: #84908c; }
 button:disabled { cursor: not-allowed; opacity: .55; }

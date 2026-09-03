@@ -14,6 +14,7 @@ import { OPTIONAL_STAGE_ORDER, stageCompleted, stageStatus } from "../optional-s
 import { functionalFilterStats, inputFilterStats, parameterSettings, porpidCallStats, postprocFilterStats, sampleOverviewStats, type CountStat, type DualCountStat, type ParameterSettingRow, type SampleOverviewStat } from "../report-stats";
 import { exportComponent, type ExportKind, safeDatasetName } from "../result-file";
 import { runScalableMsa } from "../scalable-msa";
+import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceName } from "../sequence-names";
 import type { AlignmentAuditEntry, AlignmentChangeSummary, CollapseGroup, ContaminationCall, OptionalStageName, PostprocRecord, ResultBundle, UmiFamily } from "../types";
 import { AgreementPositionPlot, ArtefactDecisionPlot, DinucleotideHeatmaps, MdsApobecPlot, UmiDecisionPlot } from "./charts";
 import { AlignmentTreeViewer, type LeafMetadata } from "./alignment-tree-viewer";
@@ -96,6 +97,7 @@ function Filters({ bundle, sample }: { bundle: ResultBundle; sample: string }) {
 
 function ExportMenu({ bundle, sample, allOnly = false }: { bundle: ResultBundle; sample: string; allOnly?: boolean }) {
   const [kind, setKind] = useState<ExportKind>("consensus-fasta"), [exportingAll, setExportingAll] = useState(false);
+  const [includeStaticTreeHighlighters, setIncludeStaticTreeHighlighters] = useState(true);
   const labels: Array<[ExportKind, string]> = [["consensus-fasta", "Consensus FASTA"], ["passed-consensus-fasta", "Passed consensus FASTA"],
     ["rejected-consensus-fasta", "Rejected consensus FASTA"], ["trimmed-nt-fasta", "Collapsed functional nucleotide FASTA"], ["trimmed-aa-fasta", "Collapsed functional amino-acid FASTA"],
     ["family-csv", "UMI family CSV"], ["low-agreement-csv", "Low-agreement CSV"], ["contamination-csv", "Contamination CSV"],
@@ -106,10 +108,11 @@ function ExportMenu({ bundle, sample, allOnly = false }: { bundle: ResultBundle;
     ["functional-newick", "Functional Newick tree"], ["log", "Run log"]];
   return <div className="export-menu">{!allOnly && <><select value={kind} onChange={(event) => setKind(event.target.value as ExportKind)}>{labels.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select>
     <button type="button" onClick={() => { const result = exportComponent(bundle, kind, sample); downloadData(`${safeDatasetName(bundle.config.dataset)}-${safeDatasetName(sample)}.${result.extension}`, result.text, result.mime); }}>Export</button></>}
+    <label className="export-figure-option"><input type="checkbox" checked={includeStaticTreeHighlighters} onChange={(event) => setIncludeStaticTreeHighlighters(event.target.checked)} /> Static SVG tree + highlighter plots</label>
     <button type="button" disabled={exportingAll} onClick={() => {
       setExportingAll(true);
       window.requestAnimationFrame(() => {
-        try { downloadData(`${safeDatasetName(bundle.config.dataset)}-all-outputs.tar.gz`, buildExportArchive(bundle), "application/gzip"); }
+        try { downloadData(`${safeDatasetName(bundle.config.dataset)}-all-outputs.tar.gz`, buildExportArchive(bundle, { includeStaticTreeHighlighters }), "application/gzip"); }
         catch (cause) { window.alert(`The export bundle could not be created. ${cause instanceof Error ? cause.message : String(cause)}`); }
         finally { setExportingAll(false); }
       });
@@ -244,7 +247,22 @@ function collapsedMetadata(groups: CollapseGroup[] | undefined): Record<string, 
 }
 
 function uncollapsedMetadata(records: PostprocRecord[]): Record<string, LeafMetadata> {
-  return Object.fromEntries(records.filter((record) => record.alignedNt).map((record) => [record.id, { familyCount: 1, minimumAgreement: record.minimumAgreement }]));
+  return Object.fromEntries(records.filter((record) => record.alignedNt).flatMap((record) => {
+    const metadata = { familyCount: 1, minimumAgreement: record.minimumAgreement };
+    // Keep legacy result files (plain internal IDs) and new annotated FASTA
+    // names equally usable in the tree/alignment workbench.
+    return [[record.id, metadata], [uncollapsedSequenceName(record), metadata]];
+  }));
+}
+
+function functionalMetadata(groups: CollapseGroup[] | undefined): Record<string, LeafMetadata> {
+  const entries: Array<[string, LeafMetadata]> = [[FUNCTIONAL_REFERENCE_NAME,
+    { familyCount: 0, color: "#ffffff", category: "Functional reference" }]];
+  for (const group of groups ?? []) if (group.functionalPass) {
+    const metadata = { familyCount: group.familyCount };
+    entries.push([group.representativeId, metadata], [functionalSequenceName(group), metadata]);
+  }
+  return Object.fromEntries(entries);
 }
 
 const DONOR_COLORS = ["#08796f", "#c5534f", "#5e55a4", "#c77b20", "#3c78a8", "#8b5a82", "#557b3d", "#a84b70"];
@@ -269,11 +287,12 @@ function DonorView({ bundle, donorId }: { bundle: ResultBundle; donorId: string 
       const rows: Array<{ name: string; sequence: string; sample: string; familyCount: number }> = [];
       for (const configured of samples) {
         const active = effectiveAlignment(bundle, configured.name, variant).fasta; if (!active) continue;
-        const familyCounts = new Map((bundle.collapseGroups?.[configured.name] ?? []).map((group) => [group.representativeId, group.familyCount]));
+        const familyCounts = new Map((bundle.collapseGroups?.[configured.name] ?? []).flatMap((group) =>
+          [[group.representativeId, group.familyCount] as const, [functionalSequenceName(group), group.familyCount] as const]));
         parseFasta(active).forEach((record, index) => rows.push({
           name: `${configured.name.replace(/[^A-Za-z0-9_.+-]/g, "_")}__${index + 1}__${record.name}`,
           sequence: record.sequence.replaceAll("-", "").toUpperCase().replaceAll("U", "T"), sample: configured.name,
-          familyCount: familyCounts.get(record.name) ?? 1,
+          familyCount: variant === "functional" && record.name === FUNCTIONAL_REFERENCE_NAME ? 0 : familyCounts.get(record.name) ?? 1,
         }));
       }
       if (!rows.length) throw new Error(`No ${variant} sequences are available for donor ${donorId}. Compute the required downstream stages first.`);
@@ -335,7 +354,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
   const functionalRefSequence = useMemo(() => referenceSequence(bundle, sample, "functional"), [bundle, sample]);
   const collapsedTips = useMemo(() => collapsedMetadata(bundle.collapseGroups?.[sample]), [bundle, sample]);
   const uncollapsedTips = useMemo(() => uncollapsedMetadata(sampleRecords), [sampleRecords]);
-  const functionalTips = useMemo(() => collapsedMetadata(bundle.collapseGroups?.[sample]?.filter((group) => group.functionalPass === true)), [bundle, sample]);
+  const functionalTips = useMemo(() => functionalMetadata(bundle.collapseGroups?.[sample]), [bundle, sample]);
   const edited = Boolean(collapsed.edit || uncollapsed.edit || functional.edit);
   const contaminationDone = stageCompleted(bundle, "contamination"), postprocessingDone = stageCompleted(bundle, "postprocessing"), collapseDone = stageCompleted(bundle, "collapse");
   const donorIds = useMemo(() => [...new Set(bundle.config.samples.map((row) => row.donorId).filter((value): value is string => Boolean(value)))].sort(), [bundle]);
@@ -484,7 +503,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const targetSample = sampleRef.current, current = effectiveAlignment(bundleRef.current, targetSample, variant); if (!current.fasta) return;
     setAlignmentError(""); setAlignmentStatus("Opening the bundled Alivibe editor…");
     const applicationBase = new URL(import.meta.env.BASE_URL, document.baseURI), editorUrl = new URL("tools/alivibe.html", applicationBase);
-    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.10");
+    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.11");
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const popup = window.open(editorUrl.href, `webporpid-alivibe-${token}`, "popup,width=1500,height=920") as AlivibeEditorWindow | null;
     if (!popup) { setAlignmentError("The browser blocked the Alivibe window. Allow pop-ups for this site and try again."); return; }
@@ -530,7 +549,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const description = variant === "collapsed"
       ? "Identical retained consensuses are collapsed; bubble area represents UMI-family count, never read count. Minimum agreement remains a per-family property and is available in the uncollapsed view."
       : variant === "uncollapsed" ? "Every retained UMI-family consensus is shown separately and can be colored by its family minimum agreement."
-        : "Every collapsed variant that passed the functional filter retains its abundance-ranked collapsed name and is shown in the joint codon-aware alignment, clipped exactly to the first and last nucleotide of the functional reference.";
+        : "The functional reference is the first row, followed by every passing collapsed variant labelled with abundance rank and its two-decimal reference match. The joint codon-aware alignment is clipped exactly to the reference endpoints.";
     if (!current.fasta) return <div className="empty-state">No {variant} nucleotide alignment is available for this sample.</div>;
     const stale = Boolean(current.edit?.treeStale || (current.edit?.treeFingerprint && current.edit.treeFingerprint !== current.edit.editedFingerprint));
     return <section className="phylogeny-block" key={variant}><header><div><span className="section-kicker">{kicker}</span><h3>{heading}</h3><p>{description}</p><MethodLink topic={variant === "functional" ? "functional" : variant === "collapsed" ? "collapse" : "phylogeny"} /></div><div><button type="button" className={tree ? "" : "primary"} disabled={busy} onClick={() => void inferTree(variant)}>{busy ? "Running FastTree…" : tree ? "Recalculate tree" : "Infer tree"}</button></div></header>
@@ -555,7 +574,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
       <TimingSummary bundle={bundle} /><article className="provenance-card"><h3>Audit trail</h3><dl><div><dt>Input SHA-256</dt><dd>{bundle.provenance.inputSha256}</dd></div><div><dt>Config SHA-256</dt><dd>{bundle.provenance.configSha256}</dd></div><div><dt>Engine</dt><dd>{bundle.provenance.engine}</dd></div><div><dt>Processing source</dt><dd>{bundle.provenance.upstreamBranch}@{bundle.provenance.upstreamCommit.slice(0, 12)}</dd></div>{bundle.inputMappings?.map((mapping) => <div key={`${mapping.slot}-${mapping.uploadedName}`}><dt>{mapping.role} · {mapping.slot}</dt><dd>{mapping.uploadedName}{mapping.expectedName && mapping.expectedName !== mapping.uploadedName ? ` → ${mapping.expectedName}` : ""}</dd></div>)}</dl><h4>Interactive threshold decisions</h4><ThresholdAuditTrail bundle={bundle} sample={sample} /><h4>Alignment and phylogeny changes</h4><AlignmentAuditTable bundle={bundle} sample={sample} /></article>
     </section>}
     {tab === "families" && <section className="result-section"><div className="table-heading"><div><h2>UMI family decisions</h2><p>Probabilistic offspring assignment, heteroduplex check, length and family-size gates.</p><MethodLink topic="umi" /></div><input placeholder="Search UMI, parent, or class" value={familyQuery} onChange={(event) => setFamilyQuery(event.target.value)} /></div><div className="table-scroll"><table><thead><tr><SortHeader label="UMI" column="umi" state={familySort} onChange={setFamilySort} /><SortHeader label="fs" column="familySize" state={familySort} onChange={setFamilySort} /><SortHeader label="classification" column="classification" state={familySort} onChange={setFamilySort} /><SortHeader label="parent" column="mostLikelyParent" state={familySort} onChange={setFamilySort} /><SortHeader label="posterior" column="posteriorProbability" state={familySort} onChange={setFamilySort} /><SortHeader label="minag" column="minimumAgreement" state={familySort} onChange={setFamilySort} /></tr></thead><tbody>{page(filteredFamilies, familyPage).map((row) => <tr key={`${row.sampleIndex}-${row.umi}`}><td><code>{row.umi}</code></td><td>{row.familySize}</td><td><span className={`status ${row.disposition === "likely_real" ? "pass" : "reject"}`}>{row.disposition}</span></td><td><code>{row.mostLikelyParent}</code></td><td>{row.posteriorProbability.toFixed(6)}</td><td>{row.minimumAgreement?.toFixed(2) ?? "—"}</td></tr>)}</tbody></table></div><Pager page={familyPage} count={filteredFamilies.length} onChange={setFamilyPage} /></section>}
-    {tab === "sequences" && <section className="result-section"><div className="table-heading"><div><h2>Consensus and post-processing</h2><p>Every filter decision remains inspectable; FASTA exports use the exact stored sequences.</p><MethodLink topic="consensus" /></div><input placeholder="Search ID or UMI" value={query} onChange={(event) => setQuery(event.target.value)} /></div>{!postprocessingDone && <div className="viewer-status warning">Downstream filtering has not been computed; no filter decisions are being presented as passes or rejects.</div>}<div className="table-scroll"><table><thead><tr><SortHeader label="Sequence" column="id" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="fs" column="familySize" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="minag" column="minimumAgreement" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="panel score" column="panelScore" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="filters" column="filters" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="APOBEC p" column="apobec" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="reason" column="reason" state={sequenceSort} onChange={setSequenceSort} /></tr></thead><tbody>{page(records, sequencePage).map((row) => <tr key={row.id}><td><code title={row.id}>{row.id}</code></td><td>{row.familySize}</td><td>{row.minimumAgreement.toFixed(2)}</td><td>{row.panelScore.toFixed(2)}</td><td><span className={`status ${row.artefactPass && row.agreementPass && row.contaminationPass && row.panelPass ? "pass" : "reject"}`}>{row.artefactPass && row.agreementPass && row.contaminationPass && row.panelPass ? "pass" : "reject"}</span></td><td>{row.apobec?.posteriorGaInflated.toFixed(3) ?? "—"}</td><td>{row.rejectionReasons.join("; ") || "—"}</td></tr>)}</tbody></table></div><Pager page={sequencePage} count={records.length} onChange={setSequencePage} /></section>}
+    {tab === "sequences" && <section className="result-section"><div className="table-heading"><div><h2>Consensus and post-processing</h2><p>Every filter decision remains inspectable; FASTA exports use the exact stored sequences.</p><MethodLink topic="consensus" /></div><input placeholder="Search ID or UMI" value={query} onChange={(event) => setQuery(event.target.value)} /></div>{!postprocessingDone && <div className="viewer-status warning">Downstream filtering has not been computed; no filter decisions are being presented as passes or rejects.</div>}<div className="table-scroll"><table><thead><tr><SortHeader label="Sequence" column="id" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="fs" column="familySize" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="minag" column="minimumAgreement" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="panel score" column="panelScore" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="filters" column="filters" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="APOBEC p" column="apobec" state={sequenceSort} onChange={setSequenceSort} /><SortHeader label="reason" column="reason" state={sequenceSort} onChange={setSequenceSort} /></tr></thead><tbody>{page(records, sequencePage).map((row) => { const displayName = uncollapsedSequenceName(row); return <tr key={row.id}><td><code title={displayName}>{displayName}</code></td><td>{row.familySize}</td><td>{row.minimumAgreement.toFixed(2)}</td><td>{row.panelScore.toFixed(2)}</td><td><span className={`status ${row.artefactPass && row.agreementPass && row.contaminationPass && row.panelPass ? "pass" : "reject"}`}>{row.artefactPass && row.agreementPass && row.contaminationPass && row.panelPass ? "pass" : "reject"}</span></td><td>{row.apobec?.posteriorGaInflated.toFixed(3) ?? "—"}</td><td>{row.rejectionReasons.join("; ") || "—"}</td></tr>; })}</tbody></table></div><Pager page={sequencePage} count={records.length} onChange={setSequencePage} /></section>}
     {tab === "contamination" && <section className="result-section"><div className="table-heading"><div><h2>Contamination report</h2><p>One decision is shown per consensus family. A primary decision takes precedence; the wider suspect pass appears only when no primary call exists.</p><MethodLink topic="contamination" /></div><span>{contaminationRows.length.toLocaleString()} unique families</span></div>{!contaminationDone && <div className="viewer-status warning">Contamination checks have not been computed. An empty table here is not a pass decision. Other downstream outputs remain valid but explicitly unfiltered at this gate.</div>}<div className="table-scroll"><table><thead><tr><SortHeader label="Sequence" column="sequenceId" state={contaminationSort} onChange={setContaminationSort} /><SortHeader label="Nearest non-self" column="nearestNonselfVariant" state={contaminationSort} onChange={setContaminationSort} /><SortHeader label="distance" column="nearestNonselfDistance" state={contaminationSort} onChange={setContaminationSort} /><SortHeader label="decision" column="decision" state={contaminationSort} onChange={setContaminationSort} /></tr></thead><tbody>{page(contaminationRows, contaminationPage).map((row) => <tr key={row.sequenceId}><td><code>{row.sequenceId}</code></td><td>{row.nearestNonselfVariant}</td><td>{row.nearestNonselfDistance.toPrecision(5)}</td><td><span className={`status ${row.discarded ? "reject" : "warn"}`}>{row.discarded ? "discarded contaminant" : row.suspectOnly ? "suspect pass" : "reported, retained"}</span></td></tr>)}</tbody></table></div><Pager page={contaminationPage} count={contaminationRows.length} onChange={setContaminationPage} />
       <section className="contamination-phylogeny"><header><div><span className="section-kicker">On-demand cross-check</span><h3>Contamination references + donor sequences</h3><p>Build a joint nucleotide alignment and double-precision FastTree phylogeny. Tips are colored as panel references, donor contaminants discarded by the filter, or retained donor sequences.</p></div><button type="button" disabled={contaminationPhylogenyBusy || !contaminationDone} onClick={() => void buildContaminationPhylogeny()}>{!contaminationDone ? "Compute contamination checks first" : contaminationPhylogenyBusy ? "Aligning and inferring…" : contaminationPhylogeny ? "Rebuild tree + alignment" : "Build tree + alignment"}</button></header>
         {contaminationPhylogenyError && <div className="error-box" role="alert">{contaminationPhylogenyError}</div>}

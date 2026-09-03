@@ -2,6 +2,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import { gzipSync, gunzipSync } from "fflate";
 import { inspectAlignment, summarizeAlignmentChanges, translateAlignmentFasta, validateCorrectedAlignment } from "./alignment-utils.ts";
 import { deduplicateContaminationCalls } from "./contamination.ts";
+import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceId, uncollapsedSequenceName } from "./sequence-names.ts";
 import type { ResultBundle } from "./types";
 
 const MAGIC = Uint8Array.of(0x57, 0x50, 0x52, 0x00, 0x01, 0x0d, 0x0a, 0x1a);
@@ -200,10 +201,15 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     const collapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/nucleotide`], `alignments.${sample}/nucleotide`), 1);
     const uncollapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/uncollapsed-nucleotide`], `alignments.${sample}/uncollapsed-nucleotide`), 1);
     const collapsedByName = new Map(collapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
-    const uncollapsedByName = new Map(uncollapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+    const uncollapsedByName = new Map(uncollapsed.records.map((record) => [uncollapsedSequenceId(record.name), record.sequence.replaceAll("-", "")]));
+    if (uncollapsedByName.size !== uncollapsed.records.length) throw new Error("Uncollapsed sequence annotations do not resolve to unique consensus identifiers.");
     const functionalSource = object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`];
-    const functionalNames = functionalSource == null ? new Set<string>()
-      : new Set(inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records.map((record) => record.name));
+    const functionalRecords = functionalSource == null ? []
+      : inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records;
+    const embeddedReferenceIndex = functionalRecords.findIndex((record) => record.name === FUNCTIONAL_REFERENCE_NAME);
+    if (embeddedReferenceIndex > 0) throw new Error("The functional reference must be the first sequence in its alignment.");
+    const hasEmbeddedFunctionalReference = embeddedReferenceIndex === 0;
+    const functionalNames = new Set(functionalRecords.filter((_, index) => index !== embeddedReferenceIndex).map((record) => record.name));
     let hasCollapsedFunctionalCalls = false, collapsedFunctionalPasses = 0;
     array(rawGroups, `collapseGroups.${sample}`).forEach((rawGroup, index) => {
       const group = object(rawGroup, `collapseGroups.${sample}[${index}]`);
@@ -230,12 +236,19 @@ function validateResult(value: unknown): asserts value is ResultBundle {
       if (group.minimumAgreement != null && numeric(group.minimumAgreement, "legacy collapse minimum agreement") !== Math.min(...agreements))
         throw new Error("A legacy collapse group has inconsistent family-agreement metadata.");
       optionalText(group.trimmedNt, "collapsed functional nucleotide"); optionalText(group.trimmedAa, "collapsed functional protein");
+      const referenceMatch = group.referenceMatch == null ? undefined : numeric(group.referenceMatch, "collapsed functional reference match");
+      if (referenceMatch != null && (referenceMatch < 0 || referenceMatch > 1 || Math.abs(referenceMatch - Math.round(referenceMatch * 100) / 100) > 1e-12))
+        throw new Error("A collapsed functional reference match must be between zero and one at two-decimal precision.");
       if (group.functionalRejectionReasons != null) array(group.functionalRejectionReasons, "collapsed functional reasons")
         .forEach((reason) => text(reason, "collapsed functional reason"));
       if (group.functionalPass != null) {
         hasCollapsedFunctionalCalls = true; const functionalPass = bool(group.functionalPass, "collapsed functionalPass");
         if (functionalPass) collapsedFunctionalPasses++;
-        if (functionalNames.has(representative) !== functionalPass)
+        if (hasEmbeddedFunctionalReference && functionalPass && referenceMatch == null)
+          throw new Error("A functional-pass variant in a reference-inclusive alignment is missing its reference-match measure.");
+        const annotatedName = functionalSequenceName({ representativeId: representative, referenceMatch });
+        const present = functionalNames.has(annotatedName) || (!hasEmbeddedFunctionalReference && functionalNames.has(representative));
+        if (present !== functionalPass)
           throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
       }
     });
@@ -409,15 +422,15 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
   const collapsedFunctional = Object.entries(bundle.collapseGroups ?? {}).flatMap(([groupSample, groups]) =>
     (!sample || groupSample === sample) ? groups.filter((group) => group.functionalPass) : []);
   switch (kind) {
-    case "consensus-fasta": return { extension: "consensus.fasta", mime: "text/x-fasta", text: fasta(consensuses.map((record) => ({ id: record.id, sequence: record.sequence }))) };
-    case "passed-consensus-fasta": return { extension: "passed-consensus.fasta", mime: "text/x-fasta", text: fasta(records.filter(passed).map((record) => ({ id: record.id, sequence: record.consensusNt }))) };
-    case "rejected-consensus-fasta": return { extension: "rejected-consensus.fasta", mime: "text/x-fasta", text: fasta(records.filter((record) => !passed(record)).map((record) => ({ id: record.id, sequence: record.consensusNt }))) };
+    case "consensus-fasta": return { extension: "consensus.fasta", mime: "text/x-fasta", text: fasta(consensuses.map((record) => ({ id: uncollapsedSequenceName(record), sequence: record.sequence }))) };
+    case "passed-consensus-fasta": return { extension: "passed-consensus.fasta", mime: "text/x-fasta", text: fasta(records.filter(passed).map((record) => ({ id: uncollapsedSequenceName(record), sequence: record.consensusNt }))) };
+    case "rejected-consensus-fasta": return { extension: "rejected-consensus.fasta", mime: "text/x-fasta", text: fasta(records.filter((record) => !passed(record)).map((record) => ({ id: uncollapsedSequenceName(record), sequence: record.consensusNt }))) };
     case "trimmed-nt-fasta": return { extension: "trimmed-nt.fasta", mime: "text/x-fasta", text: fasta(
-      (collapsedFunctional.length ? collapsedFunctional.map((group) => ({ id: group.representativeId, sequence: group.trimmedNt ?? "" }))
+      (collapsedFunctional.length ? collapsedFunctional.map((group) => ({ id: functionalSequenceName(group), sequence: group.trimmedNt ?? "" }))
         : records.filter((record) => record.functionalPass && record.trimmedNt).map((record) => ({ id: record.id, sequence: record.trimmedNt! })))
         .filter((row) => row.sequence)) };
     case "trimmed-aa-fasta": return { extension: "trimmed-aa.fasta", mime: "text/x-fasta", text: fasta(
-      (collapsedFunctional.length ? collapsedFunctional.map((group) => ({ id: group.representativeId, sequence: group.trimmedAa ?? "" }))
+      (collapsedFunctional.length ? collapsedFunctional.map((group) => ({ id: functionalSequenceName(group), sequence: group.trimmedAa ?? "" }))
         : records.filter((record) => record.functionalPass && record.trimmedAa).map((record) => ({ id: record.id, sequence: record.trimmedAa! })))
         .filter((row) => row.sequence)) };
     case "family-csv": return { extension: "families.csv", mime: "text/csv", text: csv(
@@ -443,9 +456,9 @@ export function exportComponent(bundle: ResultBundle, kind: ExportKind, sample?:
     case "collapse-csv": {
       const selected = alignmentSample(bundle, sample);
       return { extension: "collapsed-families.csv", mime: "text/csv", text: csv(
-        ["sample", "representative_id", "family_count", "functional_pass", "functional_rejection_reasons", "member_ids"],
+        ["sample", "representative_id", "family_count", "functional_pass", "reference_match", "functional_rejection_reasons", "member_ids"],
         (bundle.collapseGroups?.[selected] ?? []).map((group) => [selected, group.representativeId, group.familyCount,
-          group.functionalPass, group.functionalRejectionReasons?.join(";"), group.memberIds.join(";")]),
+          group.functionalPass, group.referenceMatch?.toFixed(2), group.functionalRejectionReasons?.join(";"), group.memberIds.join(";")]),
       ) };
     }
     case "nucleotide-alignment": {

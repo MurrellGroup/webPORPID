@@ -19,6 +19,8 @@ The previous tree component compressed ordinary fractional branch lengths agains
 
 The Protein button always translates the active nucleotide alignment and never requires a functional-filter pass. Complete gap codons render as `-`; mixed-gap, ambiguous, and incomplete codons render as `X`. The user can choose nucleotide-column frame 1, 2, or 3.
 
+The export-all static-figure toggle produces a publication-style SVG in which the phylogram and modal highlighter each occupy exactly half of a 1600-unit canvas. Tree leaves and alignment rows share one y coordinate; the alignment uses a top coordinate ruler, horizontal row guides, white modal matches, A/G/T/C mutation colors, grey gaps, a bottom nucleotide legend, and a branch-length scale. Abundance circles retain exact linear area (`25 px² × represented UMI-family count`) with no floor or cap. Functional-reference rows use a separate outlined marker and therefore do not imply a sampled-family abundance.
+
 ## Alivibe round trip
 
 “Open in Alivibe” launches the bundled, same-origin Swig Alivibe build. webPORPID verifies the bridge revision, loads and re-reads the exact nucleotide FASTA, installs the local MSA runner, and adds a “Return alignment to webPORPID” control. On return it rejects stale sample/alignment sessions, verifies identifiers/order/residues, accepts gap editing plus row/base deletion, reruns FastTree, and stores the corrected FASTA, frame, fingerprints, edit provenance, and refreshed tree inside the next `.webporpid` save. A corrected FASTA can also be imported directly, and “Restore pipeline alignment” removes the edit.

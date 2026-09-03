@@ -1,4 +1,5 @@
 import { inspectAlignment } from "./alignment-utils.ts";
+import { uncollapsedSequenceId } from "./sequence-names.ts";
 import type { CollapseGroup } from "./types";
 
 export interface CollapsedAlignment {
@@ -29,7 +30,10 @@ export function collapseAlignment(fasta: string, sample: string): CollapsedAlign
       group = { haplotype, sequence: row.sequence, members: [] };
       bySequence.set(haplotype, group);
     }
-    group.members.push(row.name);
+    // Display FASTA names carry fs/minag annotations. Collapse membership uses
+    // the stable sample_UMI identifier so it still joins exactly to consensus
+    // and post-processing metadata.
+    group.members.push(uncollapsedSequenceId(row.name));
   }
   // Variant numbers are scientific identifiers, so make both abundance order
   // and tie-breaking deterministic. Multiplicity is UMI-family count only.

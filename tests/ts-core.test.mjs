@@ -21,7 +21,7 @@ import { collapseAlignment } from "../src/collapse.ts";
 import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
-import { postprocess } from "../src/postprocess.ts";
+import { functionalFilter, postprocess } from "../src/postprocess.ts";
 import { filterQueriesAgainstPanel } from "../src/independent-panel-filter.ts";
 import { extractAndScorePanel } from "../src/panel-profile.ts";
 import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
@@ -31,6 +31,7 @@ import { parseSpoolRecordHeader, selectSpoolChunks } from "../src/spool-record.t
 import { layoutTree, midpointRoot, parseNewick, rootOnOutgroup } from "../src/tree.ts";
 import { treeTipNames } from "../src/tree-names.ts";
 import { applyThresholdSelection, buildConsensusThresholdReview, buildUmiThresholdReview } from "../src/threshold-review.ts";
+import { staticTreeHighlighterSvg } from "../src/static-tree-highlighter.ts";
 
 function spoolRecord(sample, hash, umi = "AACCGGTT", name = "read", sequence = "ACGT") {
   const encoder = new TextEncoder(), umiBytes = encoder.encode(umi), nameBytes = encoder.encode(name), sequenceBytes = encoder.encode(sequence);
@@ -361,6 +362,8 @@ test("collapse counts retained UMI families without assigning family agreement t
   const abundanceRanked = collapseAlignment(">rare\nTTTT\n>common_a\nAAAA\n>common_b\nAAAA\n", "donor_sample");
   assert.equal(abundanceRanked.groups[0].representativeId, "donor_sample_v1_2");
   assert.deepEqual(abundanceRanked.groups[0].memberIds, ["common_a", "common_b"]);
+  const annotated = collapseAlignment(">5VM_AAACCTTG fs=447 minag=0.78\nAAAA\n", "5VM");
+  assert.deepEqual(annotated.groups[0].memberIds, ["5VM_AAACCTTG"], "display annotations must not replace the stable member ID");
 });
 
 test("overview statistics expose family- and read-level rejection proportions", () => {
@@ -480,11 +483,27 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   const functional = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1);
   const functionalReference = inspectAlignment(output.referenceAlignments["sample_1/functional-nucleotide"], 1);
   assert.equal(functional.columns, reference.length); assert.equal(functionalReference.columns, reference.length);
-  assert.equal(functional.records[0].name, "sample_1_v1_1");
-  assert.equal(functional.records[0].sequence, query.slice(0, reference.length));
+  assert.equal(functional.records[0].name, "functional_reference");
+  assert.equal(functional.records[0].sequence, reference);
+  assert.equal(functional.records[1].name, "sample_1_v1 rm=0.75");
+  assert.equal(functional.records[1].sequence, query.slice(0, reference.length));
+  assert.match(output.alignments["sample_1/uncollapsed-nucleotide"], /^>c1 fs=3 minag=0\.67\n/);
   assert.equal(output.records[0].functionalPass, undefined, "uncollapsed family records must never carry functional decisions");
   assert.equal(output.collapseGroups.sample_1[0].functionalPass, true);
+  assert.equal(output.collapseGroups.sample_1[0].referenceMatch, .75);
   assert.equal(output.collapseGroups.sample_1[0].trimmedNt, query.slice(0, reference.length));
+  const stored = resultBundle();
+  stored.consensuses = consensus; stored.records = output.records; stored.alignments = output.alignments;
+  stored.referenceAlignments = output.referenceAlignments; stored.collapseGroups = output.collapseGroups; stored.trees = {};
+  stored.optionalStages.tree = { state: "deferred", detail: "not inferred", updatedUtc: "2026-09-03T00:00:00.000Z" };
+  assert.doesNotThrow(() => encodeResult(stored), "reference-first functional alignments and annotated UMI labels must validate");
+});
+
+test("functional filtering rejects sequences without a complete start-to-stop ORF", () => {
+  const result = functionalFilter("ATGAAAAAATAA", "GCTGCTGCTTAA", 0);
+  assert.equal(result.passed, false);
+  assert.deepEqual(result.reasons, ["noORF-reject"]);
+  assert.equal(result.nt, undefined);
 });
 
 test("independent panel alignment preserves exact scoring, query order, and large indels", () => {
@@ -586,8 +605,9 @@ function resultBundle() {
 test("result bundles round-trip, export, and reject structural corruption", () => {
   const bundle = resultBundle(), encoded = encodeResult(bundle), decoded = decodeResult(encoded);
   assert.deepEqual(decoded, bundle);
+  assert.equal(exportComponent(decoded, "consensus-fasta", "sample_1").text, ">c1 fs=3 minag=0.67\nATGTAA\n");
   assert.equal(exportComponent(decoded, "trimmed-aa-fasta", "sample_1").text, ">c1\nM*\n");
-  assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /representative_id,family_count,functional_pass,functional_rejection_reasons,member_ids\nsample_1,c1,1,,,c1/);
+  assert.match(exportComponent(decoded, "collapse-csv", "sample_1").text, /representative_id,family_count,functional_pass,reference_match,functional_rejection_reasons,member_ids\nsample_1,c1,1,,,,c1/);
   assert.equal(exportComponent(decoded, "uncollapsed-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
   assert.equal(exportComponent(decoded, "functional-nucleotide-alignment", "sample_1").text, ">c1\nATGTAA\n");
   assert.equal(exportComponent(decoded, "functional-protein-alignment", "sample_1").text, ">c1\nM*\n");
@@ -642,8 +662,14 @@ test("export all is one gzip-compressed tar with every sample output in its samp
   assert.equal(decoder.decode(entries.get("sample_1/sample_1_trimmed-aa.fasta")), exportComponent(bundle, "trimmed-aa-fasta", "sample_1").text);
   assert.equal(decoder.decode(entries.get("sample_1/sample_1_families.csv")), exportComponent(bundle, "family-csv", "sample_1").text);
   for (const plot of ["umi-family-decisions.svg", "artefact-cutoff.svg", "low-agreement-positions.svg", "mds-apobec.svg",
-    "collapsed-highlighter.svg", "uncollapsed-highlighter.svg", "functional-highlighter.svg"])
+    "collapsed-tree-highlighter.svg", "uncollapsed-tree-highlighter.svg", "functional-tree-highlighter.svg"])
     assert.match(decoder.decode(entries.get(`sample_1/sample_1_${plot}`)), /^<svg/);
+  const staticFigure = decoder.decode(entries.get("sample_1/sample_1_collapsed-tree-highlighter.svg"));
+  assert.equal(staticFigure, staticTreeHighlighterSvg(bundle, "sample_1", "collapsed"));
+  assert.match(staticFigure, /viewBox="0 0 1600/); assert.match(staticFigure, /modal-sequence highlighter/);
+  assert.match(staticFigure, /Tip-circle area = 25 px²/); assert.match(staticFigure, /#f8766d/);
+  const compactEntries = tarEntries(buildExportArchive(bundle, { includeStaticTreeHighlighters: false }));
+  assert.equal(compactEntries.has("sample_1/sample_1_collapsed-tree-highlighter.svg"), false);
   assert.match(decoder.decode(entries.get("cross-sample-overview/parameters.csv")), /maxReadsPerSample/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/sample-summary.csv")), /sample_1/);
   assert.match(decoder.decode(entries.get("cross-sample-overview/interactive-threshold-decisions.csv")), /checkpoint_id,phase,accepted_utc,change/);
@@ -651,8 +677,8 @@ test("export all is one gzip-compressed tar with every sample output in its samp
 });
 
 test("live demultiplexing and Swig-style navigation-loss guards stay wired into the app", async () => {
-  const [app, pipeline, styles] = await Promise.all([
-    readFile("src/App.tsx", "utf8"), readFile("src/pipeline-worker.ts", "utf8"), readFile("src/styles.css", "utf8"),
+  const [app, pipeline, styles, results] = await Promise.all([
+    readFile("src/App.tsx", "utf8"), readFile("src/pipeline-worker.ts", "utf8"), readFile("src/styles.css", "utf8"), readFile("src/components/results-explorer.tsx", "utf8"),
   ]);
   assert.match(pipeline, /sampleAssignments:\s*sampleAssignments\(\)/);
   assert.match(app, /Live sample assignments/); assert.match(app, /last pipeline update/);
@@ -667,6 +693,7 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(styles, /overscroll-behavior-x:\s*none/);
   assert.match(app, /className="app-version"/); assert.match(app, /packageInformation\.version/);
   assert.match(styles, /\.app-version/);
+  assert.match(results, /Static SVG tree \+ highlighter plots/);
 });
 
 test("landing, configuration, and result sections link to built detailed Methods pages", async () => {

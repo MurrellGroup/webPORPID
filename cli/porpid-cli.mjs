@@ -954,6 +954,30 @@ function translateAlignmentFasta(fasta, frameOffset = 0) {
 	})));
 }
 //#endregion
+//#region src/sequence-names.ts
+/** The stable label used for the first row of every functional alignment. */
+const FUNCTIONAL_REFERENCE_NAME = "functional_reference";
+/**
+* Human-readable UMI-family FASTA label. The internal consensus identifier
+* remains `sample_UMI`, so joins and contamination decisions never depend on
+* presentation metadata embedded in a FASTA header.
+*/
+function uncollapsedSequenceName(record) {
+	return `${record.id} fs=${record.familySize} minag=${record.minimumAgreement.toFixed(2)}`;
+}
+/** Recover the stable internal identifier from a webPORPID UMI-family label. */
+function uncollapsedSequenceId(name) {
+	return name.replace(/\s+fs=\d+\s+minag=[^\s]+$/, "");
+}
+/**
+* Functional variants retain sample and abundance-rank identity but replace
+* the collapsed family-count suffix with their reference-match annotation.
+*/
+function functionalSequenceName(group) {
+	if (group.referenceMatch == null) return group.representativeId;
+	return `${/^(.*_v\d+)_\d+$/.exec(group.representativeId)?.[1] ?? group.representativeId} rm=${group.referenceMatch.toFixed(2)}`;
+}
+//#endregion
 //#region src/collapse.ts
 function exactFasta(rows) {
 	return rows.map((row) => `>${row.name}\n${row.sequence}\n`).join("");
@@ -978,7 +1002,7 @@ function collapseAlignment(fasta, sample) {
 			};
 			bySequence.set(haplotype, group);
 		}
-		group.members.push(row.name);
+		group.members.push(uncollapsedSequenceId(row.name));
 	}
 	const variants = [...bySequence.values()].sort((left, right) => right.members.length - left.members.length || left.haplotype.localeCompare(right.haplotype));
 	const groups = variants.map((group, index) => ({
@@ -1405,7 +1429,7 @@ function longestOrf(sequence) {
 			};
 		}
 	}
-	return best ? sequence.slice(best.start, best.end) : sequence.slice(0, Math.floor(sequence.length / 3) * 3);
+	return best ? sequence.slice(best.start, best.end) : void 0;
 }
 function backtranslate(alignedAminoAcids, codingNucleotides) {
 	let output = "", offset = 0;
@@ -1432,10 +1456,17 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 			passed: false,
 			reasons: ["ambiguousSymbols-reject"]
 		};
-		else coding.push({
-			index,
-			sequence: longestOrf(sequence)
-		});
+		else {
+			const orf = longestOrf(sequence);
+			if (orf) coding.push({
+				index,
+				sequence: orf
+			});
+			else outcomes[index] = {
+				passed: false,
+				reasons: ["noORF-reject"]
+			};
+		}
 	});
 	const referenceCoding = degap(reference).slice(0, Math.floor(degap(reference).length / 3) * 3);
 	if (!coding.length) return {
@@ -1464,7 +1495,8 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 			nt: trimmed,
 			aa,
 			alignedNt: queryRegion,
-			alignedAa: translateAlignedNucleotides(queryRegion, 0)
+			alignedAa: translateAlignedNucleotides(queryRegion, 0),
+			referenceMatch: Number(rawRatio.toFixed(2))
 		};
 	});
 	return {
@@ -1560,7 +1592,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				if (!contaminationPass) rejectionReasons.push("contamination filter");
 				if (!panelPass[index]) rejectionReasons.push(`distance_from_panel >= ${config.parameters.panelThreshold}`);
 				if (acceptedRow) nucleotideRows.push({
-					name: record.id,
+					name: uncollapsedSequenceName(record),
 					sequence: acceptedRow
 				});
 				records.push({
@@ -1659,35 +1691,43 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 					detail: `Checking ${collapsedRows.length.toLocaleString()} collapsed variants against the functional reference for ${sample.name}`
 				});
 				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
-				const functionalNucleotideRows = [];
-				const functionalProteinRows = [];
+				const functionalNucleotideRows = [{
+					name: FUNCTIONAL_REFERENCE_NAME,
+					sequence: batch.referenceNt
+				}];
+				const functionalProteinRows = [{
+					name: FUNCTIONAL_REFERENCE_NAME,
+					sequence: batch.referenceAa
+				}];
 				let passedCount = 0;
 				collapsed.groups.forEach((group, position) => {
 					const outcome = batch.outcomes[position];
 					group.functionalPass = outcome.passed;
 					group.trimmedNt = outcome.nt;
 					group.trimmedAa = outcome.aa;
+					group.referenceMatch = outcome.referenceMatch;
 					group.functionalRejectionReasons = outcome.reasons;
 					if (outcome.passed) {
 						passedCount++;
 						if (outcome.alignedNt && outcome.alignedAa) {
+							const name = functionalSequenceName(group);
 							functionalNucleotideRows.push({
-								name: group.representativeId,
+								name,
 								sequence: outcome.alignedNt
 							});
 							functionalProteinRows.push({
-								name: group.representativeId,
+								name,
 								sequence: outcome.alignedAa
 							});
 						}
 					}
 				});
 				functionalPassed = passedCount;
-				if (functionalNucleotideRows.length) {
+				if (passedCount) {
 					alignments[`${sample.name}/functional-nucleotide`] = fasta$1(functionalNucleotideRows);
 					alignments[`${sample.name}/functional-protein`] = fasta$1(functionalProteinRows);
 					referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta$1([{
-						name: "functional_reference",
+						name: FUNCTIONAL_REFERENCE_NAME,
 						sequence: batch.referenceNt
 					}]);
 				}
@@ -3596,12 +3636,6 @@ function gzipSync(data, opts) {
 	var d = dopt(data, opts, gzhl(opts), 8), s = d.length;
 	return gzh(d, opts), wbytes(d, s - 8, c.d()), wbytes(d, s - 4, l), d;
 }
-/**
-* Expands GZIP data
-* @param data The data to decompress
-* @param opts The decompression options
-* @returns The decompressed version of the data
-*/
 function gunzipSync(data, opts) {
 	var st = gzs(data);
 	if (st + 8 > data.length) err(6, "invalid gzip data");
@@ -3905,9 +3939,14 @@ function validateResult(value) {
 		const collapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/nucleotide`], `alignments.${sample}/nucleotide`), 1);
 		const uncollapsed = inspectAlignment(text(object(bundle.alignments, "alignments")[`${sample}/uncollapsed-nucleotide`], `alignments.${sample}/uncollapsed-nucleotide`), 1);
 		const collapsedByName = new Map(collapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
-		const uncollapsedByName = new Map(uncollapsed.records.map((record) => [record.name, record.sequence.replaceAll("-", "")]));
+		const uncollapsedByName = new Map(uncollapsed.records.map((record) => [uncollapsedSequenceId(record.name), record.sequence.replaceAll("-", "")]));
+		if (uncollapsedByName.size !== uncollapsed.records.length) throw new Error("Uncollapsed sequence annotations do not resolve to unique consensus identifiers.");
 		const functionalSource = object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`];
-		const functionalNames = functionalSource == null ? /* @__PURE__ */ new Set() : new Set(inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records.map((record) => record.name));
+		const functionalRecords = functionalSource == null ? [] : inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records;
+		const embeddedReferenceIndex = functionalRecords.findIndex((record) => record.name === FUNCTIONAL_REFERENCE_NAME);
+		if (embeddedReferenceIndex > 0) throw new Error("The functional reference must be the first sequence in its alignment.");
+		const hasEmbeddedFunctionalReference = embeddedReferenceIndex === 0;
+		const functionalNames = new Set(functionalRecords.filter((_, index) => index !== embeddedReferenceIndex).map((record) => record.name));
 		let hasCollapsedFunctionalCalls = false, collapsedFunctionalPasses = 0;
 		array(rawGroups, `collapseGroups.${sample}`).forEach((rawGroup, index) => {
 			const group = object(rawGroup, `collapseGroups.${sample}[${index}]`);
@@ -3931,12 +3970,19 @@ function validateResult(value) {
 			if (group.minimumAgreement != null && numeric(group.minimumAgreement, "legacy collapse minimum agreement") !== Math.min(...agreements)) throw new Error("A legacy collapse group has inconsistent family-agreement metadata.");
 			optionalText(group.trimmedNt, "collapsed functional nucleotide");
 			optionalText(group.trimmedAa, "collapsed functional protein");
+			const referenceMatch = group.referenceMatch == null ? void 0 : numeric(group.referenceMatch, "collapsed functional reference match");
+			if (referenceMatch != null && (referenceMatch < 0 || referenceMatch > 1 || Math.abs(referenceMatch - Math.round(referenceMatch * 100) / 100) > 1e-12)) throw new Error("A collapsed functional reference match must be between zero and one at two-decimal precision.");
 			if (group.functionalRejectionReasons != null) array(group.functionalRejectionReasons, "collapsed functional reasons").forEach((reason) => text(reason, "collapsed functional reason"));
 			if (group.functionalPass != null) {
 				hasCollapsedFunctionalCalls = true;
 				const functionalPass = bool(group.functionalPass, "collapsed functionalPass");
 				if (functionalPass) collapsedFunctionalPasses++;
-				if (functionalNames.has(representative) !== functionalPass) throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
+				if (hasEmbeddedFunctionalReference && functionalPass && referenceMatch == null) throw new Error("A functional-pass variant in a reference-inclusive alignment is missing its reference-match measure.");
+				const annotatedName = functionalSequenceName({
+					representativeId: representative,
+					referenceMatch
+				});
+				if ((functionalNames.has(annotatedName) || !hasEmbeddedFunctionalReference && functionalNames.has(representative)) !== functionalPass) throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
 			}
 		});
 		if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length) throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
@@ -4180,7 +4226,7 @@ function exportComponent(bundle, kind, sample) {
 			extension: "consensus.fasta",
 			mime: "text/x-fasta",
 			text: fasta(consensuses.map((record) => ({
-				id: record.id,
+				id: uncollapsedSequenceName(record),
 				sequence: record.sequence
 			})))
 		};
@@ -4188,7 +4234,7 @@ function exportComponent(bundle, kind, sample) {
 			extension: "passed-consensus.fasta",
 			mime: "text/x-fasta",
 			text: fasta(records.filter(passed).map((record) => ({
-				id: record.id,
+				id: uncollapsedSequenceName(record),
 				sequence: record.consensusNt
 			})))
 		};
@@ -4196,7 +4242,7 @@ function exportComponent(bundle, kind, sample) {
 			extension: "rejected-consensus.fasta",
 			mime: "text/x-fasta",
 			text: fasta(records.filter((record) => !passed(record)).map((record) => ({
-				id: record.id,
+				id: uncollapsedSequenceName(record),
 				sequence: record.consensusNt
 			})))
 		};
@@ -4204,7 +4250,7 @@ function exportComponent(bundle, kind, sample) {
 			extension: "trimmed-nt.fasta",
 			mime: "text/x-fasta",
 			text: fasta((collapsedFunctional.length ? collapsedFunctional.map((group) => ({
-				id: group.representativeId,
+				id: functionalSequenceName(group),
 				sequence: group.trimmedNt ?? ""
 			})) : records.filter((record) => record.functionalPass && record.trimmedNt).map((record) => ({
 				id: record.id,
@@ -4215,7 +4261,7 @@ function exportComponent(bundle, kind, sample) {
 			extension: "trimmed-aa.fasta",
 			mime: "text/x-fasta",
 			text: fasta((collapsedFunctional.length ? collapsedFunctional.map((group) => ({
-				id: group.representativeId,
+				id: functionalSequenceName(group),
 				sequence: group.trimmedAa ?? ""
 			})) : records.filter((record) => record.functionalPass && record.trimmedAa).map((record) => ({
 				id: record.id,
@@ -4345,6 +4391,7 @@ function exportComponent(bundle, kind, sample) {
 					"representative_id",
 					"family_count",
 					"functional_pass",
+					"reference_match",
 					"functional_rejection_reasons",
 					"member_ids"
 				], (bundle.collapseGroups?.[selected] ?? []).map((group) => [
@@ -4352,6 +4399,7 @@ function exportComponent(bundle, kind, sample) {
 					group.representativeId,
 					group.familyCount,
 					group.functionalPass,
+					group.referenceMatch?.toFixed(2),
 					group.functionalRejectionReasons?.join(";"),
 					group.memberIds.join(";")
 				]))
@@ -4552,7 +4600,7 @@ function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-pane
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.10";
+const VERSION = "0.3.11";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

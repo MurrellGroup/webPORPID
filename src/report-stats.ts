@@ -62,6 +62,7 @@ export const FAMILY_CALLS: ReadonlyArray<{ disposition: FamilyDisposition; label
 
 export const FUNCTIONAL_REASONS = [
   { key: "ambiguous", label: "Ambiguous-symbol rejects", matches: (reason: string) => reason.startsWith("ambiguousSymbols-reject") },
+  { key: "no-orf", label: "No complete start-to-stop ORF", matches: (reason: string) => reason.startsWith("noORF-reject") },
   { key: "frameshift", label: "Frameshift rejects", matches: (reason: string) => reason.startsWith("frameshift-reject") },
   { key: "late-start", label: "Late-start rejects", matches: (reason: string) => reason.startsWith("lateStart-reject") },
   { key: "early-stop", label: "Early-stop rejects", matches: (reason: string) => reason.startsWith("earlyStop-reject") },
