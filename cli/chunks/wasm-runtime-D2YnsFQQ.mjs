@@ -1,5 +1,5 @@
 import { n as BinaryWriter, t as BinaryReader } from "./binary-68r8u1WT.mjs";
-import { t as WASI } from "./dist-BFrMSSwW.mjs";
+import { t as WASI } from "./dist-BPeWFyil.mjs";
 //#region src/wasm-runtime.ts
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -149,6 +149,23 @@ function decodeFamilyModel(bytes, config) {
 	if (!reader.done) throw new Error("Family model has trailing bytes.");
 	return output;
 }
+/** Re-encode an inspected family model after an interactive cutoff decision. */
+function encodeFamilyModel(families) {
+	const writer = new BinaryWriter();
+	writer.magic("WPM1");
+	writer.u32(families.length);
+	for (const family of families) {
+		const disposition = DISPOSITIONS.indexOf(family.disposition);
+		if (disposition < 0) throw new Error(`Cannot encode unknown UMI-family disposition ${family.disposition}.`);
+		writer.u16(family.sampleIndex);
+		writer.string(family.disposition === "BPB-rejects" ? "REJECTS" : family.umi);
+		writer.string(family.mostLikelyParent);
+		writer.u32(family.familySize);
+		writer.f64(family.posteriorProbability);
+		writer.u8(disposition);
+	}
+	return writer.finish();
+}
 function decodeConsensusOutput(bytes, config) {
 	const reader = new BinaryReader(bytes);
 	reader.magic("WPO1");
@@ -216,4 +233,4 @@ function mergeStats(stats, samples) {
 	return result;
 }
 //#endregion
-export { makeCutoffValues as a, mergeStats as c, decodeFamilyModel as i, decodeConsensusOutput as n, makeCutoffs as o, decodeFamilyCounts as r, mergeFamilyCounts as s, WebPorpidRuntime as t };
+export { encodeFamilyModel as a, mergeFamilyCounts as c, decodeFamilyModel as i, mergeStats as l, decodeConsensusOutput as n, makeCutoffValues as o, decodeFamilyCounts as r, makeCutoffs as s, WebPorpidRuntime as t };

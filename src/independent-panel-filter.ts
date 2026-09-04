@@ -46,6 +46,13 @@ interface AlignmentMap {
   touchedBand: boolean;
 }
 
+export interface ProfileAddition {
+  /** Existing profile rows with only shared all-gap columns inserted. */
+  profileRows: string[];
+  /** The added sequence, aligned to exactly the same columns. */
+  sequence: string;
+}
+
 /**
  * Global affine profile/query alignment using O(panelLength * band) work.
  *
@@ -148,6 +155,43 @@ function alignAdaptively(profile: PanelProfile, sequence: string): AlignmentMap 
     if (!result.touchedBand || band >= maximumBand) return result;
     band = Math.min(maximumBand, band * 2);
   }
+}
+
+/**
+ * Add one sequence to a fixed alignment without ever realigning its existing
+ * rows. Query insertions become all-gap columns in the existing profile. This
+ * is the profile-add operation needed when a biological sample MSA must remain
+ * invariant while a reference is added for coordinates and scoring.
+ */
+export function addSequenceToProfile(profileRows: readonly string[], sequence: string): ProfileAddition {
+  const normalizedRows = profileRows.map((row) => row.replace(/\s/g, "").toUpperCase());
+  const profile = buildPanelProfile(normalizedRows), aligned = alignAdaptively(profile, sequence);
+  const insertions = Array.from({ length: profile.width + 1 }, () => "");
+  const mapped = Array(profile.width).fill("-") as string[];
+  let previousPanelColumn = -1;
+  for (let queryColumn = 0; queryColumn < aligned.query.length; queryColumn++) {
+    const panelColumn = aligned.queryToPanel[queryColumn], residue = aligned.query[queryColumn];
+    if (panelColumn < 0) insertions[previousPanelColumn + 1] += residue;
+    else {
+      if (panelColumn <= previousPanelColumn) throw new Error("Profile-add alignment produced non-monotonic columns.");
+      mapped[panelColumn] = residue; previousPanelColumn = panelColumn;
+    }
+  }
+
+  const expandProfileRow = (row: string) => {
+    let output = "-".repeat(insertions[0].length);
+    for (let column = 0; column < profile.width; column++)
+      output += row[column] + "-".repeat(insertions[column + 1].length);
+    return output;
+  };
+  let alignedSequence = insertions[0];
+  for (let column = 0; column < profile.width; column++) alignedSequence += mapped[column] + insertions[column + 1];
+  const expandedRows = normalizedRows.map(expandProfileRow);
+  if (expandedRows.some((row) => row.length !== alignedSequence.length))
+    throw new Error("Profile-add alignment did not produce a rectangular alignment.");
+  if (alignedSequence.replaceAll("-", "") !== aligned.query)
+    throw new Error("Profile-add alignment did not preserve the added sequence.");
+  return { profileRows: expandedRows, sequence: alignedSequence };
 }
 
 function maximumSubarrayScore(profile: PanelProfile, query: string, mapping: Int32Array) {

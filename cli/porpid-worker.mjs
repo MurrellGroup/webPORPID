@@ -1,4 +1,4 @@
-import { t as WebPorpidRuntime } from "./chunks/wasm-runtime-Wv6FuJI8.mjs";
+import { t as WebPorpidRuntime } from "./chunks/wasm-runtime-D2YnsFQQ.mjs";
 import { readFile } from "node:fs/promises";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/porpid-worker.mjs
@@ -17,7 +17,10 @@ async function handle(message) {
 		runtime.initFamilyModel(new Uint8Array(message.bytes));
 		return { ready: true };
 	}
-	if (message.type === "consensus") return runtime.consensus(new Uint8Array(message.bytes), new Uint8Array(message.cutoffs));
+	if (message.type === "consensus") {
+		if (message.model) runtime.initFamilyModel(new Uint8Array(message.model));
+		return runtime.consensus(new Uint8Array(message.bytes), new Uint8Array(message.cutoffs));
+	}
 	if (message.type === "stats") return runtime.stats();
 	throw new Error(`Unknown porpid-cli worker request ${message.type}.`);
 }

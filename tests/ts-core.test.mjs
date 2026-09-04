@@ -22,7 +22,7 @@ import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.t
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
 import { functionalFilter, postprocess } from "../src/postprocess.ts";
-import { filterQueriesAgainstPanel } from "../src/independent-panel-filter.ts";
+import { addSequenceToProfile, filterQueriesAgainstPanel } from "../src/independent-panel-filter.ts";
 import { extractAndScorePanel } from "../src/panel-profile.ts";
 import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
 import { adaptiveSpoolCutoff, PartitionStore, writeAllSync } from "../src/partition-store.ts";
@@ -187,6 +187,11 @@ test("external scratch mode streams complete no-downsampling partitions and remo
     const selected = await Promise.all(Array.from({ length: 4 }, (_, partition) => store.readSelected(partition, [maximumHash])));
     assert.equal(selected.reduce((sum, bytes) => sum + countSpoolRecords(bytes), 0), 40);
     assert.equal(store.statistics().bypassedRecords, 0); assert(store.statistics().currentBytes > 0);
+    const compactResults = Array.from({ length: 4 }, (_, partition) => Uint8Array.of(87, 80, 79, 49, partition));
+    await Promise.all(compactResults.map((bytes, partition) => store.replaceWithResult(partition, bytes)));
+    const restored = await Promise.all(compactResults.map((_, partition) => store.readResult(partition)));
+    assert.deepEqual(restored, compactResults, "consensus outputs must replace consumed reads and stream back one result block at a time");
+    assert.equal(store.statistics().currentBytes, 0);
   } finally { await store.close(); }
   assert.equal(root.directories.size, 0); assert.equal(root.removed.length, 1);
 });
@@ -328,6 +333,9 @@ test("report figures and the Swig-derived viewer render from a result payload", 
     assert.deepEqual(weightedModal, { treeName: "b", sequenceName: "b", modalSequence: "CCC", representedFamilies: 4, matchingTips: 1 });
     const uncollapsedModal = chooseModalRootTip([{ name: "first", sequence: "AAA" }, { name: "second", sequence: "CCC" }, { name: "third", sequence: "AAA" }], ["first", "second", "third"]);
     assert.deepEqual(uncollapsedModal, { treeName: "first", sequenceName: "first", modalSequence: "AAA", representedFamilies: 2, matchingTips: 2 });
+    const referenceFirstModal = chooseModalRootTip([{ name: "reference", sequence: "AAA" }, { name: "observed", sequence: "AAA" }], ["reference", "observed"],
+      { reference: { familyCount: 0 }, observed: { familyCount: 5 } });
+    assert.deepEqual(referenceFirstModal, { treeName: "observed", sequenceName: "observed", modalSequence: "AAA", representedFamilies: 5, matchingTips: 2 });
     const radiusOne = abundanceBubbleRadius(1, 25), radiusFour = abundanceBubbleRadius(4, 25), radiusMillion = abundanceBubbleRadius(1_000_000, 25);
     assert(Math.abs((Math.PI * radiusFour ** 2) / (Math.PI * radiusOne ** 2) - 4) < 1e-12, "bubble area must be exactly linear in UMI-family count");
     assert(radiusMillion > 2_000, "large family counts must not encounter a display cap");
@@ -344,6 +352,8 @@ test("report figures and the Swig-derived viewer render from a result payload", 
     assert.match(familyViewer, /Family minimum agreement/i);
     const mismatched = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">a\nATGTAA\n", newick: "(a:0.0,b:0.0);", alphabet: "nt" }));
     assert.match(mismatched, /stale tree is hidden/i);
+    const alignmentOnly = renderToStaticMarkup(createElement(AlignmentTreeViewer, { fasta: ">visible_before_tree\nATGTAA\n", alphabet: "nt" }));
+    assert.match(alignmentOnly, /alignment-name-viewport/, "sequence names need a visible gutter before tree inference");
     const coordinates = charts.classicalMds(["AAAA", "AAAT", "AATA", "ATAA", "TAAA"]);
     const secondSpan = Math.max(...coordinates.map((row) => row[1])) - Math.min(...coordinates.map((row) => row[1]));
     assert(secondSpan > .1, "the second positive MDS axis must not be replaced by a negative eigenvector");
@@ -482,21 +492,47 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   const output = await postprocess(consensus, [], config, undefined, runner, 1);
   const functional = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1);
   const functionalReference = inspectAlignment(output.referenceAlignments["sample_1/functional-nucleotide"], 1);
-  assert.equal(functional.columns, reference.length); assert.equal(functionalReference.columns, reference.length);
-  assert.equal(functional.records[0].name, "functional_reference");
-  assert.equal(functional.records[0].sequence, reference);
-  assert.equal(functional.records[1].name, "sample_1_v1 rm=0.75");
-  assert.equal(functional.records[1].sequence, query.slice(0, reference.length));
+  assert.equal(functional.columns, query.length); assert.equal(functionalReference.columns, query.length);
+  assert.equal(functional.records[0].name, "ref");
+  assert.equal(functional.records[0].sequence, "ATGAAAAAA------TAA");
+  assert.equal(functional.records[1].name, "sample_1_v1 rm=0.67");
+  assert.equal(functional.records[1].sequence, query);
   assert.match(output.alignments["sample_1/uncollapsed-nucleotide"], /^>c1 fs=3 minag=0\.67\n/);
   assert.equal(output.records[0].functionalPass, undefined, "uncollapsed family records must never carry functional decisions");
   assert.equal(output.collapseGroups.sample_1[0].functionalPass, true);
-  assert.equal(output.collapseGroups.sample_1[0].referenceMatch, .75);
-  assert.equal(output.collapseGroups.sample_1[0].trimmedNt, query.slice(0, reference.length));
+  assert.equal(output.collapseGroups.sample_1[0].referenceMatch, .67);
+  assert.equal(output.collapseGroups.sample_1[0].trimmedNt, query);
   const stored = resultBundle();
   stored.consensuses = consensus; stored.records = output.records; stored.alignments = output.alignments;
   stored.referenceAlignments = output.referenceAlignments; stored.collapseGroups = output.collapseGroups; stored.trees = {};
   stored.optionalStages.tree = { state: "deferred", detail: "not inferred", updatedUtc: "2026-09-03T00:00:00.000Z" };
   assert.doesNotThrow(() => encodeResult(stored), "reference-first functional alignments and annotated UMI labels must validate");
+});
+
+test("functional reference profile-add preserves the existing sample MSA", () => {
+  const sampleAlignment = ["MK-AAG*", "MKTAA-*"], added = addSequenceToProfile(sampleAlignment, "MKA*");
+  assert.equal(added.profileRows.length, sampleAlignment.length);
+  assert(added.profileRows.every((row, index) => row.replaceAll("-", "") === sampleAlignment[index].replaceAll("-", "")));
+  const retainedColumns = Array.from({ length: added.profileRows[0].length }, (_, column) => column)
+    .filter((column) => added.profileRows.some((row) => row[column] !== "-"));
+  assert.deepEqual(added.profileRows.map((row) => retainedColumns.map((column) => row[column]).join("")), sampleAlignment,
+    "removing only newly inserted all-gap columns must recover the byte-identical sample MSA");
+  assert.equal(added.sequence.replaceAll("-", ""), "MKA*");
+});
+
+test("static tree highlights only variants strictly above ten percent", () => {
+  const bundle = {
+    alignments: { "sample/nucleotide": ">sample_v1_9\nAAAA\n>sample_v2_1\nAAAT\n" }, trees: { "sample/nucleotide": "(sample_v1_9:0.01,sample_v2_1:0.02);" },
+    records: [], collapseGroups: { sample: [
+      { representativeId: "sample_v1_9", familyCount: 9, functionalPass: false },
+      { representativeId: "sample_v2_1", familyCount: 1, functionalPass: false },
+    ] },
+  };
+  const svg = staticTreeHighlighterSvg(bundle, "sample", "collapsed");
+  assert.match(svg, /fill="#FF0000" fill-opacity="0\.6"><title>sample_v1_9; 9 UMI families/);
+  assert.match(svg, /fill="#000000" fill-opacity="0\.6"><title>sample_v2_1; 1 UMI family/,
+    "a variant at exactly ten percent must remain black");
+  assert.match(svg, /tip order = small clades first/);
 });
 
 test("functional filtering rejects sequences without a complete start-to-stop ORF", () => {
@@ -668,6 +704,7 @@ test("export all is one gzip-compressed tar with every sample output in its samp
   assert.equal(staticFigure, staticTreeHighlighterSvg(bundle, "sample_1", "collapsed"));
   assert.match(staticFigure, /viewBox="0 0 1600/); assert.match(staticFigure, /modal-sequence highlighter/);
   assert.match(staticFigure, /Tip-circle area = 25 px²/); assert.match(staticFigure, /#f8766d/);
+  assert.match(staticFigure, /small clades first/); assert.match(staticFigure, /#FF0000/);
   const compactEntries = tarEntries(buildExportArchive(bundle, { includeStaticTreeHighlighters: false }));
   assert.equal(compactEntries.has("sample_1/sample_1_collapsed-tree-highlighter.svg"), false);
   assert.match(decoder.decode(entries.get("cross-sample-overview/parameters.csv")), /maxReadsPerSample/);

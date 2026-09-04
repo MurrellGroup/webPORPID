@@ -7,6 +7,7 @@ import { collapseAlignment } from "./collapse.ts";
 import { extractAndScorePanel } from "./panel-profile.ts";
 import { runScalableMsa } from "./scalable-msa.ts";
 import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceName } from "./sequence-names.ts";
+import { addSequenceToProfile } from "./independent-panel-filter.ts";
 import type { ApobecResult, ConsensusRecord, ContaminationCall, PipelineConfig, PostprocRecord, SampleSummary } from "./types.ts";
 
 export interface PostprocessOutput {
@@ -200,6 +201,7 @@ interface FunctionalOutcome {
 
 interface FunctionalBatchOutcome {
   outcomes: FunctionalOutcome[];
+  referenceName: string;
   referenceNt: string;
   referenceAa: string;
 }
@@ -215,14 +217,13 @@ function backtranslate(alignedAminoAcids: string, codingNucleotides: string): st
 }
 
 /**
- * SeededAlignment's functional filter is codon-aware and evaluates every
- * sequence against one joint reference-anchored alignment.  Doing independent
- * nucleotide NW alignments introduced arbitrary one-base gaps and incorrectly
- * labeled almost every long-read sequence as a frameshift.  Translate first,
- * align the complete batch, and project gaps back as codon triplets instead.
+ * Align the eligible sample ORFs in amino-acid space first, freeze that sample
+ * profile, and add the translated reference without moving existing residues.
+ * Projecting every resulting gap back as a codon triplet prevents an aligner
+ * from manufacturing one- or two-base frameshifts.
  */
 async function functionalFilterBatch(
-  reference: string, sequences: string[], threshold: number, runMsa: MsaRunner, signal?: AbortSignal,
+  referenceName: string, reference: string, sequences: string[], threshold: number, runMsa: MsaRunner, signal?: AbortSignal,
 ): Promise<FunctionalBatchOutcome> {
   const outcomes: FunctionalOutcome[] = Array(sequences.length), coding: Array<{ index: number; sequence: string }> = [];
   sequences.forEach((raw, index) => {
@@ -235,9 +236,18 @@ async function functionalFilterBatch(
     }
   });
   const referenceCoding = degap(reference).slice(0, Math.floor(degap(reference).length / 3) * 3);
-  if (!coding.length) return { outcomes, referenceNt: referenceCoding, referenceAa: translate(referenceCoding) };
-  const aminoInputs = [translate(referenceCoding), ...coding.map((row) => translate(row.sequence))];
-  const aminoAlignment = await runScalableMsa(aminoInputs, runMsa, signal, 3, "amino-acid");
+  const resolvedReferenceName = referenceName.trim() || FUNCTIONAL_REFERENCE_NAME;
+  if (!coding.length) return { outcomes, referenceName: resolvedReferenceName, referenceNt: referenceCoding, referenceAa: translate(referenceCoding) };
+
+  // SeededAlignment first aligns the biological sequences to one another, then
+  // adds the functional reference to that *fixed* profile. A joint MSA can move
+  // gaps between sample sequences merely because a reference was introduced.
+  const sampleAminoInputs = coding.map((row) => translate(row.sequence));
+  const sampleAminoAlignment = sampleAminoInputs.length > 1
+    ? await runScalableMsa(sampleAminoInputs, runMsa, signal, 3, "amino-acid")
+    : sampleAminoInputs;
+  const withReference = addSequenceToProfile(sampleAminoAlignment, translate(referenceCoding));
+  const aminoAlignment = [withReference.sequence, ...withReference.profileRows];
   const nucleotideAlignment = aminoAlignment.map((row, index) => backtranslate(row, index ? coding[index - 1].sequence : referenceCoding));
   const alignedReference = nucleotideAlignment[0], first = alignedReference.search(/[^-]/);
   let last = alignedReference.length - 1; while (last >= first && alignedReference[last] === "-") last--;
@@ -254,7 +264,7 @@ async function functionalFilterBatch(
     outcomes[entry.index] = { passed: !reasons.length, reasons, nt: trimmed, aa,
       alignedNt: queryRegion, alignedAa: translateAlignedNucleotides(queryRegion, 0), referenceMatch: Number(rawRatio.toFixed(2)) };
   });
-  return { outcomes, referenceNt: referenceRegion, referenceAa: translateAlignedNucleotides(referenceRegion, 0) };
+  return { outcomes, referenceName: resolvedReferenceName, referenceNt: referenceRegion, referenceAa: translateAlignedNucleotides(referenceRegion, 0) };
 }
 
 export async function postprocess(
@@ -407,13 +417,13 @@ export async function collapsePostprocess(
       if (sample.functionalReferenceSequence && collapsedRows.length) {
         onProgress?.({ fraction: (index + .45) / Math.max(1, config.samples.length),
           detail: `Checking ${collapsedRows.length.toLocaleString()} collapsed variants against the functional reference for ${sample.name}` });
-        const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence,
+        const batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence,
           collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
         const functionalNucleotideRows: Array<{ name: string; sequence: string }> = [
-          { name: FUNCTIONAL_REFERENCE_NAME, sequence: batch.referenceNt },
+          { name: batch.referenceName, sequence: batch.referenceNt },
         ];
         const functionalProteinRows: Array<{ name: string; sequence: string }> = [
-          { name: FUNCTIONAL_REFERENCE_NAME, sequence: batch.referenceAa },
+          { name: batch.referenceName, sequence: batch.referenceAa },
         ];
         let passedCount = 0;
         collapsed.groups.forEach((group, position) => {
@@ -434,7 +444,7 @@ export async function collapsePostprocess(
         if (passedCount) {
           alignments[`${sample.name}/functional-nucleotide`] = fasta(functionalNucleotideRows);
           alignments[`${sample.name}/functional-protein`] = fasta(functionalProteinRows);
-          referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta([{ name: FUNCTIONAL_REFERENCE_NAME, sequence: batch.referenceNt }]);
+          referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta([{ name: batch.referenceName, sequence: batch.referenceNt }]);
         }
       } else if (sample.functionalReferenceSequence) functionalPassed = 0;
     }

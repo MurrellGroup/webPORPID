@@ -15,14 +15,14 @@ import { downstreamResources, statusRecord } from "../src/optional-stages.ts";
 import { decodeResult, encodeResult, exportComponent, safeDatasetName } from "../src/result-file.ts";
 import { concatenateSpoolRecords, parseSpoolRecordHeader, selectedSpoolRecord, SPOOL_HEADER_BYTES } from "../src/spool-record.ts";
 import {
-  decodeConsensusOutput, decodeFamilyCounts, decodeFamilyModel, makeCutoffs, makeCutoffValues, mergeFamilyCounts, mergeStats,
+  decodeConsensusOutput, decodeFamilyCounts, decodeFamilyModel, encodeFamilyModel, makeCutoffs, makeCutoffValues, mergeFamilyCounts, mergeStats,
 } from "../src/wasm-runtime.ts";
 import { createFastTreeRunner } from "./direct-fasttree.mjs";
 import { createMafftRunner } from "./direct-mafft.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 import { createIndependentPanelFilterRunner } from "./direct-panel-filter.mjs";
 
-const VERSION = "0.3.11";
+const VERSION = "0.3.12";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 
@@ -86,7 +86,7 @@ class WorkerClient {
 }
 
 class WorkerPool {
-  constructor(clients) { this.clients = clients; this.cursor = 0; }
+  constructor(clients) { this.clients = clients; this.cursor = 0; this.closed = false; }
   static async create(size, wasmPath, compiledConfig) {
     const clients = [];
     for (let index = 0; index < size; index++) {
@@ -100,7 +100,7 @@ class WorkerPool {
   }
   any(message, transfer = []) { return this.clients[this.cursor++ % this.clients.length].call(message, transfer); }
   at(index, message, transfer = []) { return this.clients[index].call(message, transfer); }
-  async close() { await Promise.all(this.clients.map((client) => client.terminate())); }
+  async close() { if (this.closed) return; this.closed = true; await Promise.all(this.clients.map((client) => client.terminate())); }
 }
 
 class DiskPartitions {
@@ -150,6 +150,19 @@ class DiskPartitions {
     }
     if (offset !== this.lengths[partition]) throw new Error("Temporary partition contains trailing spool bytes.");
     return concatenateSpoolRecords(records);
+  }
+  async replaceWithResult(partition, bytes) {
+    await this.chains[partition]; const handle = this.handles[partition]; await handle.truncate(0);
+    let offset = 0;
+    while (offset < bytes.byteLength) {
+      const result = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+      if (!result.bytesWritten) throw new Error("Temporary consensus-result write was incomplete."); offset += result.bytesWritten;
+    }
+    this.lengths[partition] = bytes.byteLength;
+  }
+  async readResult(partition) {
+    await this.chains[partition]; const bytes = new Uint8Array(this.lengths[partition]);
+    await this.readFully(partition, bytes, 0); await this.handles[partition].truncate(0); this.lengths[partition] = 0; return bytes;
   }
   async close() {
     if (this.closed) return; this.closed = true;
@@ -204,7 +217,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
   const compiledConfig = compileConfig(config);
   const configHash = createHash("sha256").update(JSON.stringify(resultConfig(config))).digest("hex"), inputHash = createHash("sha256");
   status(`starting ${config.dataset} with ${workers} workers`);
-  const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
+  let pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig); const store = await DiskPartitions.create(config.parameters.spoolPartitions);
   const log = [`${now()} webPORPID ${VERSION} started`, `${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
     `${now()} parameters: error_rate=${config.parameters.errorRate}, lengths=(${config.parameters.minLength},${config.parameters.maxLength}), lda=${config.parameters.ldaThreshold}, panel_filter=${config.parameters.panelFilterMode ?? "mafft-batch"}`];
   const inputMappings = [{ slot: "reads", role: "reads", uploadedName: basename(input), uploadedSize: inputInformation.size }, ...loadedConfiguration.mappings];
@@ -243,37 +256,52 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
         countParts[partition] = new Uint8Array(await pool.at(worker, { type: "countFamilies", bytes: data, cutoffs: cutoffCopy }, [data, cutoffCopy]));
       }
     }));
-    const mergedCounts = mergeFamilyCounts(countParts), decodedCounts = decodeFamilyCounts(mergedCounts);
+    let mergedCounts = mergeFamilyCounts(countParts); const decodedCounts = decodeFamilyCounts(mergedCounts);
     const selectedReadsBySample = Array(config.samples.length).fill(0);
     for (const entry of decodedCounts) selectedReadsBySample[entry.sample] += entry.count;
     const selectedReads = selectedReadsBySample.reduce((sum, count) => sum + count, 0);
     quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
+    decodedCounts.length = 0;
     const modelData = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
-    const familyModel = new Uint8Array(await pool.at(0, { type: "buildModel", bytes: modelData }, [modelData]));
+    let familyModel = new Uint8Array(await pool.at(0, { type: "buildModel", bytes: modelData }, [modelData])); mergedCounts = new Uint8Array();
     const umiFamilies = decodeFamilyModel(familyModel, config);
+    familyModel = new Uint8Array();
     quality.bpbRejects = umiFamilies.filter((row) => row.disposition === "BPB-rejects").reduce((sum, row) => sum + row.familySize, 0);
-    await Promise.all(pool.clients.map((_, index) => { const copy = familyModel.slice().buffer; return pool.at(index, { type: "initModel", bytes: copy }, [copy]); }));
+    const familyByKey = new Map(umiFamilies.filter((family) => family.disposition !== "BPB-rejects")
+      .map((family) => [`${family.sampleIndex}\0${family.umi}`, family]));
+    await pool.close(); pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig);
+    log.push(`${now()} consensus memory: released preprocessing WASM heaps; using partition-local family models and scratch-backed result blocks`);
     log.push(`${now()} UMI model: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length} observed families; ${quality.bpbRejects} BPB rejects; ${umiFamilies.filter((row) => row.disposition === "likely_real").length} initially likely real`);
     status(`UMI model complete: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length.toLocaleString()} observed families`);
     stageStarted = recordTiming("umi", stageStarted, quality.demultiplexedReads - quality.downsampledReads);
 
-    const consensusParts = Array(countParts.length);
+    let consensusBlocks = 0;
     await Promise.all(pool.clients.map(async (_, worker) => {
-      for (let partition = worker; partition < consensusParts.length; partition += workers) {
-        const bytes = await store.readSelected(partition, cutoffValues), data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), cutoffCopy = cutoffs.slice().buffer;
+      for (let partition = worker; partition < countParts.length; partition += workers) {
+        const localFamilies = decodeFamilyCounts(countParts[partition]).map((entry) => familyByKey.get(`${entry.sample}\0${entry.umi}`)).filter(Boolean);
+        countParts[partition] = new Uint8Array();
+        const model = encodeFamilyModel(localFamilies), bytes = await store.readSelected(partition, cutoffValues);
+        const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), cutoffCopy = cutoffs.slice().buffer;
+        const modelData = model.buffer.slice(model.byteOffset, model.byteOffset + model.byteLength);
         if (process.env.WEBPORPID_DEBUG) status(`debug: worker ${worker} consensus partition ${partition} bytes=${bytes.byteLength}`);
-        const response = await pool.at(worker, { type: "consensus", bytes: data, cutoffs: cutoffCopy }, [data, cutoffCopy]);
-        consensusParts[partition] = decodeConsensusOutput(new Uint8Array(response), config);
+        const response = await pool.at(worker, { type: "consensus", bytes: data, cutoffs: cutoffCopy, model: modelData }, [data, cutoffCopy, modelData]);
+        await store.replaceWithResult(partition, new Uint8Array(response)); consensusBlocks++;
+        if (!(consensusBlocks % 8) || consensusBlocks === countParts.length) status(`consensus: ${consensusBlocks}/${countParts.length} read blocks complete and spooled`);
         if (process.env.WEBPORPID_DEBUG) status(`debug: worker ${worker} finished partition ${partition}`);
       }
     }));
-    const consensuses = consensusParts.flatMap((part) => part.consensuses).sort((a, b) => a.sampleIndex - b.sampleIndex || a.umi.localeCompare(b.umi));
-    const heteroduplexes = new Set(consensusParts.flatMap((part) => part.heteroduplexes));
-    const consensusByFamily = new Map(consensuses.map((record) => [`${record.sampleIndex}\0${record.umi}`, record]));
-    for (const family of umiFamilies) {
-      const key = `${family.sampleIndex}\0${family.umi}`; if (heteroduplexes.has(key)) family.disposition = "heteroduplex";
-      const consensus = consensusByFamily.get(key); if (consensus) family.minimumAgreement = consensus.minimumAgreement;
+    await pool.close(); status("consensus workers released; assembling spooled result blocks");
+    const consensuses = [], heteroduplexes = new Set();
+    for (let partition = 0; partition < countParts.length; partition++) {
+      const part = decodeConsensusOutput(await store.readResult(partition), config); consensuses.push(...part.consensuses);
+      for (const key of part.heteroduplexes) {
+        heteroduplexes.add(key); const family = familyByKey.get(key); if (family) family.disposition = "heteroduplex";
+      }
+      for (const consensus of part.consensuses) {
+        const family = familyByKey.get(`${consensus.sampleIndex}\0${consensus.umi}`); if (family) family.minimumAgreement = consensus.minimumAgreement;
+      }
     }
+    consensuses.sort((a, b) => a.sampleIndex - b.sampleIndex || a.umi.localeCompare(b.umi));
     log.push(`${now()} consensus: ${consensuses.length} sequences; ${heteroduplexes.size} heteroduplex families`);
     status(`consensus complete: ${consensuses.length.toLocaleString()} sequences`); await store.close();
     stageStarted = recordTiming("consensus", stageStarted, consensuses.length);

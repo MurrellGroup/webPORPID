@@ -206,7 +206,13 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     const functionalSource = object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`];
     const functionalRecords = functionalSource == null ? []
       : inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records;
-    const embeddedReferenceIndex = functionalRecords.findIndex((record) => record.name === FUNCTIONAL_REFERENCE_NAME);
+    const functionalReferenceSource = bundle.referenceAlignments == null ? undefined
+      : object(bundle.referenceAlignments, "referenceAlignments")[`${sample}/functional-nucleotide`];
+    const functionalReference = functionalReferenceSource == null ? undefined
+      : inspectAlignment(text(functionalReferenceSource, `referenceAlignments.${sample}/functional-nucleotide`), 1).records[0];
+    const embeddedReferenceIndex = functionalReference
+      ? functionalRecords.findIndex((record) => record.name === functionalReference.name && record.sequence === functionalReference.sequence)
+      : functionalRecords.findIndex((record) => record.name === FUNCTIONAL_REFERENCE_NAME);
     if (embeddedReferenceIndex > 0) throw new Error("The functional reference must be the first sequence in its alignment.");
     const hasEmbeddedFunctionalReference = embeddedReferenceIndex === 0;
     const functionalNames = new Set(functionalRecords.filter((_, index) => index !== embeddedReferenceIndex).map((record) => record.name));

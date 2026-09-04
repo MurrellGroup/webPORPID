@@ -235,11 +235,15 @@ function editWarnings(inspection: ReturnType<typeof validateCorrectedAlignment>)
   return warnings;
 }
 
-function referenceSequence(bundle: ResultBundle, sample: string, variant: AlignmentVariant = "collapsed"): string | undefined {
+function referenceRecord(bundle: ResultBundle, sample: string, variant: AlignmentVariant = "collapsed"): { name: string; sequence: string } | undefined {
   const fasta = bundle.referenceAlignments?.[alignmentKey(sample, variant)]
     ?? (variant === "uncollapsed" ? bundle.referenceAlignments?.[alignmentKey(sample)] : undefined);
   if (!fasta) return undefined;
-  try { return parseFasta(fasta)[0]?.sequence; } catch { return undefined; }
+  try { return parseFasta(fasta)[0]; } catch { return undefined; }
+}
+
+function referenceSequence(bundle: ResultBundle, sample: string, variant: AlignmentVariant = "collapsed"): string | undefined {
+  return referenceRecord(bundle, sample, variant)?.sequence;
 }
 
 function collapsedMetadata(groups: CollapseGroup[] | undefined): Record<string, LeafMetadata> {
@@ -255,8 +259,8 @@ function uncollapsedMetadata(records: PostprocRecord[]): Record<string, LeafMeta
   }));
 }
 
-function functionalMetadata(groups: CollapseGroup[] | undefined): Record<string, LeafMetadata> {
-  const entries: Array<[string, LeafMetadata]> = [[FUNCTIONAL_REFERENCE_NAME,
+function functionalMetadata(groups: CollapseGroup[] | undefined, referenceName = FUNCTIONAL_REFERENCE_NAME): Record<string, LeafMetadata> {
+  const entries: Array<[string, LeafMetadata]> = [[referenceName,
     { familyCount: 0, color: "#ffffff", category: "Functional reference" }]];
   for (const group of groups ?? []) if (group.functionalPass) {
     const metadata = { familyCount: group.familyCount };
@@ -289,10 +293,11 @@ function DonorView({ bundle, donorId }: { bundle: ResultBundle; donorId: string 
         const active = effectiveAlignment(bundle, configured.name, variant).fasta; if (!active) continue;
         const familyCounts = new Map((bundle.collapseGroups?.[configured.name] ?? []).flatMap((group) =>
           [[group.representativeId, group.familyCount] as const, [functionalSequenceName(group), group.familyCount] as const]));
+        const functionalReferenceName = variant === "functional" ? referenceRecord(bundle, configured.name, "functional")?.name : undefined;
         parseFasta(active).forEach((record, index) => rows.push({
           name: `${configured.name.replace(/[^A-Za-z0-9_.+-]/g, "_")}__${index + 1}__${record.name}`,
           sequence: record.sequence.replaceAll("-", "").toUpperCase().replaceAll("U", "T"), sample: configured.name,
-          familyCount: variant === "functional" && record.name === FUNCTIONAL_REFERENCE_NAME ? 0 : familyCounts.get(record.name) ?? 1,
+          familyCount: variant === "functional" && record.name === functionalReferenceName ? 0 : familyCounts.get(record.name) ?? 1,
         }));
       }
       if (!rows.length) throw new Error(`No ${variant} sequences are available for donor ${donorId}. Compute the required downstream stages first.`);
@@ -351,10 +356,11 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
   const collapsedTree = collapsed.edit?.treeNewick ?? bundle.trees[collapsed.key], uncollapsedTree = uncollapsed.edit?.treeNewick ?? bundle.trees[uncollapsed.key];
   const functionalTree = functional.edit?.treeNewick ?? bundle.trees[functional.key];
   const refSequence = useMemo(() => referenceSequence(bundle, sample), [bundle, sample]);
-  const functionalRefSequence = useMemo(() => referenceSequence(bundle, sample, "functional"), [bundle, sample]);
+  const functionalReference = useMemo(() => referenceRecord(bundle, sample, "functional"), [bundle, sample]);
+  const functionalRefSequence = functionalReference?.sequence;
   const collapsedTips = useMemo(() => collapsedMetadata(bundle.collapseGroups?.[sample]), [bundle, sample]);
   const uncollapsedTips = useMemo(() => uncollapsedMetadata(sampleRecords), [sampleRecords]);
-  const functionalTips = useMemo(() => functionalMetadata(bundle.collapseGroups?.[sample]), [bundle, sample]);
+  const functionalTips = useMemo(() => functionalMetadata(bundle.collapseGroups?.[sample], functionalReference?.name), [bundle, sample, functionalReference?.name]);
   const edited = Boolean(collapsed.edit || uncollapsed.edit || functional.edit);
   const contaminationDone = stageCompleted(bundle, "contamination"), postprocessingDone = stageCompleted(bundle, "postprocessing"), collapseDone = stageCompleted(bundle, "collapse");
   const donorIds = useMemo(() => [...new Set(bundle.config.samples.map((row) => row.donorId).filter((value): value is string => Boolean(value)))].sort(), [bundle]);
@@ -503,7 +509,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const targetSample = sampleRef.current, current = effectiveAlignment(bundleRef.current, targetSample, variant); if (!current.fasta) return;
     setAlignmentError(""); setAlignmentStatus("Opening the bundled Alivibe editor…");
     const applicationBase = new URL(import.meta.env.BASE_URL, document.baseURI), editorUrl = new URL("tools/alivibe.html", applicationBase);
-    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.11");
+    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.12");
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const popup = window.open(editorUrl.href, `webporpid-alivibe-${token}`, "popup,width=1500,height=920") as AlivibeEditorWindow | null;
     if (!popup) { setAlignmentError("The browser blocked the Alivibe window. Allow pop-ups for this site and try again."); return; }
@@ -549,7 +555,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const description = variant === "collapsed"
       ? "Identical retained consensuses are collapsed; bubble area represents UMI-family count, never read count. Minimum agreement remains a per-family property and is available in the uncollapsed view."
       : variant === "uncollapsed" ? "Every retained UMI-family consensus is shown separately and can be colored by its family minimum agreement."
-        : "The functional reference is the first row, followed by every passing collapsed variant labelled with abundance rank and its two-decimal reference match. The joint codon-aware alignment is clipped exactly to the reference endpoints.";
+        : "The supplied functional reference is profile-aligned into the fixed sample-protein MSA and retained as the first row under its FASTA name. Passing collapsed variants keep abundance rank and two-decimal reference match; the codon-aware alignment is clipped to the reference endpoints.";
     if (!current.fasta) return <div className="empty-state">No {variant} nucleotide alignment is available for this sample.</div>;
     const stale = Boolean(current.edit?.treeStale || (current.edit?.treeFingerprint && current.edit.treeFingerprint !== current.edit.editedFingerprint));
     return <section className="phylogeny-block" key={variant}><header><div><span className="section-kicker">{kicker}</span><h3>{heading}</h3><p>{description}</p><MethodLink topic={variant === "functional" ? "functional" : variant === "collapsed" ? "collapse" : "phylogeny"} /></div><div><button type="button" className={tree ? "" : "primary"} disabled={busy} onClick={() => void inferTree(variant)}>{busy ? "Running FastTree…" : tree ? "Recalculate tree" : "Infer tree"}</button></div></header>

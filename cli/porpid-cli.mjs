@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-CuMSsXhU.mjs";
-import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-DNMUfcBa.mjs";
-import { a as makeCutoffValues, c as mergeStats, i as decodeFamilyModel, n as decodeConsensusOutput, o as makeCutoffs, r as decodeFamilyCounts, s as mergeFamilyCounts } from "./chunks/wasm-runtime-Wv6FuJI8.mjs";
-import { n as createMafftRunner } from "./chunks/direct-mafft-IVivIuqW.mjs";
-import { t as filterQueriesAgainstPanel } from "./chunks/independent-panel-filter-DmDC1Ts9.mjs";
+import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-Bnko_59s.mjs";
+import { n as filterQueriesAgainstPanel, t as addSequenceToProfile } from "./chunks/independent-panel-filter-DTwAa3St.mjs";
+import { a as encodeFamilyModel, c as mergeFamilyCounts, i as decodeFamilyModel, l as mergeStats, n as decodeConsensusOutput, o as makeCutoffValues, r as decodeFamilyCounts, s as makeCutoffs } from "./chunks/wasm-runtime-D2YnsFQQ.mjs";
+import { n as createMafftRunner } from "./chunks/direct-mafft-W7tDpHgK.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -1442,13 +1442,12 @@ function backtranslate(alignedAminoAcids, codingNucleotides) {
 	return output;
 }
 /**
-* SeededAlignment's functional filter is codon-aware and evaluates every
-* sequence against one joint reference-anchored alignment.  Doing independent
-* nucleotide NW alignments introduced arbitrary one-base gaps and incorrectly
-* labeled almost every long-read sequence as a frameshift.  Translate first,
-* align the complete batch, and project gaps back as codon triplets instead.
+* Align the eligible sample ORFs in amino-acid space first, freeze that sample
+* profile, and add the translated reference without moving existing residues.
+* Projecting every resulting gap back as a codon triplet prevents an aligner
+* from manufacturing one- or two-base frameshifts.
 */
-async function functionalFilterBatch(reference, sequences, threshold, runMsa, signal) {
+async function functionalFilterBatch(referenceName, reference, sequences, threshold, runMsa, signal) {
 	const outcomes = Array(sequences.length), coding = [];
 	sequences.forEach((raw, index) => {
 		const sequence = degap(raw);
@@ -1469,12 +1468,16 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 		}
 	});
 	const referenceCoding = degap(reference).slice(0, Math.floor(degap(reference).length / 3) * 3);
+	const resolvedReferenceName = referenceName.trim() || "functional_reference";
 	if (!coding.length) return {
 		outcomes,
+		referenceName: resolvedReferenceName,
 		referenceNt: referenceCoding,
 		referenceAa: translate(referenceCoding)
 	};
-	const nucleotideAlignment = (await runScalableMsa([translate(referenceCoding), ...coding.map((row) => translate(row.sequence))], runMsa, signal, 3, "amino-acid")).map((row, index) => backtranslate(row, index ? coding[index - 1].sequence : referenceCoding));
+	const sampleAminoInputs = coding.map((row) => translate(row.sequence));
+	const withReference = addSequenceToProfile(sampleAminoInputs.length > 1 ? await runScalableMsa(sampleAminoInputs, runMsa, signal, 3, "amino-acid") : sampleAminoInputs, translate(referenceCoding));
+	const nucleotideAlignment = [withReference.sequence, ...withReference.profileRows].map((row, index) => backtranslate(row, index ? coding[index - 1].sequence : referenceCoding));
 	const alignedReference = nucleotideAlignment[0], first = alignedReference.search(/[^-]/);
 	let last = alignedReference.length - 1;
 	while (last >= first && alignedReference[last] === "-") last--;
@@ -1501,6 +1504,7 @@ async function functionalFilterBatch(reference, sequences, threshold, runMsa, si
 	});
 	return {
 		outcomes,
+		referenceName: resolvedReferenceName,
 		referenceNt: referenceRegion,
 		referenceAa: translateAlignedNucleotides(referenceRegion, 0)
 	};
@@ -1690,13 +1694,13 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 					fraction: (index + .45) / Math.max(1, config.samples.length),
 					detail: `Checking ${collapsedRows.length.toLocaleString()} collapsed variants against the functional reference for ${sample.name}`
 				});
-				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
 				const functionalNucleotideRows = [{
-					name: FUNCTIONAL_REFERENCE_NAME,
+					name: batch.referenceName,
 					sequence: batch.referenceNt
 				}];
 				const functionalProteinRows = [{
-					name: FUNCTIONAL_REFERENCE_NAME,
+					name: batch.referenceName,
 					sequence: batch.referenceAa
 				}];
 				let passedCount = 0;
@@ -1727,7 +1731,7 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 					alignments[`${sample.name}/functional-nucleotide`] = fasta$1(functionalNucleotideRows);
 					alignments[`${sample.name}/functional-protein`] = fasta$1(functionalProteinRows);
 					referenceAlignments[`${sample.name}/functional-nucleotide`] = fasta$1([{
-						name: FUNCTIONAL_REFERENCE_NAME,
+						name: batch.referenceName,
 						sequence: batch.referenceNt
 					}]);
 				}
@@ -3943,7 +3947,9 @@ function validateResult(value) {
 		if (uncollapsedByName.size !== uncollapsed.records.length) throw new Error("Uncollapsed sequence annotations do not resolve to unique consensus identifiers.");
 		const functionalSource = object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`];
 		const functionalRecords = functionalSource == null ? [] : inspectAlignment(text(functionalSource, `alignments.${sample}/functional-nucleotide`), 1).records;
-		const embeddedReferenceIndex = functionalRecords.findIndex((record) => record.name === FUNCTIONAL_REFERENCE_NAME);
+		const functionalReferenceSource = bundle.referenceAlignments == null ? void 0 : object(bundle.referenceAlignments, "referenceAlignments")[`${sample}/functional-nucleotide`];
+		const functionalReference = functionalReferenceSource == null ? void 0 : inspectAlignment(text(functionalReferenceSource, `referenceAlignments.${sample}/functional-nucleotide`), 1).records[0];
+		const embeddedReferenceIndex = functionalReference ? functionalRecords.findIndex((record) => record.name === functionalReference.name && record.sequence === functionalReference.sequence) : functionalRecords.findIndex((record) => record.name === FUNCTIONAL_REFERENCE_NAME);
 		if (embeddedReferenceIndex > 0) throw new Error("The functional reference must be the first sequence in its alignment.");
 		const hasEmbeddedFunctionalReference = embeddedReferenceIndex === 0;
 		const functionalNames = new Set(functionalRecords.filter((_, index) => index !== embeddedReferenceIndex).map((record) => record.name));
@@ -4600,7 +4606,7 @@ function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-pane
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.11";
+const VERSION = "0.3.12";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -4691,6 +4697,7 @@ var WorkerPool = class WorkerPool {
 	constructor(clients) {
 		this.clients = clients;
 		this.cursor = 0;
+		this.closed = false;
 	}
 	static async create(size, wasmPath, compiledConfig) {
 		const clients = [];
@@ -4716,6 +4723,8 @@ var WorkerPool = class WorkerPool {
 		return this.clients[index].call(message, transfer);
 	}
 	async close() {
+		if (this.closed) return;
+		this.closed = true;
 		await Promise.all(this.clients.map((client) => client.terminate()));
 	}
 };
@@ -4801,6 +4810,26 @@ var DiskPartitions = class DiskPartitions {
 		}
 		if (offset !== this.lengths[partition]) throw new Error("Temporary partition contains trailing spool bytes.");
 		return concatenateSpoolRecords(records);
+	}
+	async replaceWithResult(partition, bytes) {
+		await this.chains[partition];
+		const handle = this.handles[partition];
+		await handle.truncate(0);
+		let offset = 0;
+		while (offset < bytes.byteLength) {
+			const result = await handle.write(bytes, offset, bytes.byteLength - offset, offset);
+			if (!result.bytesWritten) throw new Error("Temporary consensus-result write was incomplete.");
+			offset += result.bytesWritten;
+		}
+		this.lengths[partition] = bytes.byteLength;
+	}
+	async readResult(partition) {
+		await this.chains[partition];
+		const bytes = new Uint8Array(this.lengths[partition]);
+		await this.readFully(partition, bytes, 0);
+		await this.handles[partition].truncate(0);
+		this.lengths[partition] = 0;
+		return bytes;
 	}
 	async close() {
 		if (this.closed) return;
@@ -4895,7 +4924,8 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 	const compiledConfig = compileConfig(config);
 	const configHash = createHash("sha256").update(JSON.stringify(resultConfig(config))).digest("hex"), inputHash = createHash("sha256");
 	status(`starting ${config.dataset} with ${workers} workers`);
-	const pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig), store = await DiskPartitions.create(config.parameters.spoolPartitions);
+	let pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig);
+	const store = await DiskPartitions.create(config.parameters.spoolPartitions);
 	const log = [
 		`${now()} webPORPID ${VERSION} started`,
 		`${now()} execution: ${workers} WASM workers; disk-backed partition spool`,
@@ -4956,51 +4986,71 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 				}, [data, cutoffCopy]));
 			}
 		}));
-		const mergedCounts = mergeFamilyCounts(countParts), decodedCounts = decodeFamilyCounts(mergedCounts);
+		let mergedCounts = mergeFamilyCounts(countParts);
+		const decodedCounts = decodeFamilyCounts(mergedCounts);
 		const selectedReadsBySample = Array(config.samples.length).fill(0);
 		for (const entry of decodedCounts) selectedReadsBySample[entry.sample] += entry.count;
 		const selectedReads = selectedReadsBySample.reduce((sum, count) => sum + count, 0);
 		quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
+		decodedCounts.length = 0;
 		const modelData = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
-		const familyModel = new Uint8Array(await pool.at(0, {
+		let familyModel = new Uint8Array(await pool.at(0, {
 			type: "buildModel",
 			bytes: modelData
 		}, [modelData]));
+		mergedCounts = new Uint8Array();
 		const umiFamilies = decodeFamilyModel(familyModel, config);
+		familyModel = new Uint8Array();
 		quality.bpbRejects = umiFamilies.filter((row) => row.disposition === "BPB-rejects").reduce((sum, row) => sum + row.familySize, 0);
-		await Promise.all(pool.clients.map((_, index) => {
-			const copy = familyModel.slice().buffer;
-			return pool.at(index, {
-				type: "initModel",
-				bytes: copy
-			}, [copy]);
-		}));
+		const familyByKey = new Map(umiFamilies.filter((family) => family.disposition !== "BPB-rejects").map((family) => [`${family.sampleIndex}\0${family.umi}`, family]));
+		await pool.close();
+		pool = await WorkerPool.create(workers, assets.wasmPath, compiledConfig);
+		log.push(`${now()} consensus memory: released preprocessing WASM heaps; using partition-local family models and scratch-backed result blocks`);
 		log.push(`${now()} UMI model: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length} observed families; ${quality.bpbRejects} BPB rejects; ${umiFamilies.filter((row) => row.disposition === "likely_real").length} initially likely real`);
 		status(`UMI model complete: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length.toLocaleString()} observed families`);
 		stageStarted = recordTiming("umi", stageStarted, quality.demultiplexedReads - quality.downsampledReads);
-		const consensusParts = Array(countParts.length);
+		let consensusBlocks = 0;
 		await Promise.all(pool.clients.map(async (_, worker) => {
-			for (let partition = worker; partition < consensusParts.length; partition += workers) {
-				const bytes = await store.readSelected(partition, cutoffValues), data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), cutoffCopy = cutoffs.slice().buffer;
+			for (let partition = worker; partition < countParts.length; partition += workers) {
+				const localFamilies = decodeFamilyCounts(countParts[partition]).map((entry) => familyByKey.get(`${entry.sample}\0${entry.umi}`)).filter(Boolean);
+				countParts[partition] = new Uint8Array();
+				const model = encodeFamilyModel(localFamilies), bytes = await store.readSelected(partition, cutoffValues);
+				const data = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength), cutoffCopy = cutoffs.slice().buffer;
+				const modelData = model.buffer.slice(model.byteOffset, model.byteOffset + model.byteLength);
 				if (process.env.WEBPORPID_DEBUG) status(`debug: worker ${worker} consensus partition ${partition} bytes=${bytes.byteLength}`);
 				const response = await pool.at(worker, {
 					type: "consensus",
 					bytes: data,
-					cutoffs: cutoffCopy
-				}, [data, cutoffCopy]);
-				consensusParts[partition] = decodeConsensusOutput(new Uint8Array(response), config);
+					cutoffs: cutoffCopy,
+					model: modelData
+				}, [
+					data,
+					cutoffCopy,
+					modelData
+				]);
+				await store.replaceWithResult(partition, new Uint8Array(response));
+				consensusBlocks++;
+				if (!(consensusBlocks % 8) || consensusBlocks === countParts.length) status(`consensus: ${consensusBlocks}/${countParts.length} read blocks complete and spooled`);
 				if (process.env.WEBPORPID_DEBUG) status(`debug: worker ${worker} finished partition ${partition}`);
 			}
 		}));
-		const consensuses = consensusParts.flatMap((part) => part.consensuses).sort((a, b) => a.sampleIndex - b.sampleIndex || a.umi.localeCompare(b.umi));
-		const heteroduplexes = new Set(consensusParts.flatMap((part) => part.heteroduplexes));
-		const consensusByFamily = new Map(consensuses.map((record) => [`${record.sampleIndex}\0${record.umi}`, record]));
-		for (const family of umiFamilies) {
-			const key = `${family.sampleIndex}\0${family.umi}`;
-			if (heteroduplexes.has(key)) family.disposition = "heteroduplex";
-			const consensus = consensusByFamily.get(key);
-			if (consensus) family.minimumAgreement = consensus.minimumAgreement;
+		await pool.close();
+		status("consensus workers released; assembling spooled result blocks");
+		const consensuses = [], heteroduplexes = /* @__PURE__ */ new Set();
+		for (let partition = 0; partition < countParts.length; partition++) {
+			const part = decodeConsensusOutput(await store.readResult(partition), config);
+			consensuses.push(...part.consensuses);
+			for (const key of part.heteroduplexes) {
+				heteroduplexes.add(key);
+				const family = familyByKey.get(key);
+				if (family) family.disposition = "heteroduplex";
+			}
+			for (const consensus of part.consensuses) {
+				const family = familyByKey.get(`${consensus.sampleIndex}\0${consensus.umi}`);
+				if (family) family.minimumAgreement = consensus.minimumAgreement;
+			}
 		}
+		consensuses.sort((a, b) => a.sampleIndex - b.sampleIndex || a.umi.localeCompare(b.umi));
 		log.push(`${now()} consensus: ${consensuses.length} sequences; ${heteroduplexes.size} heteroduplex families`);
 		status(`consensus complete: ${consensuses.length.toLocaleString()} sequences`);
 		await store.close();

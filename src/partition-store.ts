@@ -24,6 +24,8 @@ interface PartitionBackend {
   compact(cutoffs: readonly bigint[]): Promise<number>;
   seal(): Promise<void>;
   readSelected(partition: number, cutoffs: readonly bigint[]): Promise<Uint8Array>;
+  replaceWithResult(partition: number, bytes: Uint8Array): Promise<void>;
+  readResult(partition: number): Promise<Uint8Array>;
   sizes(): number[];
   close(): Promise<void>;
 }
@@ -143,8 +145,10 @@ class MemoryBackend implements PartitionBackend {
   private parts: Uint8Array[][];
   private lengths: number[];
   private maximumBytes: number;
+  private resultReady: boolean[];
   constructor(count: number, maximumBytes = 512 * 1024 * 1024) {
     this.maximumBytes = maximumBytes; this.parts = Array.from({ length: count }, () => []); this.lengths = Array(count).fill(0);
+    this.resultReady = Array(count).fill(false);
   }
   async append(partition: number, chunks: Uint8Array[]) {
     const added = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
@@ -163,8 +167,19 @@ class MemoryBackend implements PartitionBackend {
   }
   async seal() { /* memory is immediately readable */ }
   async readSelected(partition: number, cutoffs: readonly bigint[]) { return selectSpoolChunks(this.parts[partition], cutoffs); }
+  async replaceWithResult(partition: number, bytes: Uint8Array) {
+    const total = this.lengths.reduce((sum, value) => sum + value, 0) - this.lengths[partition] + bytes.byteLength;
+    if (total > this.maximumBytes) throw new Error("Consensus results exceeded the bounded in-memory scratch limit.");
+    this.parts[partition] = [bytes]; this.lengths[partition] = bytes.byteLength; this.resultReady[partition] = true;
+  }
+  async readResult(partition: number) {
+    if (!this.resultReady[partition]) throw new Error("A consensus-result partition is not ready.");
+    const bytes = concatenateChunks(this.parts[partition]);
+    this.parts[partition] = []; this.lengths[partition] = 0; this.resultReady[partition] = false;
+    return bytes;
+  }
   sizes() { return [...this.lengths]; }
-  async close() { this.parts = []; this.lengths = []; }
+  async close() { this.parts = []; this.lengths = []; this.resultReady = []; }
 }
 
 class OpfsBackend implements PartitionBackend {
@@ -174,12 +189,13 @@ class OpfsBackend implements PartitionBackend {
   private directoryName: string;
   private handles: FileSystemSyncAccessHandle[];
   private lengths: number[];
+  private resultReady: boolean[];
   private constructor(
     root: FileSystemDirectoryHandle,
     directoryName: string,
     handles: FileSystemSyncAccessHandle[],
     lengths: number[],
-  ) { this.root = root; this.directoryName = directoryName; this.handles = handles; this.lengths = lengths; }
+  ) { this.root = root; this.directoryName = directoryName; this.handles = handles; this.lengths = lengths; this.resultReady = Array(lengths.length).fill(false); }
 
   static async create(count: number) {
     const root = await navigator.storage.getDirectory();
@@ -255,6 +271,19 @@ class OpfsBackend implements PartitionBackend {
     if (offset !== this.lengths[partition]) throw new Error("OPFS contains trailing spool bytes.");
     return concatenateSpoolRecords(records);
   }
+  async replaceWithResult(partition: number, bytes: Uint8Array) {
+    const handle = this.handles[partition];
+    try {
+      handle.truncate(0); writeAllSync(handle, bytes, 0); handle.flush();
+      this.lengths[partition] = bytes.byteLength; this.resultReady[partition] = true;
+    } catch (cause) { throw await opfsWriteFailure(cause, this.lengths.reduce((sum, value) => sum + value, 0)); }
+  }
+  async readResult(partition: number) {
+    if (!this.resultReady[partition]) throw new Error("A consensus-result partition is not ready.");
+    const handle = this.handles[partition], bytes = new Uint8Array(this.lengths[partition]);
+    this.readFully(handle, bytes, 0); handle.truncate(0);
+    this.lengths[partition] = 0; this.resultReady[partition] = false; return bytes;
+  }
   sizes() { return [...this.lengths]; }
   async close() {
     if (this.closed) return; this.closed = true;
@@ -298,6 +327,7 @@ class ExternalDirectoryBackend implements PartitionBackend {
   private readonly lengths: number[];
   private readonly pending: Uint8Array[][];
   private readonly pendingBytes: number[];
+  private readonly resultReady: boolean[];
   private readonly flushThreshold: number;
   private sealed = false;
   private closed = false;
@@ -311,6 +341,7 @@ class ExternalDirectoryBackend implements PartitionBackend {
     this.root = root; this.directoryName = directoryName; this.directory = directory;
     this.fileHandles = Array(count); this.writers = Array(count); this.lengths = Array(count).fill(0);
     this.pending = Array.from({ length: count }, () => []); this.pendingBytes = Array(count).fill(0);
+    this.resultReady = Array(count).fill(false);
     this.flushThreshold = Math.max(256 * 1024, Math.min(4 * 1024 * 1024, Math.floor((64 * 1024 * 1024) / count)));
   }
 
@@ -379,6 +410,31 @@ class ExternalDirectoryBackend implements PartitionBackend {
     if (file.size !== this.lengths[partition]) throw new Error("An external scratch partition has an unexpected size.");
     const bytes = new Uint8Array(await file.arrayBuffer());
     return cutoffs.every((cutoff) => cutoff === MAX_SAMPLING_HASH) ? bytes : selectSpoolBuffer(bytes, cutoffs);
+  }
+
+  async replaceWithResult(partition: number, bytes: Uint8Array) {
+    if (!this.sealed) throw new Error("The external scratch spool must be sealed before storing consensus results.");
+    try {
+      const handle = this.fileHandles[partition]
+        ?? await this.directory.getFileHandle(`partition-${partition}.bin`, { create: true });
+      const writer = await handle.createWritable({ keepExistingData: false });
+      try { await writer.write(bytes); await writer.close(); }
+      catch (cause) { await writer.abort(cause).catch(() => undefined); throw cause; }
+      this.fileHandles[partition] = handle; this.lengths[partition] = bytes.byteLength; this.resultReady[partition] = true;
+    } catch (cause) {
+      throw new Error(`The selected scratch disk could not store a consensus-result block. ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    }
+  }
+
+  async readResult(partition: number) {
+    if (!this.resultReady[partition]) throw new Error("A consensus-result partition is not ready.");
+    const handle = this.fileHandles[partition]; if (!handle) throw new Error("A consensus-result scratch file is missing.");
+    const file = await handle.getFile();
+    if (file.size !== this.lengths[partition]) throw new Error("An external consensus-result partition has an unexpected size.");
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    await this.directory.removeEntry(`partition-${partition}.bin`);
+    this.fileHandles[partition] = undefined; this.lengths[partition] = 0; this.resultReady[partition] = false;
+    return bytes;
   }
 
   sizes() { return [...this.lengths]; }
@@ -479,6 +535,8 @@ export class PartitionStore {
   async seal() { return this.enqueue(() => this.backend.seal()); }
 
   async readSelected(partition: number, cutoffs: readonly bigint[]) { await this.tail; return this.backend.readSelected(partition, cutoffs); }
+  async replaceWithResult(partition: number, bytes: Uint8Array) { await this.tail; return this.backend.replaceWithResult(partition, bytes); }
+  async readResult(partition: number) { await this.tail; return this.backend.readResult(partition); }
   sizes() { return this.backend.sizes(); }
   statistics(): PartitionStoreStatistics {
     return {

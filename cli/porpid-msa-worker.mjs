@@ -1,4 +1,4 @@
-import { t as createDirectMsaRunner } from "./chunks/direct-msa-DNMUfcBa.mjs";
+import { t as createDirectMsaRunner } from "./chunks/direct-msa-Bnko_59s.mjs";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/porpid-msa-worker.mjs
 let wasmPath, runner;

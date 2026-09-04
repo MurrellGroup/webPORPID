@@ -63,7 +63,10 @@ export function chooseModalRootTip(
     // root. Missing/invalid weights still retain the ordinary one-row weight.
     const weight = Number.isFinite(rawWeight) && rawWeight >= 0 ? rawWeight : 1;
     const group = groups.get(sequence);
-    if (group) { group.representedFamilies += weight; group.matchingTips += 1; }
+    if (group) {
+      if (group.representedFamilies === 0 && weight > 0) group.firstIndex = index;
+      group.representedFamilies += weight; group.matchingTips += 1;
+    }
     else groups.set(sequence, { firstIndex: index, representedFamilies: weight, matchingTips: 1 });
   });
   // In a tie, retain the earliest FASTA row. This is deterministic and does
@@ -156,6 +159,43 @@ function AlignmentCanvas({ sequences, columns, labels, modal, alphabet, highligh
     const index = Math.floor((scrollRef.current!.scrollTop + event.nativeEvent.offsetY - RULER_HEIGHT) / rowHeight);
     if (index >= 0 && index < sequences.length) onSelect(index);
   }}><div style={{ width: Math.max(size.width, columns.length * cellWidth), height: Math.max(size.height, RULER_HEIGHT + sequences.length * rowHeight), position: "relative" }}><canvas ref={canvas} /></div></div>;
+}
+
+/** Canvas-virtualized name gutter used while a tree has not been inferred. */
+function AlignmentNameCanvas({ names, rowHeight, selected, onSelect, scrollRef, peerRef }: {
+  names: string[]; rowHeight: number; selected: number; onSelect(index: number): void;
+  scrollRef: React.RefObject<HTMLDivElement | null>; peerRef: React.RefObject<HTMLDivElement | null>;
+}) {
+  const canvas = useRef<HTMLCanvasElement>(null), size = useViewportSize(scrollRef);
+  useEffect(() => {
+    const container = scrollRef.current, target = canvas.current; if (!container || !target) return;
+    const draw = () => {
+      const context = canvasResolution(target, size.width, size.height), top = container.scrollTop;
+      const firstRow = Math.max(0, Math.floor((top - RULER_HEIGHT) / rowHeight));
+      const lastRow = Math.min(names.length, Math.ceil((top + size.height - RULER_HEIGHT) / rowHeight) + 1);
+      context.clearRect(0, 0, size.width, size.height); context.textAlign = "left"; context.textBaseline = "middle";
+      context.font = `${Math.min(11, rowHeight - 5)}px ui-monospace,monospace`;
+      for (let row = firstRow; row < lastRow; row++) {
+        const y = RULER_HEIGHT + row * rowHeight - top;
+        context.fillStyle = row === selected ? "#e2ece7" : row % 2 ? "#faf9f4" : "#ffffff";
+        context.fillRect(0, y, size.width, rowHeight);
+        context.fillStyle = "#263630"; context.fillText(shortName(names[row], 38), 8, y + rowHeight / 2);
+      }
+      context.fillStyle = "#f1f2ed"; context.fillRect(0, 0, size.width, RULER_HEIGHT);
+      context.fillStyle = "#596862"; context.font = "700 9px ui-monospace,monospace"; context.fillText("SEQUENCE", 8, RULER_HEIGHT / 2);
+      context.strokeStyle = "#aeb8b2"; context.beginPath(); context.moveTo(0, RULER_HEIGHT - .5); context.lineTo(size.width, RULER_HEIGHT - .5); context.stroke();
+    };
+    draw();
+    const sync = () => {
+      if (peerRef.current && Math.abs(peerRef.current.scrollTop - container.scrollTop) > 1) peerRef.current.scrollTop = container.scrollTop;
+      draw();
+    };
+    container.addEventListener("scroll", sync, { passive: true }); return () => container.removeEventListener("scroll", sync);
+  }, [names, rowHeight, selected, size, scrollRef, peerRef]);
+  return <div ref={scrollRef} className="alignment-name-viewport" onPointerDown={(event) => {
+    const index = Math.floor((scrollRef.current!.scrollTop + event.nativeEvent.offsetY - RULER_HEIGHT) / rowHeight);
+    if (index >= 0 && index < names.length) onSelect(index);
+  }}><div style={{ height: Math.max(size.height, RULER_HEIGHT + names.length * rowHeight), position: "relative" }}><canvas ref={canvas} /></div></div>;
 }
 
 function niceScale(maximum: number): number {
@@ -305,7 +345,7 @@ export function AlignmentTreeViewer({ fasta, newick, alphabet = "nt", onAlphabet
   const [highlighter, setHighlighter] = useState(false), [showNames, setShowNames] = useState(true), [showMutations, setShowMutations] = useState(false);
   const [mutationLimit, setMutationLimit] = useState(2), [bubbleAreaPerFamily, setBubbleAreaPerFamily] = useState(DEFAULT_BUBBLE_AREA_PER_FAMILY), [colorByAgreement, setColorByAgreement] = useState(false);
   const [regionDraft, setRegionDraft] = useState(""), [regionText, setRegionText] = useState(""), [coordinateUnits, setCoordinateUnits] = useState<CoordinateUnits>(alphabet);
-  const treeScroll = useRef<HTMLDivElement>(null), alignmentScroll = useRef<HTMLDivElement>(null), svgRef = useRef<SVGSVGElement>(null);
+  const treeScroll = useRef<HTMLDivElement>(null), nameScroll = useRef<HTMLDivElement>(null), alignmentScroll = useRef<HTMLDivElement>(null), svgRef = useRef<SVGSVGElement>(null);
   const parsed = useMemo(() => {
     if (!newick) return { tree: undefined, error: "" };
     try { return { tree: parseNewick(newick), error: "" }; }
@@ -382,9 +422,10 @@ export function AlignmentTreeViewer({ fasta, newick, alphabet = "nt", onAlphabet
     {tipLegend.length > 0 && <div className="viewer-tip-legend">{tipLegend.map((entry) => <span key={entry.label}><i style={{ background: entry.color }} />{entry.label}</span>)}</div>}
     {regionText && columns.length > 0 && <div className="viewer-status region-active">Reference-region filter active: {regionText} ({coordinateUnits.toUpperCase()} coordinates). Press Show all to restore every alignment column.</div>}
     {regionText && !columns.length && <div className="viewer-status warning">No displayed columns matched those reference coordinates.</div>}
-    <div className={`viewer-grid ${displayTree ? "with-tree" : "alignment-only"}`} style={displayTree ? { gridTemplateColumns: `${treeWidth}px minmax(0,1fr)` } : undefined}>
+    <div className={`viewer-grid ${displayTree ? "with-tree" : showNames ? "with-names" : "alignment-only"}`} style={displayTree ? { gridTemplateColumns: `${treeWidth}px minmax(0,1fr)` } : undefined}>
       {displayTree && <TreeSvg root={displayTree} width={treeWidth} rowHeight={rowHeight} selected={selected} onSelect={setSelected} scrollRef={treeScroll} peerRef={alignmentScroll} svgRef={svgRef} layoutMode={layoutMode} showNames={showNames} leafMetadata={normalizedLeafMetadata} leafLabels={leafLabels} bubbleAreaPerFamily={bubbleAreaPerFamily} colorByAgreement={colorByAgreement} mutations={mutations} mutationLimit={mutationLimit} />}
-      <AlignmentCanvas sequences={sequences} columns={columns} labels={labels} modal={modal} alphabet={alphabet} highlighter={highlighter} rowHeight={rowHeight} cellWidth={cellWidth} selected={selected} onSelect={setSelected} scrollRef={alignmentScroll} peerRef={treeScroll} />
+      {!displayTree && showNames && <AlignmentNameCanvas names={orderedRecords.map((record) => record.name)} rowHeight={rowHeight} selected={selected} onSelect={setSelected} scrollRef={nameScroll} peerRef={alignmentScroll} />}
+      <AlignmentCanvas sequences={sequences} columns={columns} labels={labels} modal={modal} alphabet={alphabet} highlighter={highlighter} rowHeight={rowHeight} cellWidth={cellWidth} selected={selected} onSelect={setSelected} scrollRef={alignmentScroll} peerRef={displayTree ? treeScroll : nameScroll} />
     </div>
     <footer><strong>{orderedRecords[selected]?.name ?? "No sequence"}</strong><span>{orderedRecords.length.toLocaleString()} rows × {(sequences[0]?.length ?? 0).toLocaleString()} columns · {highlighter ? "modal highlighter" : "residue colors"} · alignment cells are canvas-virtualized</span></footer>
   </section>;

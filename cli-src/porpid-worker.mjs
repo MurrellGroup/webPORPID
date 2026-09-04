@@ -13,7 +13,10 @@ async function handle(message) {
   if (message.type === "countFamilies") return runtime.countFamilies(new Uint8Array(message.bytes), new Uint8Array(message.cutoffs));
   if (message.type === "buildModel") return runtime.buildFamilyModel(new Uint8Array(message.bytes));
   if (message.type === "initModel") { runtime.initFamilyModel(new Uint8Array(message.bytes)); return { ready: true }; }
-  if (message.type === "consensus") return runtime.consensus(new Uint8Array(message.bytes), new Uint8Array(message.cutoffs));
+  if (message.type === "consensus") {
+    if (message.model) runtime.initFamilyModel(new Uint8Array(message.model));
+    return runtime.consensus(new Uint8Array(message.bytes), new Uint8Array(message.cutoffs));
+  }
   if (message.type === "stats") return runtime.stats();
   throw new Error(`Unknown porpid-cli worker request ${message.type}.`);
 }

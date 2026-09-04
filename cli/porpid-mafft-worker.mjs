@@ -1,4 +1,4 @@
-import { t as createDirectMafftRunner } from "./chunks/direct-mafft-IVivIuqW.mjs";
+import { t as createDirectMafftRunner } from "./chunks/direct-mafft-W7tDpHgK.mjs";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/porpid-mafft-worker.mjs
 let key = "", runner;

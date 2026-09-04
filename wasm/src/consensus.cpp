@@ -427,7 +427,7 @@ std::vector<std::uint8_t> process_consensus_partition(std::span<const std::uint8
                                                       const std::vector<FamilyDecision>& model,
                                                       const Config& config, std::string& error) {
   const auto thresholds = cutoffs(cutoff_bytes, error); if (!error.empty()) return {};
-  const auto records = decode_spool(bytes, error); if (!error.empty()) return {};
+  auto records = decode_spool(bytes, error); if (!error.empty()) return {};
   const auto key = [](std::uint16_t sample, std::string_view umi) { return std::to_string(sample) + '\0' + std::string(umi); };
   std::unordered_map<std::string, const FamilyDecision*> decisions;
   for (const auto& decision : model) decisions.emplace(key(decision.sample, decision.umi), &decision);
@@ -436,9 +436,9 @@ std::vector<std::uint8_t> process_consensus_partition(std::span<const std::uint8
   // within-family read order is still restored explicitly below.
   std::unordered_map<std::string, std::vector<SpoolRecord>> grouped;
   grouped.reserve(std::min(records.size(), model.size()));
-  for (const auto& record : records) if (selected(record, thresholds)) {
+  for (auto& record : records) if (selected(record, thresholds)) {
     auto family_key = key(record.sample, record.umi);
-    if (decisions.contains(family_key)) grouped[std::move(family_key)].push_back(record);
+    if (decisions.contains(family_key)) grouped[std::move(family_key)].push_back(std::move(record));
   }
   std::vector<ConsensusRecord> consensuses;
   std::vector<std::pair<std::uint16_t, std::string>> heteroduplexes;

@@ -1,6 +1,6 @@
 import { effectiveAlignment, inspectAlignment, type AlignmentVariant } from "./alignment-utils.ts";
-import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceName } from "./sequence-names.ts";
-import { layoutTree, parseNewick, rootOnOutgroup, type TreeNode } from "./tree.ts";
+import { functionalSequenceName, uncollapsedSequenceName } from "./sequence-names.ts";
+import { ladderizeTree, layoutTree, parseNewick, rootOnOutgroup, type TreeNode } from "./tree.ts";
 import { treeTipNames } from "./tree-names.ts";
 import type { ResultBundle } from "./types.ts";
 
@@ -50,7 +50,15 @@ function familyCounts(bundle: ResultBundle, sample: string, variant: AlignmentVa
       if (group.functionalPass) result.set(functionalSequenceName(group), group.familyCount);
     }
   }
-  if (variant === "functional") result.set(FUNCTIONAL_REFERENCE_NAME, 0);
+  if (variant === "functional") {
+    const reference = bundle.referenceAlignments?.[`${sample}/functional-nucleotide`];
+    if (reference) {
+      try {
+        const row = inspectAlignment(reference, 1).records[0];
+        if (row) result.set(row.name, 0);
+      } catch { /* malformed result files are rejected before export */ }
+    }
+  }
   return result;
 }
 
@@ -58,7 +66,7 @@ function modalTip(records: readonly { name: string; sequence: string }[], safeNa
   const groups = new Map<string, { weight: number; index: number }>();
   records.forEach((record, index) => {
     const sequence = record.sequence.toUpperCase(), weight = counts.get(record.name) ?? 1, current = groups.get(sequence);
-    if (current) current.weight += weight;
+    if (current) { if (current.weight === 0 && weight > 0) current.index = index; current.weight += weight; }
     else groups.set(sequence, { weight, index });
   });
   let best: { sequence: string; weight: number; index: number } | undefined;
@@ -90,6 +98,7 @@ export function staticTreeHighlighterSvg(bundle: ResultBundle, sample: string, v
 
     const counts = familyCounts(bundle, sample, variant), modal = modalTip(records, safeNames, counts);
     if (modal) root = rootOnOutgroup(root, modal.treeName);
+    root = ladderizeTree(root, "small-first");
     const byTreeName = new Map(safeNames.map((name, index) => [name, records[index]]));
     const layout = layoutTree(root, TREE_BRANCH_WIDTH, ROW_HEIGHT, "phylogram", 0, TOP);
     const leafNodes = layout.nodes.filter((node) => !node.children.length).sort((left, right) => left.y - right.y);
@@ -97,7 +106,7 @@ export function staticTreeHighlighterSvg(bundle: ResultBundle, sample: string, v
     const title = `${sample} ${label} phylogram and modal-sequence highlighter`;
     const parts: string[] = [
       `<svg xmlns="http://www.w3.org/2000/svg" width="${WIDTH}" height="${height}" viewBox="0 0 ${WIDTH} ${height}" role="img" aria-label="${xml(title)}">`,
-      `<title>${xml(title)}</title><desc>The tree and modal-sequence highlighter each occupy half the plot width. Tip-circle area is exactly ${BUBBLE_AREA_PER_FAMILY} square pixels per represented UMI family.</desc>`,
+      `<title>${xml(title)}</title><desc>The tree and modal-sequence highlighter each occupy half the plot width. Small clades are shown first. Tip-circle area is exactly ${BUBBLE_AREA_PER_FAMILY} square pixels per represented UMI family; variants above ten percent of sampled families are red.</desc>`,
       `<rect width="${WIDTH}" height="${height}" fill="#ffffff"/>`,
     ];
 
@@ -120,17 +129,20 @@ export function staticTreeHighlighterSvg(bundle: ResultBundle, sample: string, v
       parts.push(`<path d="M${edge.parent.x},${edge.parent.y} V${edge.child.y} H${edge.child.x}" fill="none" stroke="#111" stroke-width="1.25"/>`);
 
     const modalSequence = modal?.sequence ?? records[0]?.sequence.toUpperCase() ?? "";
+    const representedFamilyTotal = records.reduce((sum, record) => sum + Math.max(0, counts.get(record.name) ?? 1), 0);
     for (const node of leafNodes) {
       const record = byTreeName.get(node.name);
       if (!record) continue;
-      const count = counts.get(record.name) ?? 1, isReference = count === 0 || record.name === FUNCTIONAL_REFERENCE_NAME;
+      const count = counts.get(record.name) ?? 1, isReference = count === 0;
       if (isReference) {
         parts.push(`<rect x="${node.x - 3.5}" y="${node.y - 3.5}" width="7" height="7" fill="#ffffff" stroke="#d49a19" stroke-width="1.5"><title>Functional reference</title></rect>`);
       } else {
-        const radius = Math.sqrt(count * BUBBLE_AREA_PER_FAMILY / Math.PI), fill = node.name === modal?.treeName ? "#ff6f69" : "#4f4f4f";
-        parts.push(`<circle cx="${node.x}" cy="${node.y}" r="${radius}" fill="${fill}" fill-opacity="0.82"><title>${xml(`${record.name}; ${count} UMI ${count === 1 ? "family" : "families"}`)}</title></circle>`);
+        const radius = Math.sqrt(count * BUBBLE_AREA_PER_FAMILY / Math.PI), abundant = count / Math.max(1, representedFamilyTotal) > .1;
+        const fill = abundant ? "#FF0000" : "#000000";
+        parts.push(`<circle cx="${node.x}" cy="${node.y}" r="${radius}" fill="${fill}" fill-opacity="0.6"><title>${xml(`${record.name}; ${count} UMI ${count === 1 ? "family" : "families"}`)}</title></circle>`);
       }
-      parts.push(`<text x="${node.x + (isReference ? 7 : Math.sqrt(Math.max(0, count) * BUBBLE_AREA_PER_FAMILY / Math.PI) + 4)}" y="${node.y + 3}" font-family="Arial,sans-serif" font-size="8" font-weight="600" fill="${node.name === modal?.treeName ? "#d5322f" : "#111"}">${xml(record.name)}</text>`);
+      const abundant = !isReference && count / Math.max(1, representedFamilyTotal) > .1;
+      parts.push(`<text x="${node.x + (isReference ? 7 : Math.sqrt(Math.max(0, count) * BUBBLE_AREA_PER_FAMILY / Math.PI) + 4)}" y="${node.y + 3}" font-family="Arial,sans-serif" font-size="8" font-weight="600" fill="${abundant ? "#FF0000" : "#111"}">${xml(record.name)}</text>`);
 
       const sequence = record.sequence.toUpperCase();
       let start = 0;
@@ -152,7 +164,8 @@ export function staticTreeHighlighterSvg(bundle: ResultBundle, sample: string, v
 
     const scale = niceStep(layout.maximumDistance), scalePixels = scale / Math.max(layout.maximumDistance, scale) * (TREE_BRANCH_WIDTH - 48), footerY = bottom + 55;
     if (layout.maximumDistance > 0) parts.push(`<line x1="320" x2="${320 + scalePixels}" y1="${footerY}" y2="${footerY}" stroke="#111" stroke-width="4"/><text x="${320 + scalePixels / 2}" y="${footerY + 24}" text-anchor="middle" font-family="Arial,sans-serif" font-size="14">${scale.toPrecision(2)} substitutions/site</text>`);
-    parts.push(`<text x="20" y="${height - 18}" font-family="Arial,sans-serif" font-size="11">Tip-circle area = ${BUBBLE_AREA_PER_FAMILY} px² × represented UMI-family count (no floor or cap)</text>`);
+    parts.push(`<text x="20" y="${height - 24}" font-family="Arial,sans-serif" font-size="11">Tip-circle area = ${BUBBLE_AREA_PER_FAMILY} px² × represented UMI-family count (no floor or cap)</text>`);
+    parts.push(`<text x="20" y="${height - 9}" font-family="Arial,sans-serif" font-size="10" fill="#FF0000">Red = variant represents &gt;10% of sampled UMI families · tip order = small clades first</text>`);
     const legend = [["A", COLORS.A], ["G", COLORS.G], ["T", COLORS.T], ["C", COLORS.C], ["−", COLORS["-"]]] as const;
     legend.forEach(([base, color], index) => {
       const x = MATRIX_LEFT + 25 + index * 140;

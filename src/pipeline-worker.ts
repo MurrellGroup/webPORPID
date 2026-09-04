@@ -99,7 +99,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   // the fixed C++ configuration ABI (for example the panel-filter strategy).
   const configForHash = new TextEncoder().encode(JSON.stringify(resultConfig(request.config))).buffer as ArrayBuffer;
   const [module, configHashBytes] = await Promise.all([compileCore(), crypto.subtle.digest("SHA-256", configForHash)]);
-  const pool = await CoreWorkerPool.create(workers, module, compiledConfig);
+  let pool = await CoreWorkerPool.create(workers, module, compiledConfig);
   let store: PartitionStore;
   try {
     store = await PartitionStore.create(request.config.parameters.spoolPartitions, {
@@ -108,10 +108,10 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       requestPersistence: request.file.size >= 256 * 1024 * 1024,
       externalDirectory: request.spoolStorage === "external-directory" ? request.scratchDirectory : undefined,
     });
-  } catch (cause) { pool.close(); throw cause; }
+  } catch (cause) { await pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.11 started`,
+	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.12 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}, panel_filter=${request.config.parameters.panelFilterMode ?? "mafft-batch"}`];
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
@@ -196,16 +196,19 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       }
     }));
     progress({ stage: "umi", fraction: .64, detail: "Combining UMI counts across all temporary read blocks", readBlocks: [...readBlocks] });
-    const mergedCounts = mergeFamilyCounts(countParts), decodedCounts = decodeFamilyCounts(mergedCounts);
+    let mergedCounts = mergeFamilyCounts(countParts); const decodedCounts = decodeFamilyCounts(mergedCounts);
     const selectedReadsBySample = Array(request.config.samples.length).fill(0) as number[];
     for (const entry of decodedCounts) selectedReadsBySample[entry.sample] += entry.count;
     const selectedReads = selectedReadsBySample.reduce((sum, count) => sum + count, 0);
     quality.downsampledReads = Math.max(0, quality.demultiplexedReads - selectedReads);
+    decodedCounts.length = 0;
     const modelBuffer = mergedCounts.buffer.slice(mergedCounts.byteOffset, mergedCounts.byteOffset + mergedCounts.byteLength);
     progress({ stage: "umi", fraction: .72, detail: "Fitting the global UMI offspring-probability model and classifying families", readBlocks: [...readBlocks] });
     let familyModel = new Uint8Array(await pool.at<ArrayBuffer>(0, { type: "buildModel", bytes: modelBuffer }, [modelBuffer]));
+    mergedCounts = new Uint8Array();
     progress({ stage: "umi", fraction: .84, detail: "Preparing the inspectable UMI-family decisions", readBlocks: [...readBlocks] });
     const umiFamilies = decodeFamilyModel(familyModel, request.config);
+    familyModel = new Uint8Array();
     quality.bpbRejects = umiFamilies.filter((row) => row.disposition === "BPB-rejects").reduce((sum, row) => sum + row.familySize, 0);
     if (request.interactiveFiltering) {
       progress({ stage: "umi", fraction: .86, detail: "UMI probability calculations are complete; waiting for threshold review", readBlocks: [...readBlocks] });
@@ -217,45 +220,57 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       stageStarted += pauseMs; // Human review time is not computational UMI time.
       if (selection.id !== review.id || selection.phase !== review.phase) throw new Error("The interactive UMI-threshold response did not match the open checkpoint.");
       const accepted = applyThresholdSelection(request.config, umiFamilies, selection); thresholdSelections.push(accepted);
-      familyModel = new Uint8Array(encodeFamilyModel(umiFamilies));
       for (const change of accepted.changes) log.push(`${now()} interactive UMI threshold: ${change}`);
       progress({ stage: "umi", fraction: .88, detail: "Accepted UMI thresholds; updating family decisions for every observed UMI", readBlocks: [...readBlocks] });
     }
-    progress({ stage: "umi", fraction: .9, detail: "Sending the fitted UMI model to the consensus workers", readBlocks: [...readBlocks] });
-    await Promise.all(pool.clients.map((_, index) => {
-      const copy = familyModel.slice().buffer; return pool.at(index, { type: "initModel", bytes: copy }, [copy]);
-    }));
+    const familyByKey = new Map<string, (typeof umiFamilies)[number]>(umiFamilies.filter((family) => family.disposition !== "BPB-rejects")
+      .map((family) => [`${family.sampleIndex}\0${family.umi}`, family] as const));
+    progress({ stage: "umi", fraction: .9, detail: "Releasing preprocessing memory and starting clean consensus workers", readBlocks: [...readBlocks] });
+    await pool.close(); pool = await CoreWorkerPool.create(partitionWorkers, module, compiledConfig);
+    log.push(`${now()} consensus memory: released preprocessing WASM heaps; using ${partitionWorkers} clean workers with partition-local family models and scratch-backed result blocks`);
     progress({ stage: "umi", fraction: 1, detail: `UMI grouping complete: ${umiFamilies.filter((row) => row.disposition === "likely_real").length.toLocaleString()} families selected for consensus calling`, readBlocks: [...readBlocks] });
     log.push(`${now()} UMI model: ${umiFamilies.filter((row) => row.disposition !== "BPB-rejects").length} observed families; ${quality.bpbRejects} BPB rejects; ${umiFamilies.filter((row) => row.disposition === "likely_real").length} initially likely real`);
     stageStarted = recordTiming("umi", stageStarted, quality.demultiplexedReads - quality.downsampledReads);
 
-    progress({ stage: "consensus", fraction: 0, detail: "Starting indel-aware consensus calling for selected UMI families", readBlocks: [...readBlocks] });
-    const consensusParts: ReturnType<typeof decodeConsensusOutput>[] = Array(countParts.length);
-    let consensusPartitions = 0, consensusSequences = 0;
+    readBlocks.fill("waiting");
+    progress({ stage: "consensus", fraction: 0, detail: "Starting indel-aware consensus calling; completed blocks are written back to scratch immediately", readBlocks: [...readBlocks] });
+    let consensusPartitions = 0;
     await Promise.all(pool.clients.slice(0, partitionWorkers).map(async (_, worker) => {
-      for (let partition = worker; partition < consensusParts.length; partition += partitionWorkers) {
+      for (let partition = worker; partition < countParts.length; partition += partitionWorkers) {
         if (signal.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
-        progress({ stage: "consensus", fraction: .9 * consensusPartitions / Math.max(1, consensusParts.length), detail: `Loading temporary read block ${partition + 1} of ${consensusParts.length} for consensus calling`, readBlocks: [...readBlocks] });
-        const bytes = await store.readSelected(partition, cutoffValues), buffer = transferableBuffer(bytes), cutoffCopy = cutoffs.slice().buffer;
-        const response = await pool.at<ArrayBuffer>(worker, { type: "consensus", bytes: buffer, cutoffs: cutoffCopy }, [buffer, cutoffCopy]);
-        consensusParts[partition] = decodeConsensusOutput(new Uint8Array(response), request.config);
-        readBlocks[partition] = "complete"; consensusPartitions++; consensusSequences += consensusParts[partition].consensuses.length;
-        progress({ stage: "consensus", fraction: .9 * consensusPartitions / consensusParts.length,
-          detail: `Finished ${consensusPartitions} of ${consensusParts.length} read blocks; ${consensusSequences.toLocaleString()} consensus sequences called`, readBlocks: [...readBlocks] });
+        progress({ stage: "consensus", fraction: .82 * consensusPartitions / Math.max(1, countParts.length), detail: `Loading temporary read block ${partition + 1} of ${countParts.length}`, readBlocks: [...readBlocks] });
+        const localFamilies = decodeFamilyCounts(countParts[partition]).map((entry) => familyByKey.get(`${entry.sample}\0${entry.umi}`))
+          .filter((family): family is (typeof umiFamilies)[number] => Boolean(family));
+        countParts[partition] = new Uint8Array();
+        const model = encodeFamilyModel(localFamilies), bytes = await store.readSelected(partition, cutoffValues);
+        const buffer = transferableBuffer(bytes), cutoffCopy = cutoffs.slice().buffer, modelBuffer = transferableBuffer(model);
+        readBlocks[partition] = "loaded";
+        progress({ stage: "consensus", fraction: .82 * consensusPartitions / Math.max(1, countParts.length),
+          detail: `Calling consensuses for read block ${partition + 1} of ${countParts.length} (${localFamilies.length.toLocaleString()} UMI families)`, readBlocks: [...readBlocks] });
+        const response = await pool.at<ArrayBuffer>(worker,
+          { type: "consensus", bytes: buffer, cutoffs: cutoffCopy, model: modelBuffer }, [buffer, cutoffCopy, modelBuffer]);
+        await store.replaceWithResult(partition, new Uint8Array(response));
+        readBlocks[partition] = "complete"; consensusPartitions++;
+        progress({ stage: "consensus", fraction: .82 * consensusPartitions / countParts.length,
+          detail: `Finished and spooled ${consensusPartitions} of ${countParts.length} consensus blocks`, readBlocks: [...readBlocks] });
       }
     }));
-    progress({ stage: "consensus", fraction: .93, detail: "Combining consensus calls and checking for heteroduplex UMI families", readBlocks: [...readBlocks] });
-    const consensuses = consensusParts.flatMap((part) => part.consensuses).sort((a, b) => a.sampleIndex - b.sampleIndex || a.umi.localeCompare(b.umi));
-    const heteroduplexes = new Set(consensusParts.flatMap((part) => part.heteroduplexes));
-    const consensusByFamily = new Map<string, (typeof consensuses)[number]>(
-      consensuses.map((record) => [`${record.sampleIndex}\0${record.umi}`, record]),
-    );
-    for (const family of umiFamilies) {
-      const key = `${family.sampleIndex}\0${family.umi}`;
-      if (heteroduplexes.has(key)) family.disposition = "heteroduplex";
-      const consensus = consensusByFamily.get(key);
-      if (consensus) family.minimumAgreement = consensus.minimumAgreement;
+    await pool.close();
+    progress({ stage: "consensus", fraction: .84, detail: "Consensus workers released; assembling compact result blocks one at a time", readBlocks: [...readBlocks] });
+    const consensuses: ReturnType<typeof decodeConsensusOutput>["consensuses"] = [], heteroduplexes = new Set<string>();
+    for (let partition = 0; partition < countParts.length; partition++) {
+      const part = decodeConsensusOutput(await store.readResult(partition), request.config);
+      consensuses.push(...part.consensuses);
+      for (const key of part.heteroduplexes) {
+        heteroduplexes.add(key); const family = familyByKey.get(key); if (family) family.disposition = "heteroduplex";
+      }
+      for (const consensus of part.consensuses) {
+        const family = familyByKey.get(`${consensus.sampleIndex}\0${consensus.umi}`); if (family) family.minimumAgreement = consensus.minimumAgreement;
+      }
+      progress({ stage: "consensus", fraction: .84 + .14 * (partition + 1) / countParts.length,
+        detail: `Assembled ${partition + 1} of ${countParts.length} result blocks; ${consensuses.length.toLocaleString()} consensus sequences`, readBlocks: [...readBlocks] });
     }
+    consensuses.sort((a, b) => a.sampleIndex - b.sampleIndex || a.umi.localeCompare(b.umi));
     log.push(`${now()} consensus: ${consensuses.length} sequences; ${heteroduplexes.size} heteroduplex families`);
     progress({ stage: "consensus", fraction: .99, detail: "Consensus calls are complete; removing temporary read files", readBlocks: [...readBlocks] });
     await store.close();
@@ -442,7 +457,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.11", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.12", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
@@ -459,7 +474,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       optionalStages, postprocessingContaminationMode, timings, thresholdSelections, log,
     };
   } finally {
-    pool.close(); try { await store.close(); } catch { /* already closed or best-effort cleanup */ }
+    await pool.close(); try { await store.close(); } catch { /* already closed or best-effort cleanup */ }
   }
 }
 
