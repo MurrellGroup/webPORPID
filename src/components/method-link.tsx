@@ -25,5 +25,5 @@ const TARGETS: Record<MethodTopic, string> = {
 export function methodHref(topic: MethodTopic) { return `./${TARGETS[topic]}`; }
 
 export function MethodLink({ topic, label = "Method" }: { topic: MethodTopic; label?: string }) {
-  return <a className="method-link" href={methodHref(topic)}>{label} <span aria-hidden="true">↗</span></a>;
+  return <a className="method-link" href={methodHref(topic)} target="_blank" rel="noreferrer">{label} <span aria-hidden="true">↗</span></a>;
 }

@@ -268,7 +268,8 @@ export function parameterSettings(bundle: ResultBundle): ParameterSettingRow[] {
   addRun("workers", bundle.provenance.workers); addRun("engine", bundle.provenance.engine);
   addRun("temporaryReadStorage", bundle.runOptions?.spoolStorage ?? "not recorded");
   addRun("postprocessingContaminationMode", bundle.postprocessingContaminationMode ?? "not recorded (legacy result)");
-  for (const [parameter, value] of Object.entries(bundle.runOptions ?? {})) if (parameter !== "spoolStorage") addRun(parameter, value);
+  for (const [parameter, value] of Object.entries(bundle.runOptions ?? {})) if (parameter !== "spoolStorage")
+    addRun(parameter === "interactiveFiltering" ? "reviewConsensusThresholds" : parameter, value);
   for (const sample of bundle.config.samples) {
     const add = (parameter: string, value: unknown) => rows.push({ scope: "sample", sample: sample.name, parameter, value: String(value ?? "—") });
     add("cDNA primer", sample.cdnaPrimer); add("second-strand primer", sample.secondStrandPrimer);

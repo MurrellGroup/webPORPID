@@ -22,7 +22,7 @@ import { createMafftRunner } from "./direct-mafft.mjs";
 import { createMsaRunner } from "./direct-msa.mjs";
 import { createIndependentPanelFilterRunner } from "./direct-panel-filter.mjs";
 
-const VERSION = "0.3.12";
+const VERSION = "0.3.14";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 

@@ -10,7 +10,7 @@ import { PartitionStore, type ExternalScratchDirectoryHandle } from "./partition
 import { collapsePostprocess, postprocess, type PostprocessOutput } from "./postprocess";
 import { runFastTreeIsolated } from "./biowasm";
 import { downstreamResources, statusRecord } from "./optional-stages";
-import { applyThresholdSelection, buildConsensusThresholdReview, buildUmiThresholdReview } from "./threshold-review";
+import { applyThresholdSelection, buildConsensusThresholdReview } from "./threshold-review";
 import { treeTipNames } from "./tree-names";
 import type { InputFileMapping, OptionalStageName, PipelineConfig, PipelineProgress, QualityStats, ResultBundle, SampleSummary,
   ThresholdReview, ThresholdSelection } from "./types";
@@ -22,13 +22,15 @@ import {
 
 type RunRequest = { type: "run"; file: File; config: PipelineConfig; workers: number; deferPhylogeny?: boolean; deferContamination?: boolean;
   deferPostprocessing?: boolean; deferCollapse?: boolean; interactiveFiltering?: boolean; inputMappings?: InputFileMapping[];
-  spoolStorage?: "automatic" | "external-directory"; scratchDirectory?: ExternalScratchDirectoryHandle };
+  spoolStorage?: "automatic" | "external-directory"; scratchDirectory?: ExternalScratchDirectoryHandle; runWhenNotInFocus?: boolean };
 type CancelRequest = { type: "cancel" };
 type SkipStageRequest = { type: "skip-stage"; stage: OptionalStageName };
+type BackgroundModeRequest = { type: "background-mode"; enabled: boolean };
 type ThresholdSelectionRequest = { type: "threshold-selection"; selection: ThresholdSelection };
 let cancellation: AbortController | undefined;
 let activeOptionalStage: OptionalStageName | undefined, optionalStageCancellation: AbortController | undefined;
 let requestedSkip: OptionalStageName | undefined;
+let activeBackgroundMode = false, activeLog: string[] | undefined;
 let thresholdWaiter: { id: string; accept(selection: ThresholdSelection): void; cancel(): void } | undefined;
 
 function progress(value: PipelineProgress) { self.postMessage({ type: "progress", progress: value }); }
@@ -111,9 +113,12 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   } catch (cause) { await pool.close(); throw cause; }
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
-	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.12 started`,
+	  activeBackgroundMode = Boolean(request.runWhenNotInFocus);
+	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.14 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
+    `${now()} background execution aid: ${activeBackgroundMode ? "requested; quiet audible processing hum controlled by the browser UI" : "disabled"}`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}, panel_filter=${request.config.parameters.panelFilterMode ?? "mafft-batch"}`];
+  activeLog = log;
   if (store.storage.quotaBytes != null) log.push(`${now()} browser storage: ${formatBytes(store.storage.usageBytes ?? 0)} used of ${formatBytes(store.storage.quotaBytes)} quota; persistence=${store.storage.persisted == null ? "unknown" : store.storage.persisted ? "granted" : "not granted"}`);
   for (const mapping of request.inputMappings ?? []) {
     log.push(`${now()} input mapping: ${mapping.role} slot ${mapping.slot}${mapping.expectedName ? ` (${mapping.expectedName})` : ""} <- ${mapping.uploadedName} (${mapping.uploadedSize} bytes)`);
@@ -210,19 +215,6 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     const umiFamilies = decodeFamilyModel(familyModel, request.config);
     familyModel = new Uint8Array();
     quality.bpbRejects = umiFamilies.filter((row) => row.disposition === "BPB-rejects").reduce((sum, row) => sum + row.familySize, 0);
-    if (request.interactiveFiltering) {
-      progress({ stage: "umi", fraction: .86, detail: "UMI probability calculations are complete; waiting for threshold review", readBlocks: [...readBlocks] });
-      const review = buildUmiThresholdReview(umiFamilies, request.config);
-      const pauseStarted = performance.now();
-      const selection = await requestThresholdSelection(review, signal);
-      const pauseMs = performance.now() - pauseStarted;
-      thresholdReviewPauseMs += pauseMs;
-      stageStarted += pauseMs; // Human review time is not computational UMI time.
-      if (selection.id !== review.id || selection.phase !== review.phase) throw new Error("The interactive UMI-threshold response did not match the open checkpoint.");
-      const accepted = applyThresholdSelection(request.config, umiFamilies, selection); thresholdSelections.push(accepted);
-      for (const change of accepted.changes) log.push(`${now()} interactive UMI threshold: ${change}`);
-      progress({ stage: "umi", fraction: .88, detail: "Accepted UMI thresholds; updating family decisions for every observed UMI", readBlocks: [...readBlocks] });
-    }
     const familyByKey = new Map<string, (typeof umiFamilies)[number]>(umiFamilies.filter((family) => family.disposition !== "BPB-rejects")
       .map((family) => [`${family.sampleIndex}\0${family.umi}`, family] as const));
     progress({ stage: "umi", fraction: .9, detail: "Releasing preprocessing memory and starting clean consensus workers", readBlocks: [...readBlocks] });
@@ -457,7 +449,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.12", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.14", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
@@ -470,16 +462,23 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
         deferContamination: Boolean(request.deferContamination), deferPostprocessing: Boolean(request.deferPostprocessing),
         deferCollapse: Boolean(request.deferCollapse),
         interactiveFiltering: Boolean(request.interactiveFiltering),
+        runWhenNotInFocus: activeBackgroundMode,
         spoolStorage: request.spoolStorage === "external-directory" ? "external-directory" : "automatic" },
       optionalStages, postprocessingContaminationMode, timings, thresholdSelections, log,
     };
   } finally {
+    activeLog = undefined;
     await pool.close(); try { await store.close(); } catch { /* already closed or best-effort cleanup */ }
   }
 }
 
-self.addEventListener("message", (event: MessageEvent<RunRequest | CancelRequest | SkipStageRequest | ThresholdSelectionRequest>) => {
+self.addEventListener("message", (event: MessageEvent<RunRequest | CancelRequest | SkipStageRequest | BackgroundModeRequest | ThresholdSelectionRequest>) => {
   if (event.data.type === "cancel") { cancellation?.abort(); optionalStageCancellation?.abort(); thresholdWaiter?.cancel(); return; }
+  if (event.data.type === "background-mode") {
+    activeBackgroundMode = event.data.enabled;
+    activeLog?.push(`${now()} background execution aid: ${event.data.enabled ? "enabled" : "disabled"} by user during processing`);
+    return;
+  }
   if (event.data.type === "skip-stage") {
     if (event.data.stage === activeOptionalStage) { requestedSkip = event.data.stage; optionalStageCancellation?.abort(); }
     return;

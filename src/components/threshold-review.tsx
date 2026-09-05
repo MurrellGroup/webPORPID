@@ -126,8 +126,9 @@ function DecisionPlot({ review, sample, thresholds }: { review: ThresholdReview;
   </svg><figcaption>{categorized.length.toLocaleString()} deterministic display points. Family-size, artefact, and minimum-agreement classes update live; accepted thresholds are applied to every eligible consensus family.</figcaption></figure>;
 }
 
-export function ThresholdReviewDialog({ review, onAccept, onCancel }: {
+export function ThresholdReviewDialog({ review, onAccept, onCancel, acceptLabel = "Accept thresholds and continue", cancelLabel = "Cancel analysis" }: {
   review: ThresholdReview; onAccept(selection: ThresholdSelection): void; onCancel(): void;
+  acceptLabel?: string; cancelLabel?: string;
 }) {
   const [draft, setDraft] = useState(() => initialDraft(review));
   const [sampleName, setSampleName] = useState(review.samples[0]?.sample ?? "");
@@ -198,6 +199,6 @@ export function ThresholdReviewDialog({ review, onAccept, onCancel }: {
     </div>
     <p className="threshold-unbounded-note">Slider ranges are convenient guides only. Direct numeric fields have no slider-imposed limits; scientifically invalid non-numeric values are rejected.</p>
     {issue && <div className="error-box" role="alert">{issue}</div>}
-    <footer><button type="button" className="danger" onClick={onCancel}>Cancel analysis</button><button type="button" className="primary" onClick={accept}>Accept thresholds and continue</button></footer>
+    <footer><button type="button" className="danger" onClick={onCancel}>{cancelLabel}</button><button type="button" className="primary" onClick={accept}>{acceptLabel}</button></footer>
   </section></div>;
 }

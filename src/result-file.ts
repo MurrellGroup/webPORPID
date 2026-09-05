@@ -277,7 +277,7 @@ function validateResult(value: unknown): asserts value is ResultBundle {
   });
   if (bundle.runOptions != null) {
     const options = object(bundle.runOptions, "runOptions"); bool(options.deferPhylogeny, "runOptions.deferPhylogeny");
-    for (const key of ["deferContamination", "deferPostprocessing", "deferCollapse", "interactiveFiltering"])
+    for (const key of ["deferContamination", "deferPostprocessing", "deferCollapse", "interactiveFiltering", "runWhenNotInFocus"])
       if (options[key] != null) bool(options[key], `runOptions.${key}`);
     if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage")))
       throw new Error("runOptions.spoolStorage is not recognized.");

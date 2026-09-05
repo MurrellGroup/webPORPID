@@ -8,17 +8,18 @@ import { alignmentKey, effectiveAlignment, inspectAlignment, summarizeAlignmentC
 import { runFastTree } from "../biowasm";
 import { parseFasta } from "../config";
 import { deduplicateContaminationCalls } from "../contamination";
-import { computeThrough, markOptionalStageSkipped, type DeferredAnalysisProgress } from "../deferred-analysis";
+import { buildStoredConsensusThresholdReview, computeThrough, markOptionalStageSkipped, recomputeAfterConsensusThresholds, type DeferredAnalysisProgress } from "../deferred-analysis";
 import { buildExportArchive } from "../export-archive";
 import { OPTIONAL_STAGE_ORDER, stageCompleted, stageStatus } from "../optional-stages";
 import { functionalFilterStats, inputFilterStats, parameterSettings, porpidCallStats, postprocFilterStats, sampleOverviewStats, type CountStat, type DualCountStat, type ParameterSettingRow, type SampleOverviewStat } from "../report-stats";
 import { exportComponent, type ExportKind, safeDatasetName } from "../result-file";
 import { runScalableMsa } from "../scalable-msa";
 import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceName } from "../sequence-names";
-import type { AlignmentAuditEntry, AlignmentChangeSummary, CollapseGroup, ContaminationCall, OptionalStageName, PostprocRecord, ResultBundle, UmiFamily } from "../types";
+import type { AlignmentAuditEntry, AlignmentChangeSummary, CollapseGroup, ContaminationCall, OptionalStageName, PostprocRecord, ResultBundle, ThresholdReview, ThresholdSelection, UmiFamily } from "../types";
 import { AgreementPositionPlot, ArtefactDecisionPlot, DinucleotideHeatmaps, MdsApobecPlot, UmiDecisionPlot } from "./charts";
 import { AlignmentTreeViewer, type LeafMetadata } from "./alignment-tree-viewer";
 import { MethodLink } from "./method-link";
+import { ThresholdReviewDialog } from "./threshold-review";
 
 type Tab = "overview" | "families" | "sequences" | "contamination" | "alignment" | "log";
 type SortDirection = "asc" | "desc";
@@ -151,17 +152,27 @@ const OPTIONAL_STAGE_LABELS: Record<OptionalStageName, string> = {
   collapse: "Haplotype collapse + functional filtering", tree: "Collapsed phylogenies",
 };
 
-function OptionalStagePanel({ bundle, progress, onCompute, onSkip }: { bundle: ResultBundle; progress?: DeferredAnalysisProgress;
-  onCompute(stage: OptionalStageName): void; onSkip(): void }) {
+function OptionalStagePanel({ bundle, progress, blocked = false, onCompute, onSkip }: { bundle: ResultBundle; progress?: DeferredAnalysisProgress;
+  blocked?: boolean; onCompute(stage: OptionalStageName): void; onSkip(): void }) {
   return <section className="optional-stage-panel"><header><div><span className="section-kicker">Resumable analysis</span><h2>Optional stages after consensus</h2><p>Deferred and skipped work is recorded explicitly. Contamination is an optional side gate: downstream analysis can continue unfiltered. Collapsed-variant functional filtering runs with collapse, which requires post-processing; the default tree then uses those collapsed variants.</p><MethodLink topic="optional-stages" /></div></header>
     <div className="optional-stage-grid">{OPTIONAL_STAGE_ORDER.map((stage) => {
       const status = stageStatus(bundle, stage), prerequisites: OptionalStageName[] = stage === "collapse" ? ["postprocessing"] : stage === "tree" ? ["postprocessing", "collapse"] : [];
       const missing = prerequisites.filter((candidate) => !stageCompleted(bundle, candidate));
       const needsReapply = stage === "postprocessing" && status.state === "completed" && stageCompleted(bundle, "contamination")
         && bundle.postprocessingContaminationMode === "bypassed" && bundle.config.parameters.contaminationFilter;
-      const busy = Boolean(progress), current = progress?.stage === stage;
+      const busy = Boolean(progress) || blocked, current = progress?.stage === stage;
       return <article className={`optional-stage ${status.state}${needsReapply ? " needs-reapply" : ""}`} key={stage}><span>{OPTIONAL_STAGE_LABELS[stage]}</span><strong>{needsReapply ? "computed · unfiltered" : status.state}</strong><p>{status.detail}</p>{(status.state !== "completed" || needsReapply) && <button type="button" disabled={busy} onClick={() => onCompute(stage)}>{needsReapply ? "Recompute and apply contamination" : `Compute ${OPTIONAL_STAGE_LABELS[stage].toLowerCase()}`}</button>}{missing.length > 0 && <small>Also computes required input: {missing.map((item) => OPTIONAL_STAGE_LABELS[item]).join(" → ")}</small>}{current && <div className="on-demand-progress"><progress max="100" value={Math.round(progress.fraction * 100)} /><span>{progress.detail}</span><button type="button" className="danger" onClick={onSkip}>Skip this step</button></div>}</article>;
     })}</div>
+  </section>;
+}
+
+function ConsensusThresholdReanalysisPanel({ bundle, progress, blocked = false, onReview, onStop }: { bundle: ResultBundle;
+  progress?: DeferredAnalysisProgress; blocked?: boolean; onReview(): void; onStop(): void }) {
+  if (!bundle.runOptions?.interactiveFiltering) return null;
+  const postprocessingDone = stageCompleted(bundle, "postprocessing"), canReplay = !postprocessingDone || Boolean(bundle.downstreamResources);
+  return <section className="threshold-reanalysis-panel"><header><div><span className="section-kicker">Consensus decision checkpoint</span><h2>Review consensus thresholds again</h2><p>Reopen the agreement, outlier-quantile, and artefact-fraction dialogue from the stored family consensuses. Accepting a change preserves UMI grouping, consensus calls, and contamination calls, then recomputes only the downstream stages that were previously complete.</p><MethodLink topic="artefact" /></div><button type="button" className="primary" disabled={Boolean(progress) || blocked || !canReplay} onClick={onReview}>Return to consensus thresholds review</button></header>
+    {!canReplay && <div className="viewer-status warning">This older project lacks the stored panel/reference inputs required to replay completed downstream analysis.</div>}
+    {progress && <div className="on-demand-progress"><progress max="100" value={Math.round(progress.fraction * 100)} /><span>{progress.detail}</span><button type="button" className="danger" onClick={onStop}>Stop rerun</button></div>}
   </section>;
 }
 
@@ -170,9 +181,9 @@ function AllSampleOverview({ bundle, onOpenSample }: { bundle: ResultBundle; onO
   const rows = useMemo(() => sorted(sampleOverviewStats(bundle), sort, (row, key) => row[key as keyof SampleOverviewStat]), [bundle, sort]);
   const percentCell = (value: number) => <span className={value > 0 ? "stat-reject" : ""}>{pct(value)}</span>;
   const contaminationComplete = stageCompleted(bundle, "contamination"), postprocessingComplete = stageCompleted(bundle, "postprocessing"), collapseComplete = stageCompleted(bundle, "collapse");
-  return <section className="result-section all-sample-overview"><div className="table-heading"><div><span className="section-kicker">Across-sample overview</span><h2>Every configured sample</h2><p>Subsampling percentages use demultiplexed reads. UMI-filter percentages use selected reads represented by stored family calls; consensus-filter percentages use reads represented by consensus families.</p><MethodLink topic="results" /></div><span>{rows.length.toLocaleString()} samples</span></div><div className="table-scroll overview-table"><table><thead><tr>
-    <SortHeader label="Sample" column="sample" state={sort} onChange={setSort} /><SortHeader label="Donor ID" column="donorId" state={sort} onChange={setSort} /><SortHeader label="Demux reads" column="demultiplexedReads" state={sort} onChange={setSort} /><SortHeader label="Selected reads" column="selectedReads" state={sort} onChange={setSort} /><SortHeader label="Subsampled" column="downsampledPercent" state={sort} onChange={setSort} /><SortHeader label="Observed UMI families" column="observedFamilies" state={sort} onChange={setSort} /><SortHeader label="BPB read rejects" column="bpbReadPercent" state={sort} onChange={setSort} /><SortHeader label="UMI-length read rejects" column="umiLengthReadPercent" state={sort} onChange={setSort} /><SortHeader label="Family-size read rejects" column="familySizeReadPercent" state={sort} onChange={setSort} /><SortHeader label="LDA read rejects" column="ldaReadPercent" state={sort} onChange={setSort} /><SortHeader label="Heteroduplex read rejects" column="heteroduplexReadPercent" state={sort} onChange={setSort} /><SortHeader label="Consensus families" column="consensusFamilies" state={sort} onChange={setSort} /><SortHeader label="Artefact read rejects" column="artefactReadPercent" state={sort} onChange={setSort} /><SortHeader label="Agreement read rejects" column="agreementReadPercent" state={sort} onChange={setSort} /><SortHeader label="Contam read rejects" column="contaminationReadPercent" state={sort} onChange={setSort} /><SortHeader label="Panel read rejects" column="panelReadPercent" state={sort} onChange={setSort} /><SortHeader label="Functional represented-family rejects" column="functionalReadPercent" state={sort} onChange={setSort} /><SortHeader label="Retained families" column="retainedFamilies" state={sort} onChange={setSort} /><SortHeader label="Functional variants evaluated" column="functionalEvaluatedFamilies" state={sort} onChange={setSort} /><SortHeader label="Functional variants passed" column="functionalPassedFamilies" state={sort} onChange={setSort} /><SortHeader label="Collapsed haplotypes" column="collapsedHaplotypes" state={sort} onChange={setSort} />
-  </tr></thead><tbody>{rows.map((row) => <tr key={row.sample}><td><button type="button" className="sample-link" onClick={() => onOpenSample(row.sample)}>{row.sample}</button></td><td>{row.donorId}</td><td>{row.demultiplexedReads.toLocaleString()}</td><td>{row.selectedReads.toLocaleString()}</td><td>{row.downsampledReads.toLocaleString()} <small>({pct(row.downsampledPercent)})</small></td><td>{row.observedFamilies.toLocaleString()}</td><td>{percentCell(row.bpbReadPercent)}</td><td>{percentCell(row.umiLengthReadPercent)}</td><td>{percentCell(row.familySizeReadPercent)}</td><td>{percentCell(row.ldaReadPercent)}</td><td>{percentCell(row.heteroduplexReadPercent)}</td><td>{row.consensusFamilies.toLocaleString()}</td><td>{postprocessingComplete ? percentCell(row.artefactReadPercent) : "not computed"}</td><td>{postprocessingComplete ? percentCell(row.agreementReadPercent) : "not computed"}</td><td>{contaminationComplete ? percentCell(row.contaminationReadPercent) : "not computed"}</td><td>{postprocessingComplete ? percentCell(row.panelReadPercent) : "not computed"}</td><td>{!row.functionalConfigured ? "—" : collapseComplete ? percentCell(row.functionalReadPercent) : "not computed"}</td><td>{postprocessingComplete ? row.retainedFamilies.toLocaleString() : "not computed"}</td><td>{!row.functionalConfigured ? "—" : collapseComplete ? row.functionalEvaluatedFamilies.toLocaleString() : "not computed"}</td><td>{!row.functionalConfigured ? "—" : collapseComplete ? row.functionalPassedFamilies.toLocaleString() : "not computed"}</td><td>{collapseComplete ? row.collapsedHaplotypes.toLocaleString() : "not computed"}</td></tr>)}</tbody></table></div>
+  return <section className="result-section all-sample-overview"><div className="table-heading"><div><span className="section-kicker">Across-sample overview</span><h2>Every configured sample</h2><p>UMI-filter percentages use selected reads represented by stored family calls; consensus-filter percentages use reads represented by consensus families.</p><MethodLink topic="results" /></div><span>{rows.length.toLocaleString()} samples</span></div><div className="table-scroll overview-table"><table><thead><tr>
+    <SortHeader label="Sample" column="sample" state={sort} onChange={setSort} /><SortHeader label="Donor ID" column="donorId" state={sort} onChange={setSort} /><SortHeader label="Demux reads" column="demultiplexedReads" state={sort} onChange={setSort} /><SortHeader label="Selected reads" column="selectedReads" state={sort} onChange={setSort} /><SortHeader label="Observed UMI families" column="observedFamilies" state={sort} onChange={setSort} /><SortHeader label="BPB read rejects" column="bpbReadPercent" state={sort} onChange={setSort} /><SortHeader label="UMI-length read rejects" column="umiLengthReadPercent" state={sort} onChange={setSort} /><SortHeader label="Family-size read rejects" column="familySizeReadPercent" state={sort} onChange={setSort} /><SortHeader label="LDA read rejects" column="ldaReadPercent" state={sort} onChange={setSort} /><SortHeader label="Heteroduplex read rejects" column="heteroduplexReadPercent" state={sort} onChange={setSort} /><SortHeader label="Consensus families" column="consensusFamilies" state={sort} onChange={setSort} /><SortHeader label="Artefact read rejects" column="artefactReadPercent" state={sort} onChange={setSort} /><SortHeader label="Agreement read rejects" column="agreementReadPercent" state={sort} onChange={setSort} /><SortHeader label="Contam read rejects" column="contaminationReadPercent" state={sort} onChange={setSort} /><SortHeader label="Panel read rejects" column="panelReadPercent" state={sort} onChange={setSort} /><SortHeader label="Retained families" column="retainedFamilies" state={sort} onChange={setSort} /><SortHeader label="Collapsed haplotypes" column="collapsedHaplotypes" state={sort} onChange={setSort} /><SortHeader label="Functional variants passed" column="functionalPassedFamilies" state={sort} onChange={setSort} />
+  </tr></thead><tbody>{rows.map((row) => <tr key={row.sample}><td><button type="button" className="sample-link" onClick={() => onOpenSample(row.sample)}>{row.sample}</button></td><td>{row.donorId}</td><td>{row.demultiplexedReads.toLocaleString()}</td><td>{row.selectedReads.toLocaleString()}</td><td>{row.observedFamilies.toLocaleString()}</td><td>{percentCell(row.bpbReadPercent)}</td><td>{percentCell(row.umiLengthReadPercent)}</td><td>{percentCell(row.familySizeReadPercent)}</td><td>{percentCell(row.ldaReadPercent)}</td><td>{percentCell(row.heteroduplexReadPercent)}</td><td>{row.consensusFamilies.toLocaleString()}</td><td>{postprocessingComplete ? percentCell(row.artefactReadPercent) : "not computed"}</td><td>{postprocessingComplete ? percentCell(row.agreementReadPercent) : "not computed"}</td><td>{contaminationComplete ? percentCell(row.contaminationReadPercent) : "not computed"}</td><td>{postprocessingComplete ? percentCell(row.panelReadPercent) : "not computed"}</td><td>{postprocessingComplete ? row.retainedFamilies.toLocaleString() : "not computed"}</td><td>{collapseComplete ? row.collapsedHaplotypes.toLocaleString() : "not computed"}</td><td>{!row.functionalConfigured ? "—" : collapseComplete ? row.functionalPassedFamilies.toLocaleString() : "not computed"}</td></tr>)}</tbody></table></div>
     <article className="statistics-card run-wide-stats"><header><h3>Run-wide input filtering</h3><p>These filters occur before sample assignment, so they cannot be attributed scientifically to individual samples. Percentages use all FASTQ records as the denominator.</p></header><CountStatsTable rows={inputFilterStats(bundle)} /></article>
     <ParameterSettingsTable bundle={bundle} />
     <TimingSummary bundle={bundle} />
@@ -221,7 +232,7 @@ function AlignmentAuditTable({ bundle, sample }: { bundle: ResultBundle; sample:
 function ThresholdAuditTrail({ bundle, sample }: { bundle: ResultBundle; sample: string }) {
   const records = bundle.thresholdSelections ?? [];
   const samplePrefixes = bundle.config.samples.map((row) => `${row.name}.`);
-  if (!records.length) return <p className="no-audit-edits">Interactive filtering was not enabled for this run.</p>;
+  if (!records.length) return <p className="no-audit-edits">Consensus-threshold review was not enabled for this run.</p>;
   return <ol className="threshold-audit">{records.map((record) => <li key={record.id}><strong>{record.phase === "umi" ? "UMI-family decision" : "Consensus-filter decision"}</strong><time>{record.acceptedUtc}</time><ul>{record.changes.filter((change) => !samplePrefixes.some((prefix) => change.startsWith(prefix)) || change.startsWith(`${sample}.`)).map((change) => <li key={change}>{change}</li>)}</ul></li>)}</ol>;
 }
 
@@ -332,8 +343,10 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
   const [alignmentStatus, setAlignmentStatus] = useState(""), [alignmentError, setAlignmentError] = useState(""), [alignmentBusy, setAlignmentBusy] = useState("");
   const [contaminationPhylogeny, setContaminationPhylogeny] = useState<ContaminationPhylogeny>(), [contaminationPhylogenyBusy, setContaminationPhylogenyBusy] = useState(false), [contaminationPhylogenyError, setContaminationPhylogenyError] = useState("");
   const [deferredProgress, setDeferredProgress] = useState<DeferredAnalysisProgress>(), [deferredError, setDeferredError] = useState("");
+  const [thresholdReview, setThresholdReview] = useState<ThresholdReview>(), [thresholdProgress, setThresholdProgress] = useState<DeferredAnalysisProgress>(), [thresholdError, setThresholdError] = useState("");
   const bundleRef = useRef(bundle), sampleRef = useRef(sample), changeRef = useRef(onBundleChange), alivibeRef = useRef<AlivibeSession | null>(null);
   const deferredControllerRef = useRef<AbortController | undefined>(undefined), deferredStageRef = useRef<OptionalStageName | undefined>(undefined);
+  const thresholdControllerRef = useRef<AbortController | undefined>(undefined);
   bundleRef.current = bundle; sampleRef.current = sample; changeRef.current = onBundleChange;
 
   const summary = bundle.summaries.find((row) => row.sample === sample), sampleConfig = bundle.config.samples.find((row) => row.name === sample);
@@ -368,11 +381,11 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
 
   useEffect(() => { setFamilyPage(0); setSequencePage(0); setContaminationPage(0); setAlignmentStatus(""); setAlignmentError(""); setShowUncollapsed(false); setShowFunctional(false); setContaminationPhylogeny(undefined); setContaminationPhylogenyError(""); }, [sample]);
   useEffect(() => setFamilyPage(0), [familyQuery, familySort]); useEffect(() => setSequencePage(0), [query, sequenceSort]); useEffect(() => setContaminationPage(0), [contaminationSort]);
-  useEffect(() => () => { deferredControllerRef.current?.abort(); const session = alivibeRef.current; if (session?.timer) window.clearInterval(session.timer); if (session && !session.popup.closed) session.popup.close(); }, []);
+  useEffect(() => () => { deferredControllerRef.current?.abort(); thresholdControllerRef.current?.abort(); const session = alivibeRef.current; if (session?.timer) window.clearInterval(session.timer); if (session && !session.popup.closed) session.popup.close(); }, []);
   const page = <T,>(rows: T[], index: number) => rows.slice(index * PAGE_SIZE, (index + 1) * PAGE_SIZE);
 
   async function computeOptionalStage(target: OptionalStageName) {
-    if (deferredControllerRef.current) return;
+    if (deferredControllerRef.current || thresholdControllerRef.current) return;
     const currentBundle = bundleRef.current;
     const reapplyingContamination = target === "postprocessing" && stageCompleted(currentBundle, "contamination")
       && currentBundle.postprocessingContaminationMode === "bypassed" && currentBundle.config.parameters.contaminationFilter;
@@ -397,6 +410,42 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
   }
 
   function skipDeferredStage() { deferredControllerRef.current?.abort(); }
+
+  function openConsensusThresholdReview() {
+    if (deferredControllerRef.current || thresholdControllerRef.current) return;
+    if (alignmentBusy || (alivibeRef.current && !alivibeRef.current.popup.closed)) {
+      setThresholdError("Finish the active tree/alignment operation or close the Alivibe round trip before reopening consensus thresholds."); return;
+    }
+    try { setThresholdError(""); setThresholdReview(buildStoredConsensusThresholdReview(bundleRef.current)); }
+    catch (cause) { setThresholdError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+
+  async function acceptConsensusThresholds(selection: ThresholdSelection) {
+    if (deferredControllerRef.current || thresholdControllerRef.current) return;
+    const current = bundleRef.current, hasDownstream = stageCompleted(current, "postprocessing");
+    if (hasDownstream && !window.confirm("Applying these consensus thresholds will replace downstream filter decisions, alignments, collapse results, and any inferred trees through their previous completion level. Active alignment edits will be detached, but their audit history remains. UMI grouping, consensus calls, and contamination calls are preserved. Continue?")) return;
+    setThresholdReview(undefined); setThresholdError("");
+    const controller = new AbortController(); thresholdControllerRef.current = controller;
+    setThresholdProgress({ stage: "postprocessing", fraction: 0, detail: hasDownstream
+      ? "Applying accepted consensus thresholds and preparing downstream recomputation…"
+      : "Saving accepted consensus thresholds for deferred downstream analysis…" });
+    try {
+      const next = await recomputeAfterConsensusThresholds(current, selection, { signal: controller.signal,
+        onProgress: setThresholdProgress,
+        onCheckpoint: (checkpointBundle) => { bundleRef.current = checkpointBundle; changeRef.current(checkpointBundle); },
+      });
+      bundleRef.current = next; changeRef.current(next);
+    } catch (cause) {
+      setThresholdError(controller.signal.aborted
+        ? "Consensus-threshold rerun stopped. The last fully completed checkpoint, if any, was preserved."
+        : cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (thresholdControllerRef.current === controller) thresholdControllerRef.current = undefined;
+      setThresholdProgress(undefined);
+    }
+  }
+
+  function stopConsensusThresholdRerun() { thresholdControllerRef.current?.abort(); }
 
   async function installCorrection(variant: AlignmentVariant, targetSample: string, baseline: string, corrected: string, frameOffset: AlignmentFrameOffset, source: string) {
     setAlignmentBusy(`${targetSample}/${variant}`); setAlignmentError("");
@@ -509,7 +558,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const targetSample = sampleRef.current, current = effectiveAlignment(bundleRef.current, targetSample, variant); if (!current.fasta) return;
     setAlignmentError(""); setAlignmentStatus("Opening the bundled Alivibe editor…");
     const applicationBase = new URL(import.meta.env.BASE_URL, document.baseURI), editorUrl = new URL("tools/alivibe.html", applicationBase);
-    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.12");
+    editorUrl.searchParams.set("swigBridge", String(ALIVIBE_BRIDGE_VERSION)); editorUrl.searchParams.set("source", ALIVIBE_SOURCE_REVISION.slice(0, 12)); editorUrl.searchParams.set("release", "0.3.14");
     const token = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
     const popup = window.open(editorUrl.href, `webporpid-alivibe-${token}`, "popup,width=1500,height=920") as AlivibeEditorWindow | null;
     if (!popup) { setAlignmentError("The browser blocked the Alivibe window. Allow pop-ups for this site and try again."); return; }
@@ -549,7 +598,8 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     const current = variant === "collapsed" ? collapsed : variant === "uncollapsed" ? uncollapsed : functional;
     const tree = variant === "collapsed" ? collapsedTree : variant === "uncollapsed" ? uncollapsedTree : functionalTree;
     const metadata = variant === "collapsed" ? collapsedTips : variant === "uncollapsed" ? uncollapsedTips : functionalTips;
-    const reference = variant === "functional" ? functionalRefSequence : refSequence, busy = alignmentBusy === `${sample}/${variant}`;
+    const reference = variant === "functional" ? functionalRefSequence : refSequence;
+    const busy = alignmentBusy === `${sample}/${variant}` || Boolean(deferredProgress) || Boolean(thresholdProgress);
     const kicker = variant === "collapsed" ? "Default phylogeny" : variant === "uncollapsed" ? "Optional family-level phylogeny" : "Functional-sequence phylogeny";
     const heading = variant === "collapsed" ? "Collapsed haplotypes" : variant === "uncollapsed" ? "Uncollapsed consensus sequences" : "Functional collapsed variants";
     const description = variant === "collapsed"
@@ -559,7 +609,7 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
     if (!current.fasta) return <div className="empty-state">No {variant} nucleotide alignment is available for this sample.</div>;
     const stale = Boolean(current.edit?.treeStale || (current.edit?.treeFingerprint && current.edit.treeFingerprint !== current.edit.editedFingerprint));
     return <section className="phylogeny-block" key={variant}><header><div><span className="section-kicker">{kicker}</span><h3>{heading}</h3><p>{description}</p><MethodLink topic={variant === "functional" ? "functional" : variant === "collapsed" ? "collapse" : "phylogeny"} /></div><div><button type="button" className={tree ? "" : "primary"} disabled={busy} onClick={() => void inferTree(variant)}>{busy ? "Running FastTree…" : tree ? "Recalculate tree" : "Infer tree"}</button></div></header>
-      <div className="alignment-edit-bar"><button type="button" disabled={busy} onClick={() => openAlivibe(variant)}>Open in Alivibe ↗</button><label className="button-like">Import edited FASTA<input type="file" accept=".fasta,.fa,.fas,.fna,text/plain" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; void importCorrected(variant, file); }} /></label><label><span>Protein frame</span><select value={current.frameOffset} onChange={(event) => setFrameOffset(variant, Number(event.target.value) as AlignmentFrameOffset)}><option value="0">Start at nucleotide column 1</option><option value="1">Start at nucleotide column 2</option><option value="2">Start at nucleotide column 3</option></select></label>{current.edit && <button type="button" onClick={() => resetCorrection(variant)}>Discard edit</button>}<span>{current.edit ? `Edited copy · ${current.edit.source}` : "Pipeline alignment · original preserved"}</span></div>
+      <div className="alignment-edit-bar"><button type="button" disabled={busy} onClick={() => openAlivibe(variant)}>Open in Alivibe ↗</button><label className="button-like">Import edited FASTA<input type="file" disabled={busy} accept=".fasta,.fa,.fas,.fna,text/plain" onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; void importCorrected(variant, file); }} /></label><label><span>Protein frame</span><select disabled={busy} value={current.frameOffset} onChange={(event) => setFrameOffset(variant, Number(event.target.value) as AlignmentFrameOffset)}><option value="0">Start at nucleotide column 1</option><option value="1">Start at nucleotide column 2</option><option value="2">Start at nucleotide column 3</option></select></label>{current.edit && <button type="button" disabled={busy} onClick={() => resetCorrection(variant)}>Discard edit</button>}<span>{current.edit ? `Edited copy · ${current.edit.source}` : "Pipeline alignment · original preserved"}</span></div>
       {current.edit && <div className="alignment-edited-notice"><strong>Alignment edited</strong><span>This separate copy is stored in the session file. The pipeline-generated alignment has not been overwritten.{stale ? " Recalculate the tree when the alignment is ready." : ""}</span></div>}
       <AlignmentTreeViewer fasta={current.fasta} newick={tree} alphabet={alphabet} onAlphabetChange={setAlphabet} frameOffset={current.frameOffset} referenceSequence={reference} leafMetadata={metadata} collapsed={variant !== "uncollapsed"} treeStale={stale} name={`${safeDatasetName(bundle.config.dataset)}-${safeDatasetName(sample)}-${variant}`} />
     </section>;
@@ -567,8 +617,10 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
 
   return <main className="results-page">
     <section className="results-hero"><div><span className="section-kicker">Loaded analysis</span><h1>{bundle.config.dataset}</h1><p>{bundle.provenance.inputName} · {bundle.provenance.createdUtc} · {bundle.provenance.workers} workers</p>{(!allSamples || donorView) && <button type="button" className="overview-return" onClick={() => { setDonorView(""); setAllSamples(true); }}>← Across-sample overview</button>}</div><div className="result-actions"><select aria-label="Sample, donor, or across-sample overview" value={donorView ? `__donor__${donorView}` : allSamples ? "__all_samples__" : sample} onChange={(event) => { const value = event.target.value; if (value === "__all_samples__") { setDonorView(""); setAllSamples(true); } else if (value.startsWith("__donor__")) { setDonorView(value.slice(9)); setAllSamples(false); } else { setDonorView(""); setSample(value); setAllSamples(false); setTab("overview"); } }}><option value="__all_samples__">Across-sample overview</option>{donorIds.length > 0 && <optgroup label="Donors">{donorIds.map((donor) => <option value={`__donor__${donor}`} key={donor}>Donor · {donor}</option>)}</optgroup>}<optgroup label="Samples">{bundle.summaries.map((row) => <option value={row.sample} key={row.sample}>{row.sample}</option>)}</optgroup></select><ExportMenu bundle={bundle} sample={sample} allOnly={allSamples || Boolean(donorView)} /><button className="primary" type="button" onClick={onSaveResults}>Save results file</button></div></section>
-    <OptionalStagePanel bundle={bundle} progress={deferredProgress} onCompute={(stage) => void computeOptionalStage(stage)} onSkip={skipDeferredStage} />
+    <OptionalStagePanel bundle={bundle} progress={deferredProgress} blocked={Boolean(thresholdProgress)} onCompute={(stage) => void computeOptionalStage(stage)} onSkip={skipDeferredStage} />
     {deferredError && <div className="error-box" role="alert">Optional-stage computation failed: {deferredError}</div>}
+    <ConsensusThresholdReanalysisPanel bundle={bundle} progress={thresholdProgress} blocked={Boolean(deferredProgress)} onReview={openConsensusThresholdReview} onStop={stopConsensusThresholdRerun} />
+    {thresholdError && <div className="error-box" role="alert">Consensus-threshold review failed: {thresholdError}</div>}
     {allSamples && !donorView && <AllSampleOverview bundle={bundle} onOpenSample={(selected) => { setDonorView(""); setSample(selected); setAllSamples(false); setTab("overview"); }} />}
     {donorView && <DonorView bundle={bundle} donorId={donorView} />}
     {sampleMode && <nav className="result-tabs">{(["overview", "families", "sequences", "contamination", "alignment", "log"] as Tab[]).map((value) => <button type="button" className={tab === value ? "active" : ""} onClick={() => setTab(value)} key={value}>{value}</button>)}</nav>}
@@ -595,5 +647,6 @@ export function ResultsExplorer({ bundle, onSaveResults, onBundleChange }: { bun
       {collapseDone && sampleConfig?.functionalReference && !functional.fasta && <div className="empty-state">No collapsed variants passed the functional filter for this sample, so there is no functional-sequence alignment to display.</div>}
     </section>}
     {tab === "log" && <section className="result-section"><div className="table-heading"><div><h2>Run log</h2><p>Persistent stage summaries, input-slot mappings, interactive tree runs, and fallbacks stored inside the results file.</p></div></div><pre className="run-log">{bundle.log.join("\n")}</pre></section>}</>}
+    {thresholdReview && <ThresholdReviewDialog review={thresholdReview} onAccept={(selection) => void acceptConsensusThresholds(selection)} onCancel={() => setThresholdReview(undefined)} acceptLabel="Apply thresholds and rerun downstream" cancelLabel="Keep current results" />}
   </main>;
 }

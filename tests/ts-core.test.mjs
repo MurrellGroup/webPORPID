@@ -32,6 +32,8 @@ import { layoutTree, midpointRoot, parseNewick, rootOnOutgroup } from "../src/tr
 import { treeTipNames } from "../src/tree-names.ts";
 import { applyThresholdSelection, buildConsensusThresholdReview, buildUmiThresholdReview } from "../src/threshold-review.ts";
 import { staticTreeHighlighterSvg } from "../src/static-tree-highlighter.ts";
+import { PROCESSING_HUM_LEVEL, ProcessingHum } from "../src/processing-hum.ts";
+import { buildStoredConsensusThresholdReview, prepareConsensusThresholdReanalysis, restoreUntouchedThresholdStatuses } from "../src/consensus-threshold-reanalysis.ts";
 
 function spoolRecord(sample, hash, umi = "AACCGGTT", name = "read", sequence = "ACGT") {
   const encoder = new TextEncoder(), umiBytes = encoder.encode(umi), nameBytes = encoder.encode(name), sequenceBytes = encoder.encode(sequence);
@@ -436,7 +438,7 @@ test("contamination clustering is capped at three passes and donor peers are bio
   assert(classifyContamination(consensuses, differentDonors).length > 0, "different donors must remain eligible non-self comparisons");
 });
 
-test("interactive threshold checkpoints reclassify every family and preserve an audit record", () => {
+test("legacy UMI decisions remain loadable while consensus decisions preserve an audit record", () => {
   const base = resultBundle(), config = { dataset: base.config.dataset, contaminationPanel: base.config.contaminationPanel,
     contaminationPanelSequences: [], parameters: { ...base.config.parameters, deterministicSeed: 1n },
     samples: base.config.samples.map((sample) => ({ ...sample, panelSequences: [] })) };
@@ -457,6 +459,36 @@ test("interactive threshold checkpoints reclassify every family and preserve an 
   project.config.parameters.ldaThreshold = .75; project.config.parameters.familySizeThreshold = 2;
   project.runOptions.interactiveFiltering = true; project.thresholdSelections = [record];
   assert.deepEqual(decodeResult(encodeResult(project)), project, "donor metadata and threshold decisions must persist in the project file");
+});
+
+test("completed results can revisit consensus thresholds without changing upstream calls", () => {
+  const bundle = resultBundle(); bundle.runOptions.interactiveFiltering = true;
+  bundle.alignmentEdits = { "sample_1/nucleotide": { fasta: ">c1\nATG---\n", frameOffset: 0,
+    baselineFingerprint: "before", editedFingerprint: "after", source: "test", savedUtc: "2026-08-27T00:00:01.000Z" } };
+  bundle.alignmentEditHistory = [{ alignmentKey: "sample_1/nucleotide", action: "alignment-edit", timestamp: "2026-08-27T00:00:01.000Z",
+    source: "test", details: ["3 deleted bases"] }];
+  const consensusSnapshot = structuredClone(bundle.consensuses), contaminationSnapshot = structuredClone(bundle.contamination);
+  const review = buildStoredConsensusThresholdReview(bundle);
+  assert.equal(review.phase, "consensus-filters"); assert.equal(review.samples[0].current.agreementThreshold, .6);
+  const plan = prepareConsensusThresholdReanalysis(bundle, { id: review.id, phase: review.phase,
+    parameters: { agreementThreshold: .8, artefactFraction: .2, outlierQuantile: .95 }, samples: [{ sample: "sample_1" }] });
+  assert.equal(plan.target, "tree"); assert.deepEqual(plan.bundle.consensuses, consensusSnapshot);
+  assert.deepEqual(plan.bundle.contamination, contaminationSnapshot); assert.equal(plan.bundle.config.parameters.agreementThreshold, .8);
+  assert.deepEqual(plan.bundle.records, []); assert.deepEqual(plan.bundle.alignments, {}); assert.deepEqual(plan.bundle.trees, {});
+  assert.equal(plan.bundle.alignmentEdits, undefined); assert.equal(plan.bundle.alignmentEditHistory.length, 1);
+  assert.equal(plan.bundle.optionalStages.postprocessing.state, "deferred"); assert.equal(plan.bundle.optionalStages.collapse.state, "deferred");
+  assert.equal(plan.bundle.optionalStages.tree.state, "deferred"); assert.equal(plan.bundle.thresholdSelections.at(-1).phase, "consensus-filters");
+
+  const partial = resultBundle(); partial.optionalStages.collapse = { state: "skipped", detail: "user choice", updatedUtc: "2026-08-27T00:00:00.000Z" };
+  partial.optionalStages.tree = { state: "deferred", detail: "waiting", updatedUtc: "2026-08-27T00:00:00.000Z" };
+  const partialReview = buildStoredConsensusThresholdReview(partial), partialPlan = prepareConsensusThresholdReanalysis(partial,
+    { id: partialReview.id, phase: partialReview.phase, parameters: { agreementThreshold: .7 }, samples: [{ sample: "sample_1" }] });
+  assert.equal(partialPlan.target, "postprocessing"); assert.equal(partialPlan.untouchedStatuses.collapse.state, "skipped");
+  assert.equal(partialPlan.untouchedStatuses.tree.state, "deferred");
+  const recomputedCheckpoint = structuredClone(partialPlan.bundle);
+  recomputedCheckpoint.optionalStages.postprocessing = { state: "completed", detail: "recomputed", updatedUtc: "2026-08-27T00:00:02.000Z" };
+  recomputedCheckpoint.optionalStages.collapse = { state: "deferred", detail: "reset by postprocessing", updatedUtc: "2026-08-27T00:00:02.000Z" };
+  assert.equal(restoreUntouchedThresholdStatuses(recomputedCheckpoint, partialPlan).optionalStages.collapse.state, "skipped");
 });
 
 test("skipped contamination remains an independent bypass while true downstream prerequisites stay explicit", () => {
@@ -632,7 +664,8 @@ function resultBundle() {
       "sample_1/functional-nucleotide": ">functional_reference\nATGTAA\n" },
     collapseGroups: { sample_1: [{ sample: "sample_1", representativeId: "c1", memberIds: ["c1"], familyCount: 1 }] },
     inputMappings: [{ slot: "panel.fa", role: "panel", expectedName: "panel.fa", uploadedName: "renamed.fasta", uploadedSize: 12 }],
-    runOptions: { deferPhylogeny: false, deferContamination: false, deferPostprocessing: false, deferCollapse: false, spoolStorage: "external-directory" },
+    runOptions: { deferPhylogeny: false, deferContamination: false, deferPostprocessing: false, deferCollapse: false,
+      runWhenNotInFocus: true, spoolStorage: "external-directory" },
     optionalStages: Object.fromEntries(["contamination", "postprocessing", "collapse", "tree"].map((stage) => [stage, { state: "completed", detail: "test complete", updatedUtc: "2026-08-27T00:00:00.000Z" }])),
     trees: { "sample_1/nucleotide": "(c1:0.0);" }, log: ["complete"],
   };
@@ -667,6 +700,8 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   assert.throws(() => encodeResult(inconsistent), /inconsistent consensus sequence/);
   const unknownStorage = structuredClone(bundle); unknownStorage.runOptions.spoolStorage = "cloud";
   assert.throws(() => encodeResult(unknownStorage), /spoolStorage is not recognized/);
+  const invalidBackgroundMode = structuredClone(bundle); invalidBackgroundMode.runOptions.runWhenNotInFocus = "yes";
+  assert.throws(() => encodeResult(invalidBackgroundMode), /runOptions\.runWhenNotInFocus/);
   const wrongSelection = structuredClone(bundle); wrongSelection.summaries[0].selectedReads = 2; wrongSelection.summaries[0].downsampledReads = 1;
   assert.throws(() => encodeResult(wrongSelection), /selected-read count does not match/);
   const legacyCollapse = structuredClone(bundle); legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .67;
@@ -722,6 +757,9 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(pipeline, /readBlocks\[partition\] = "loaded"/); assert.match(pipeline, /readBlocks\[partition\] = "complete"/);
   assert.match(app, /Read blocks/); assert.match(styles, /\.read-block-grid/);
   assert.match(app, /wakeLock/); assert.match(app, /addEventListener\("visibilitychange", visibilityChanged\)/);
+  assert.match(app, />Run when not in focus</); assert.match(app, /startProcessingHum/); assert.match(app, /stopProcessingHum/);
+  assert.match(pipeline, /background execution aid:/); assert.match(pipeline, /runWhenNotInFocus: activeBackgroundMode/);
+  assert.match(app, /postMessage\(\{ type: "background-mode", enabled \}\)/);
   assert.match(app, /addEventListener\("beforeunload", warnBeforeLeaving\)/);
   assert.match(app, /addEventListener\("popstate", interceptHistoryDeparture\)/);
   assert.match(app, /Leave anyway/); assert.match(app, /history\.go\(-2\)/);
@@ -733,6 +771,44 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(results, /Static SVG tree \+ highlighter plots/);
 });
 
+test("optional background mode emits a real quiet signal and tears it down cleanly", async () => {
+  class FakeParam {
+    value = 0; events = [];
+    setValueAtTime(value, time) { this.value = value; this.events.push(["set", value, time]); }
+    linearRampToValueAtTime(value, time) { this.value = value; this.events.push(["ramp", value, time]); }
+    cancelScheduledValues(time) { this.events.push(["cancel", time]); }
+  }
+  class FakeNode {
+    connections = [];
+    connect(target) { this.connections.push(target); return target; }
+  }
+  class FakeGain extends FakeNode { gain = new FakeParam(); }
+  class FakeFilter extends FakeNode { type = "lowpass"; frequency = new FakeParam(); Q = new FakeParam(); }
+  class FakeOscillator extends FakeNode {
+    type = "sine"; frequency = new FakeParam(); starts = []; stops = [];
+    start(time) { this.starts.push(time); }
+    stop(time) { this.stops.push(time); }
+  }
+  class FakeContext {
+    currentTime = 4; state = "suspended"; destination = new FakeNode(); gains = []; oscillators = []; filters = []; resumes = 0; closes = 0;
+    createGain() { const node = new FakeGain(); this.gains.push(node); return node; }
+    createOscillator() { const node = new FakeOscillator(); this.oscillators.push(node); return node; }
+    createBiquadFilter() { const node = new FakeFilter(); this.filters.push(node); return node; }
+    async resume() { this.resumes++; this.state = "running"; }
+    async close() { this.closes++; this.state = "closed"; }
+  }
+  const context = new FakeContext(), hum = new ProcessingHum(() => context);
+  await hum.start(); await hum.start();
+  assert.equal(hum.active, true); assert.equal(context.resumes, 1); assert.equal(context.oscillators.length, 3);
+  assert(context.oscillators.every((source) => source.starts.length === 1));
+  assert(context.gains[0].gain.events.some(([kind, value]) => kind === "ramp" && value === PROCESSING_HUM_LEVEL));
+  assert(PROCESSING_HUM_LEVEL > 0 && PROCESSING_HUM_LEVEL < 0.02, "signal must be non-silent and intentionally quiet");
+  await hum.stop();
+  assert.equal(hum.active, false); assert(context.oscillators.every((source) => source.stops.length === 1));
+  assert(context.gains[0].gain.events.some(([kind, value]) => kind === "ramp" && value === 0));
+  assert.equal(context.closes, 1);
+});
+
 test("landing, configuration, and result sections link to built detailed Methods pages", async () => {
   const [app, configForm, results, methods, preprocessingHtml, consensusHtml, downstreamHtml, vite] = await Promise.all([
     readFile("src/App.tsx", "utf8"), readFile("src/components/config-form.tsx", "utf8"),
@@ -740,10 +816,24 @@ test("landing, configuration, and result sections link to built detailed Methods
     readFile("methods-preprocessing.html", "utf8"), readFile("methods-consensus.html", "utf8"),
     readFile("methods-downstream.html", "utf8"), readFile("vite.config.ts", "utf8"),
   ]);
-  assert.match(app, /href="\.\/methods\.html"/); assert.match(app, /Detailed preprocessing methods/);
+  assert.match(app, /href="\.\/methods\.html" target="_blank" rel="noreferrer"/); assert.match(app, /Detailed preprocessing methods/);
   assert.match(configForm, /MethodLink topic=/); assert.match(results, /topic="contamination"/);
+  assert.match(methods, /href="https:\/\/github\.com\/MurrellGroup\/webPORPID" target="_blank" rel="noreferrer"/);
   for (const id of ["streaming-storage", "umi-offspring", "heteroduplex", "family-consensus", "optional-stages", "contamination", "functional-filter", "alignment-phylogeny"])
     assert.match(methods, new RegExp(`id="${id}"`));
   assert.match(preprocessingHtml, /data-methods-page="preprocessing"/); assert.match(consensusHtml, /data-methods-page="consensus"/);
   assert.match(downstreamHtml, /data-methods-page="downstream"/); assert.match(vite, /methods-downstream\.html/);
+});
+
+test("the current UI exposes only consensus review and the requested overview columns", async () => {
+  const [app, pipeline, results, methodLink, methods] = await Promise.all([
+    readFile("src/App.tsx", "utf8"), readFile("src/pipeline-worker.ts", "utf8"), readFile("src/components/results-explorer.tsx", "utf8"),
+    readFile("src/components/method-link.tsx", "utf8"), readFile("src/Methods.tsx", "utf8"),
+  ]);
+  assert.match(app, />Review consensus thresholds interactively</); assert.doesNotMatch(app, /Review UMI and consensus thresholds/);
+  assert.doesNotMatch(pipeline, /buildUmiThresholdReview/); assert.match(results, /Return to consensus thresholds review/);
+  assert.doesNotMatch(results, /label="Subsampled"/); assert.doesNotMatch(results, /Subsampling percentages use demultiplexed reads/);
+  assert.doesNotMatch(results, /label="Functional represented-family rejects"/); assert.doesNotMatch(results, /label="Functional variants evaluated"/);
+  assert.match(results, /label="Collapsed haplotypes"/); assert.match(methodLink, /target="_blank" rel="noreferrer"/);
+  assert.match(methods, /There is no interactive UMI-threshold pause/); assert.match(methods, /Return to consensus thresholds review/);
 });

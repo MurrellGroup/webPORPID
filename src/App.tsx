@@ -8,6 +8,7 @@ import { ResultsExplorer } from "./components/results-explorer";
 import { ConfigForm } from "./components/config-form";
 import { MethodLink } from "./components/method-link";
 import { ThresholdReviewDialog } from "./components/threshold-review";
+import { ProcessingHum } from "./processing-hum";
 import packageInformation from "../package.json";
 
 export const APP_VERSION = packageInformation.version;
@@ -90,6 +91,7 @@ export default function App() {
   const [deferCollapse, setDeferCollapse] = useState(false);
   const [deferPhylogeny, setDeferPhylogeny] = useState(false);
   const [interactiveFiltering, setInteractiveFiltering] = useState(false);
+  const [runWhenNotInFocus, setRunWhenNotInFocus] = useState(false);
   const [spoolStorage, setSpoolStorage] = useState<SpoolStorage>(() =>
     typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function" ? "external-directory" : "automatic");
   const [scratchDirectory, setScratchDirectory] = useState<ExternalScratchDirectoryHandle>();
@@ -101,9 +103,12 @@ export default function App() {
   const [skippingStage, setSkippingStage] = useState<OptionalStageName>();
   const [thresholdReview, setThresholdReview] = useState<ThresholdReview>();
   const [backgroundStatus, setBackgroundStatus] = useState("");
+  const [processingHumStatus, setProcessingHumStatus] = useState("");
   const [navigationBlocked, setNavigationBlocked] = useState(false);
   const workerRef = useRef<Worker | undefined>(undefined);
   const wakeLockRef = useRef<WakeLockSentinelLike | undefined>(undefined);
+  const processingHumRef = useRef<ProcessingHum | undefined>(undefined), processingHumRequestRef = useRef(0);
+  const runWhenNotInFocusRef = useRef(false);
   const protectWorkRef = useRef(false), historyGuardRef = useRef(false), confirmedLeaveRef = useRef(false);
   const maxWorkers = useMemo(() => Math.max(1, navigator.hardwareConcurrency || 1), []);
   const externalScratchSupported = typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function";
@@ -113,6 +118,39 @@ export default function App() {
     || Object.keys(referenceAssignments).length || unassignedReferences.length);
 
   useEffect(() => { protectWorkRef.current = hasWorkToProtect; }, [hasWorkToProtect]);
+
+  function stopProcessingHum() {
+    processingHumRequestRef.current++;
+    const hum = processingHumRef.current; processingHumRef.current = undefined;
+    setProcessingHumStatus("");
+    if (hum) void hum.stop();
+  }
+
+  async function startProcessingHum() {
+    const request = ++processingHumRequestRef.current;
+    const hum = processingHumRef.current ?? new ProcessingHum(); processingHumRef.current = hum;
+    setProcessingHumStatus("Starting the quiet processing hum…");
+    try {
+      await hum.start();
+      if (request !== processingHumRequestRef.current || processingHumRef.current !== hum) { void hum.stop(); return; }
+      setProcessingHumStatus("Quiet processing hum active · best-effort background mode");
+    } catch (cause) {
+      if (request !== processingHumRequestRef.current) return;
+      processingHumRef.current = undefined;
+      const reason = cause instanceof Error ? cause.message : String(cause);
+      setProcessingHumStatus(`Quiet processing hum unavailable: ${reason} Analysis is still running.`);
+    }
+  }
+
+  function changeRunWhenNotInFocus(enabled: boolean) {
+    runWhenNotInFocusRef.current = enabled;
+    setRunWhenNotInFocus(enabled);
+    if (running) workerRef.current?.postMessage({ type: "background-mode", enabled });
+    if (!enabled) stopProcessingHum();
+    else if (running) void startProcessingHum();
+  }
+
+  useEffect(() => () => { processingHumRequestRef.current++; void processingHumRef.current?.stop(); }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -297,6 +335,7 @@ export default function App() {
     setError(""); setResult(undefined); setRunning(true); setCancelling(false); setSkippingStage(undefined);
     setProgress({ stage: "preprocessing", fraction: 0, detail: "Checking the configuration and preparing local workers",
       sampleAssignments: draftConfig.samples.map((sample) => ({ sample: sample.name, reads: 0 })) });
+    if (runWhenNotInFocusRef.current) void startProcessingHum();
     try {
       if (spoolStorage === "external-directory") {
         if (!scratchDirectory) throw new Error("Choose a writable scratch directory before starting the external-disk run.");
@@ -320,18 +359,19 @@ export default function App() {
           setSkippingStage((current) => current && (nextProgress.stage !== current || nextProgress.fraction >= 1) ? undefined : current);
         }
         if (event.data.type === "threshold-review") setThresholdReview(event.data.review);
-        if (event.data.type === "result") { setResult(event.data.result); setRunning(false); setCancelling(false); setSkippingStage(undefined); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; }
-        if (event.data.type === "error") { setError(event.data.message); setRunning(false); setCancelling(false); setSkippingStage(undefined); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; }
+        if (event.data.type === "result") { stopProcessingHum(); setResult(event.data.result); setRunning(false); setCancelling(false); setSkippingStage(undefined); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; }
+        if (event.data.type === "error") { stopProcessingHum(); setError(event.data.message); setRunning(false); setCancelling(false); setSkippingStage(undefined); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; }
       };
-      worker.onerror = (event) => { setError(event.message || "The pipeline worker failed."); setRunning(false); setCancelling(false); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; };
+      worker.onerror = (event) => { stopProcessingHum(); setError(event.message || "The pipeline worker failed."); setRunning(false); setCancelling(false); setThresholdReview(undefined); worker.terminate(); workerRef.current = undefined; };
       worker.postMessage({ type: "run", file: fastq, config, workers, deferContamination, deferPostprocessing, deferCollapse, deferPhylogeny,
-        interactiveFiltering, inputMappings, spoolStorage,
+        interactiveFiltering, runWhenNotInFocus: runWhenNotInFocusRef.current, inputMappings, spoolStorage,
         scratchDirectory: spoolStorage === "external-directory" ? scratchDirectory : undefined });
-    } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); setRunning(false); setCancelling(false); }
+    } catch (cause) { stopProcessingHum(); setError(cause instanceof Error ? cause.message : String(cause)); setRunning(false); setCancelling(false); }
   }
 
   function cancel() {
     workerRef.current?.postMessage({ type: "cancel" });
+    stopProcessingHum();
     setCancelling(true); setError(""); setThresholdReview(undefined);
     setProgress((current) => current ? { ...current, detail: "Cancelling safely and removing temporary read files…" } : current);
   }
@@ -370,7 +410,7 @@ export default function App() {
   }
 
   return <div className="app-shell">
-    <header className="site-header"><a className="brand" href={import.meta.env.BASE_URL} aria-label="webPORPID home"><span className="brand-mark">wp</span><span>webPORPID<small>Nanopore &amp; PacBio analysis</small></span></a><div className="site-header-right"><nav><a href="#run">Run</a><a href="./methods.html">Methods</a><a href="https://github.com/MurrellGroup/webPORPID">GitHub</a></nav><span className="app-version" title={`webPORPID ${APP_VERSION}`}>v{APP_VERSION}</span></div></header>
+    <header className="site-header"><a className="brand" href={import.meta.env.BASE_URL} aria-label="webPORPID home"><span className="brand-mark">wp</span><span>webPORPID<small>Nanopore &amp; PacBio analysis</small></span></a><div className="site-header-right"><nav><a href="#run">Run</a><a href="./methods.html" target="_blank" rel="noreferrer">Methods</a><a href="https://github.com/MurrellGroup/webPORPID" target="_blank" rel="noreferrer">GitHub</a></nav><span className="app-version" title={`webPORPID ${APP_VERSION}`}>v{APP_VERSION}</span></div></header>
     {!result ? <>
       <main className="landing">
         <section className="intro"><div><span className="section-kicker">PORPID, entirely on your machine</span><h1>From long reads to auditable within-host variants.</h1><p>Stream compressed FASTQ through demultiplexing, probabilistic UMI grouping, indel-aware consensus, contamination control, panel and functional filters—without uploading sequence data.</p><div className="privacy-pill"><span />Input reads stay in this browser or CLI process.</div></div><div className="intro-card"><strong>C++20 · WASI · SIMD</strong><p>The same portable core runs in browser workers and <code>porpid-cli</code>. Intermediate reads are partitioned to disk-backed storage and released after consensus.</p><dl><div><dt>Input</dt><dd>.fastq / .fastq.gz</dd></div><div><dt>Output</dt><dd>.webporpid</dd></div><div><dt>Default CPUs</dt><dd>{maxWorkers}</dd></div></dl></div></section>
@@ -407,8 +447,8 @@ export default function App() {
             </div>
             {noDownsampling && <p className="scratch-recommendation"><strong>No downsampling is enabled.</strong> Every demultiplexed sequence and quality string must survive until the global UMI model and consensus pass. Use an external scratch disk with ample free space; 256 spool partitions is recommended for bounded per-worker memory on very large runs.</p>}
           </section>
-          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Decision and optional-stage controls</strong><label><input type="checkbox" checked={interactiveFiltering} onChange={(event) => setInteractiveFiltering(event.target.checked)} /><span>Review UMI and consensus thresholds interactively</span></label><small>Pauses after UMI probability fitting, then again after consensus and any applied contamination eligibility are known. Each cutoff has a live plot, slider, unrestricted direct numeric entry, and a persisted audit record.</small><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse + functional filtering</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Contamination can be deferred or skipped without blocking later work; downstream outputs then retain every sequence at that gate and are labelled unfiltered. Functional filtering runs only on collapsed variants, so it is deferred with collapse. The default phylogeny also requires collapse.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}<small className="background-compute-note">Runs use dedicated workers and request a wake lock. Keep the browser open; minimized/background execution remains subject to browser and OS suspension.</small></div></div>
-          {progress && running && <StageProgress value={progress} onSkip={skipOptionalStage} skipping={skippingStage === progress.stage} backgroundStatus={backgroundStatus} />}
+          <div className="run-bar"><label><span>CPU workers</span><input type="number" min="1" max={maxWorkers} value={workers} onChange={(event) => setWorkers(Math.max(1, Math.min(maxWorkers, Number(event.target.value) || 1)))} /><small>Maximum detected: {maxWorkers}</small></label><div className="defer-options"><strong>Decision and optional-stage controls</strong><label><input type="checkbox" checked={interactiveFiltering} onChange={(event) => setInteractiveFiltering(event.target.checked)} /><span>Review consensus thresholds interactively</span></label><label className="background-run-option"><input type="checkbox" checked={runWhenNotInFocus} onChange={(event) => changeRunWhenNotInFocus(event.target.checked)} /><span>Run when not in focus</span></label><small className="background-run-explanation">When enabled, a genuinely audible but very quiet engine hum plays continuously during processing. This can reduce Chrome background throttling, but cannot prevent browser or operating-system suspension. It stops automatically when processing stops.</small><small>Interactive review pauses once consensus agreement and any applied contamination eligibility are known. Agreement, outlier-quantile, and artefact-fraction cutoffs have live plots, sliders, unrestricted direct numeric entry, and a persisted audit record. Completed results include a button to revisit this decision and rerun only downstream work.</small><label><input type="checkbox" checked={deferContamination} onChange={(event) => setDeferContamination(event.target.checked)} /><span>Defer contamination checks</span></label><label><input type="checkbox" checked={deferPostprocessing} onChange={(event) => setDeferPostprocessing(event.target.checked)} /><span>Defer alignment + downstream filtering</span></label><label><input type="checkbox" checked={deferCollapse} onChange={(event) => setDeferCollapse(event.target.checked)} /><span>Defer haplotype collapse + functional filtering</span></label><label><input type="checkbox" checked={deferPhylogeny} onChange={(event) => setDeferPhylogeny(event.target.checked)} /><span>Defer phylogeny inference</span></label><small>Contamination can be deferred or skipped without blocking later work; downstream outputs then retain every sequence at that gate and are labelled unfiltered. Functional filtering runs only on collapsed variants, so it is deferred with collapse. The default phylogeny also requires collapse.</small></div><div>{running ? <button className="danger" type="button" disabled={cancelling} onClick={cancel}>{cancelling ? "Cancelling…" : "Cancel analysis"}</button> : <button className="primary run-button" type="button" onClick={() => void run()}>Run webPORPID</button>}<small className="background-compute-note">Runs use dedicated workers and request a wake lock. The optional quiet-audio mode is the stronger browser-retention aid; keep the browser open.</small></div></div>
+          {progress && running && <StageProgress value={progress} onSkip={skipOptionalStage} skipping={skippingStage === progress.stage} backgroundStatus={[processingHumStatus, backgroundStatus].filter(Boolean).join(" · ")} />}
           {error && <div className="error-box" role="alert">{error}</div>}
         </section>
         <section className="method-strip" id="about"><article><span>01</span><h3>Stream &amp; demultiplex</h3><p>Gzip chunks are decoded incrementally. Read-quality, primer, orientation, sample-ID and BPB logic follows the nanopore branch.</p><MethodLink topic="streaming" label="Detailed preprocessing methods" /></article><article><span>02</span><h3>Group &amp; call consensus</h3><p>Sparse two-error offspring likelihoods, LDA decisions, heteroduplex QC, seeded alignment and minimum-agreement counting.</p><MethodLink topic="consensus" label="Detailed consensus methods" /></article><article><span>03</span><h3>Filter &amp; explore</h3><p>Run-aware contamination, panel and functional filters, APOBEC model, aligned variants, phylogeny and component exports.</p><MethodLink topic="contamination" label="Detailed downstream methods" /></article></section>

@@ -20,6 +20,8 @@ The likelihood matrix is stored as sparse rows instead of the original dense/all
 
 The decision sequence is LDA posterior, eight-base UMI length, then configured family-size threshold/override. BPB rejects are retained in the family report. The first 50 quality positions are used for the same heteroduplex t-test and minimum-barcode-quality condition before an otherwise accepted family enters consensus.
 
+UMI posterior and family-size thresholds are fixed by configuration before consensus begins. Current runs do not pause for an interactive UMI-threshold decision because changing those gates changes which families receive consensus calls, and the compact saved project intentionally contains no raw reads with which to replay that boundary.
+
 ## Indel-tolerant family consensus
 
 The consensus path does not assume low indel rates.
@@ -56,6 +58,14 @@ One intentional reproducibility difference remains: Julia resolves ambiguous IUP
 - The functional filter is evaluated only on exact collapsed nucleotide variants; uncollapsed UMI-family consensuses never receive functional decisions. It selects the longest complete start-to-stop ORF across three frames and rejects a sequence as `noORF-reject` when none exists. Eligible sample ORFs are translated and amino-acid aligned first. The reference is then affine-aligned to that fixed sample profile, inserting only shared all-gap columns into existing rows, and the result is backtranslated with complete codon gaps. The supplied reference FASTA name is retained on the first row and the alignment is clipped to its first/last non-gap nucleotide. Passing `sample_vN_K` variants use `sample_vN rm=0.yy` in functional outputs; the two-decimal reference match, original collapse identity, and UMI-family multiplicity are all retained separately.
 - APOBEC summaries use the local four-state mutation grid and posterior integration; they are reporting fields rather than a filtering gate.
 - Accepted nucleotide sequences are aligned with the packaged MSA and nucleotide trees use packaged FastTree. Protein exploration does not depend on the optional functional filter: it directly translates every active aligned nucleotide row, with `--- → -` and mixed-gap/ambiguous/incomplete codons → `X`, using a persisted frame offset of 0, 1, or 2.
+
+The optional interactive decision occurs once, after consensus agreement and any applied contamination eligibility are known but before post-processing. It exposes agreement, outlier-quantile, and artefact-fraction controls with exact full-data distributions and a bounded display-only point sample. The accepted values, overrides, time, and changes are stored in the project and log.
+
+If that option was enabled for the run, the completed results page can reconstruct the same dialogue from stored consensus and UMI-family records. Accepting revised thresholds leaves UMI classification, consensus sequences, and contamination calls unchanged. It detaches active alignment edits while preserving their audit history, then recomputes downstream filters, alignments, collapse, functional filtering, and the default tree only as far as those stages had previously completed. A deliberately deferred or skipped stage remains deferred or skipped.
+
+## Browser execution and background retention
+
+Pipeline computation runs in dedicated workers and requests a Screen Wake Lock while visible. The optional **Run when not in focus** mode starts a genuinely audible, very quiet Web Audio oscillator from the user's Run gesture and keeps it alive only for the active run. This can reduce browser background throttling but cannot override browser or operating-system suspension. The CLI is the reliable route for unattended processing.
 
 ## Large-alignment batching difference
 

@@ -4017,7 +4017,8 @@ function validateResult(value) {
 			"deferContamination",
 			"deferPostprocessing",
 			"deferCollapse",
-			"interactiveFiltering"
+			"interactiveFiltering",
+			"runWhenNotInFocus"
 		]) if (options[key] != null) bool(options[key], `runOptions.${key}`);
 		if (options.spoolStorage != null && !["automatic", "external-directory"].includes(text(options.spoolStorage, "runOptions.spoolStorage"))) throw new Error("runOptions.spoolStorage is not recognized.");
 	}
@@ -4606,7 +4607,7 @@ function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-pane
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.12";
+const VERSION = "0.3.14";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

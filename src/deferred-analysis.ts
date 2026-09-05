@@ -1,10 +1,13 @@
 import { classifyContaminationAsync } from "./contamination";
 import { runFastTreeIsolated } from "./biowasm";
 import { runAlivibeMsa } from "./alivibe-msa-runtime";
+import { prepareConsensusThresholdReanalysis, restoreStoredPipelineConfig, restoreUntouchedThresholdStatuses } from "./consensus-threshold-reanalysis";
 import { collapsePostprocess, postprocess, type PostprocessOutput } from "./postprocess";
-import { OPTIONAL_STAGE_ORDER, markOptionalStageSkipped, restorePipelineConfig, stageCompleted, stageStatus, statusRecord } from "./optional-stages";
+import { OPTIONAL_STAGE_ORDER, markOptionalStageSkipped, stageCompleted, stageStatus, statusRecord } from "./optional-stages";
 import { treeTipNames } from "./tree-names";
-import type { OptionalStageName, PipelineConfig, PipelineTiming, ResultBundle } from "./types";
+import type { OptionalStageName, PipelineTiming, ResultBundle, ThresholdSelection } from "./types";
+
+export { buildStoredConsensusThresholdReview, prepareConsensusThresholdReanalysis } from "./consensus-threshold-reanalysis";
 
 export interface DeferredAnalysisProgress { stage: OptionalStageName; fraction: number; detail: string }
 export interface DeferredAnalysisOptions {
@@ -33,6 +36,16 @@ function report(options: DeferredAnalysisOptions, stage: OptionalStageName, frac
 
 function checkpoint(options: DeferredAnalysisOptions, bundle: ResultBundle) { options.onCheckpoint?.(bundle); return bundle; }
 
+/** Apply new consensus thresholds and recompute through the prior completion boundary. */
+export async function recomputeAfterConsensusThresholds(bundle: ResultBundle, selection: ThresholdSelection,
+  options: DeferredAnalysisOptions = {}): Promise<ResultBundle> {
+  const plan = prepareConsensusThresholdReanalysis(bundle, selection);
+  if (!plan.target) return checkpoint(options, plan.bundle);
+  const wrapped: DeferredAnalysisOptions = { ...options,
+    onCheckpoint: (value) => options.onCheckpoint?.(restoreUntouchedThresholdStatuses(value, plan)) };
+  return restoreUntouchedThresholdStatuses(await computeThrough(plan.bundle, plan.target, wrapped), plan);
+}
+
 export { markOptionalStageSkipped };
 
 /** Compute a requested optional output plus every missing prerequisite. */
@@ -43,12 +56,7 @@ export async function computeThrough(bundle: ResultBundle, target: OptionalStage
     && bundle.config.parameters.contaminationFilter;
   if (targetIndex >= 1 && (!stageCompleted(bundle, "postprocessing") || contaminationReapply) && !bundle.downstreamResources)
     throw new Error("This project does not contain the panel/reference sequences required to resume downstream filtering. Re-run from the FASTQ with webPORPID 0.3.6 or later.");
-  const config: PipelineConfig = bundle.downstreamResources
-    ? restorePipelineConfig(bundle.config, bundle.downstreamResources, bundle.contaminationReferences)
-    : { dataset: bundle.config.dataset, contaminationPanel: bundle.config.contaminationPanel,
-      contaminationPanelSequences: (bundle.contaminationReferences ?? []).map((record) => ({ ...record })),
-      parameters: { ...bundle.config.parameters, deterministicSeed: BigInt(bundle.config.parameters.deterministicSeed) },
-      samples: bundle.config.samples.map((sample) => ({ ...sample, panelSequences: [] })) };
+  const config = restoreStoredPipelineConfig(bundle);
   let current: ResultBundle = { ...bundle, optionalStages: explicitStatuses(bundle) };
 
   if (target === "contamination" && !stageCompleted(current, "contamination")) {

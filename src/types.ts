@@ -303,8 +303,10 @@ export interface RunOptions {
   deferCollapse?: boolean;
   /** Browser read-spool location; absent in older results and CLI runs. */
   spoolStorage?: "automatic" | "external-directory";
-  /** Pause at inspectable UMI and consensus-filter decision checkpoints. */
+  /** Pause at the inspectable consensus-filter decision checkpoint. */
   interactiveFiltering?: boolean;
+  /** Request the browser's quiet audible background-compute aid. */
+  runWhenNotInFocus?: boolean;
 }
 
 export type ThresholdReviewPhase = "umi" | "consensus-filters";
