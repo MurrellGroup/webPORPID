@@ -390,6 +390,8 @@ export interface ResultBundle {
   referenceAlignments?: Record<string, string>;
   /** Collapsed haplotypes and the UMI-family members represented by each tip. */
   collapseGroups?: Record<string, CollapseGroup[]>;
+  /** Sample-scoped functional-filter failures; collapse and every other sample remain usable. */
+  functionalFilterErrors?: Record<string, string>;
   /** Exact user-file to configuration-slot assignments used for this run. */
   inputMappings?: InputFileMapping[];
   runOptions?: RunOptions;

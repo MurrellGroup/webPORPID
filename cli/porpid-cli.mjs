@@ -969,11 +969,13 @@ function uncollapsedSequenceName(record) {
 function uncollapsedSequenceId(name) {
 	return name.replace(/\s+fs=\d+\s+minag=[^\s]+$/, "");
 }
-/**
-* Functional variants retain sample and abundance-rank identity but replace
-* the collapsed family-count suffix with their reference-match annotation.
-*/
+/** Functional variants retain their complete collapsed identity and count. */
 function functionalSequenceName(group) {
+	if (group.referenceMatch == null) return group.representativeId;
+	return `${group.representativeId} rm=${group.referenceMatch.toFixed(2)}`;
+}
+/** Functional label written by webPORPID 0.3.10–0.3.14; read-only compatibility. */
+function legacyFunctionalSequenceName(group) {
 	if (group.referenceMatch == null) return group.representativeId;
 	return `${/^(.*_v\d+)_\d+$/.exec(group.representativeId)?.[1] ?? group.representativeId} rm=${group.referenceMatch.toFixed(2)}`;
 }
@@ -1441,6 +1443,72 @@ function backtranslate(alignedAminoAcids, codingNucleotides) {
 	if (offset !== codingNucleotides.length) throw new Error("The amino-acid alignment did not preserve its nucleotide coding sequence.");
 	return output;
 }
+function splitAgainstAnchor(anchor, alignedAnchor, alignedSequence) {
+	if (alignedAnchor.length !== alignedSequence.length || degap(alignedAnchor) !== anchor) throw new Error("The sequence-preserving amino-acid fallback returned an invalid anchor.");
+	const insertions = Array.from({ length: anchor.length + 1 }, () => ""), residues = Array(anchor.length);
+	let position = 0;
+	for (let column = 0; column < alignedAnchor.length; column++) if (alignedAnchor[column] === "-") insertions[position] += alignedSequence[column];
+	else residues[position++] = alignedSequence[column];
+	if (position !== anchor.length || degap(alignedSequence).length === 0) throw new Error("The sequence-preserving amino-acid fallback returned an invalid row.");
+	return {
+		insertions,
+		residues
+	};
+}
+/**
+* Correctness fallback for a structurally corrupt POA result. Every query is
+* aligned independently to the first (abundance-leading) protein, then the
+* insertion slots are padded into one rectangular alignment. It is linear in
+* the number of rows and cannot delete or invent a residue.
+*/
+function anchorProteinAlignment(sequences) {
+	if (sequences.length < 2) return [...sequences];
+	const anchor = sequences[0], rows = Array(sequences.length);
+	rows[0] = {
+		insertions: Array.from({ length: anchor.length + 1 }, () => ""),
+		residues: [...anchor]
+	};
+	const widths = new Uint32Array(anchor.length + 1);
+	for (let index = 1; index < sequences.length; index++) {
+		const aligned = addSequenceToProfile([anchor], sequences[index]);
+		const parts = splitAgainstAnchor(anchor, aligned.profileRows[0], aligned.sequence);
+		rows[index] = parts;
+		parts.insertions.forEach((value, slot) => {
+			widths[slot] = Math.max(widths[slot], value.length);
+		});
+	}
+	const result = rows.map((row) => {
+		let output = row.insertions[0].padStart(widths[0], "-");
+		for (let position = 0; position < anchor.length; position++) output += row.residues[position] + row.insertions[position + 1].padEnd(widths[position + 1], "-");
+		return output;
+	});
+	result.forEach((row, index) => {
+		if (degap(row) !== sequences[index]) throw new Error("The sequence-preserving amino-acid fallback did not preserve an input protein.");
+	});
+	return result;
+}
+/**
+* An MSA is allowed to choose gaps, never biological residues. Restore benign
+* alphabet/case normalization onto an unchanged gap path; use a strict
+* sequence-preserving fallback if the aligner changed a row's residue count.
+*/
+function preserveProteinSequences(inputs, aligned) {
+	if (aligned.length !== inputs.length || aligned.some((row) => row.length !== aligned[0]?.length)) return anchorProteinAlignment(inputs);
+	let structuralChange = false;
+	const restored = aligned.map((row, index) => {
+		if ([...row].filter((residue) => residue !== "-").length !== inputs[index].length) {
+			structuralChange = true;
+			return row;
+		}
+		let cursor = 0;
+		return [...row].map((residue) => residue === "-" ? "-" : inputs[index][cursor++]).join("");
+	});
+	if (structuralChange) return anchorProteinAlignment(inputs);
+	restored.forEach((row, index) => {
+		if (degap(row) !== inputs[index]) throw new Error("The amino-acid alignment did not preserve an input protein.");
+	});
+	return restored;
+}
 /**
 * Align the eligible sample ORFs in amino-acid space first, freeze that sample
 * profile, and add the translated reference without moving existing residues.
@@ -1476,7 +1544,7 @@ async function functionalFilterBatch(referenceName, reference, sequences, thresh
 		referenceAa: translate(referenceCoding)
 	};
 	const sampleAminoInputs = coding.map((row) => translate(row.sequence));
-	const withReference = addSequenceToProfile(sampleAminoInputs.length > 1 ? await runScalableMsa(sampleAminoInputs, runMsa, signal, 3, "amino-acid") : sampleAminoInputs, translate(referenceCoding));
+	const withReference = addSequenceToProfile(preserveProteinSequences(sampleAminoInputs, sampleAminoInputs.length > 1 ? await runScalableMsa(sampleAminoInputs, runMsa, signal, 3, "amino-acid") : sampleAminoInputs), translate(referenceCoding));
 	const nucleotideAlignment = [withReference.sequence, ...withReference.profileRows].map((row, index) => backtranslate(row, index ? coding[index - 1].sequence : referenceCoding));
 	const alignedReference = nucleotideAlignment[0], first = alignedReference.search(/[^-]/);
 	let last = alignedReference.length - 1;
@@ -1513,6 +1581,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 	const panelMsa = options.panelMsa ?? runMafftFftnsMsa;
 	const independentPanelFilter = options.panelFilter ?? runIndependentPanelFilter;
 	const discarded = new Set(contamination.filter((call) => call.discarded).map((call) => call.sequenceId));
+	const activeSampleIndices = config.samples.flatMap((sample, index) => !options.sampleNames || options.sampleNames.has(sample.name) ? [index] : []);
 	const outputs = Array(config.samples.length);
 	let cursor = 0;
 	const sourceBySample = Array.from({ length: config.samples.length }, () => []);
@@ -1521,18 +1590,19 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 		const sampleIndex = config.samples[record.sampleIndex]?.name === record.sample ? record.sampleIndex : sampleIndexByName.get(record.sample);
 		if (sampleIndex !== void 0) sourceBySample[sampleIndex].push(record);
 	}
-	const sampleProgress = Array(config.samples.length).fill(0);
+	const sampleProgress = new Map(activeSampleIndices.map((index) => [index, 0]));
 	const report = (sampleIndex, fraction, detail) => {
-		sampleProgress[sampleIndex] = Math.max(sampleProgress[sampleIndex], Math.max(0, Math.min(1, fraction)));
+		sampleProgress.set(sampleIndex, Math.max(sampleProgress.get(sampleIndex) ?? 0, Math.max(0, Math.min(1, fraction))));
 		onProgress?.({
-			fraction: sampleProgress.reduce((sum, value) => sum + value, 0) / Math.max(1, sampleProgress.length),
+			fraction: [...sampleProgress.values()].reduce((sum, value) => sum + value, 0) / Math.max(1, sampleProgress.size),
 			detail
 		});
 	};
-	await Promise.all(Array.from({ length: Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
+	await Promise.all(Array.from({ length: Math.min(activeSampleIndices.length, Math.max(1, Math.floor(sampleConcurrency))) }, async () => {
 		while (true) {
-			const sampleIndex = cursor++;
-			if (sampleIndex >= config.samples.length) return;
+			const activeIndex = cursor++;
+			if (activeIndex >= activeSampleIndices.length) return;
+			const sampleIndex = activeSampleIndices[activeIndex];
 			const sample = config.samples[sampleIndex], records = [], summaries = [], alignments = {};
 			const referenceAlignments = {}, collapseGroups = {};
 			if (signal?.aborted) throw new DOMException("Analysis cancelled.", "AbortError");
@@ -1554,7 +1624,7 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				report(sampleIndex, .18, panelMode === "independent-query" ? `Aligning ${preliminary.length.toLocaleString()} candidate families independently to the reference panel for ${sample.name}` : `Building the batch MAFFT FFT-NS-2 alignment for ${preliminary.length.toLocaleString()} candidate families in ${sample.name}`);
 				let panelResult;
 				if (panelMode === "independent-query") {
-					const activeSamples = Math.max(1, Math.min(config.samples.length, Math.max(1, Math.floor(sampleConcurrency))));
+					const activeSamples = Math.max(1, Math.min(activeSampleIndices.length, Math.max(1, Math.floor(sampleConcurrency))));
 					panelResult = await independentPanelFilter(rawCandidates, panelRows, signal, options.panelWorkers ?? Math.max(1, Math.floor(Math.max(1, sampleConcurrency) / activeSamples)), ({ completed, total }) => report(sampleIndex, .18 + .2 * completed / Math.max(1, total), `Reference-panel alignment for ${sample.name}: ${completed.toLocaleString()} of ${total.toLocaleString()} families`));
 				} else {
 					const candidates = rawCandidates.length > 1 ? await panelMsa(rawCandidates, signal, 0, "nucleotide", ({ detail }) => report(sampleIndex, .24, `MAFFT FFT-NS-2 for ${sample.name}: ${detail}`)) : rawCandidates;
@@ -1648,35 +1718,44 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 				alignments,
 				referenceAlignments,
 				collapseGroups,
+				functionalFilterErrors: {},
 				collapseSeconds: 0
 			};
 			report(sampleIndex, 1, `Downstream processing complete for sample ${sample.name}`);
 		}
 	}));
+	const completed = outputs.filter((output) => Boolean(output));
 	const combined = {
-		records: outputs.flatMap((output) => output.records),
-		summaries: outputs.flatMap((output) => output.summaries),
-		alignments: Object.assign({}, ...outputs.map((output) => output.alignments)),
-		referenceAlignments: Object.assign({}, ...outputs.map((output) => output.referenceAlignments)),
-		collapseGroups: Object.assign({}, ...outputs.map((output) => output.collapseGroups)),
+		records: completed.flatMap((output) => output.records),
+		summaries: completed.flatMap((output) => output.summaries),
+		alignments: Object.assign({}, ...completed.map((output) => output.alignments)),
+		referenceAlignments: Object.assign({}, ...completed.map((output) => output.referenceAlignments)),
+		collapseGroups: Object.assign({}, ...completed.map((output) => output.collapseGroups)),
+		functionalFilterErrors: Object.assign({}, ...completed.map((output) => output.functionalFilterErrors)),
 		collapseSeconds: 0
 	};
 	return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress, runMsa);
 }
 /** Run family-count-preserving haplotype collapse as its own resumable stage. */
-async function collapsePostprocess(output, config, signal, onProgress, runMsa = runAlivibeMsa) {
+async function collapsePostprocess(output, config, signal, onProgress, runMsa = runAlivibeMsa, sampleNames) {
 	const started = performance.now(), alignments = { ...output.alignments }, referenceAlignments = { ...output.referenceAlignments };
 	const collapseGroups = { ...output.collapseGroups }, summaries = output.summaries.map((summary) => ({ ...summary }));
-	for (const [index, sample] of config.samples.entries()) {
+	const functionalFilterErrors = { ...output.functionalFilterErrors };
+	const activeSamples = config.samples.filter((sample) => !sampleNames || sampleNames.has(sample.name));
+	for (const [index, sample] of activeSamples.entries()) {
 		if (signal?.aborted) throw new DOMException("Haplotype collapse skipped.", "AbortError");
 		onProgress?.({
-			fraction: index / Math.max(1, config.samples.length),
+			fraction: index / Math.max(1, activeSamples.length),
 			detail: `Collapsing identical retained UMI-family sequences for ${sample.name}`
 		});
 		await new Promise((resolvePromise) => setTimeout(resolvePromise, 0));
 		const uncollapsed = alignments[`${sample.name}/uncollapsed-nucleotide`];
 		let collapsedCount = 0, functionalPassed;
 		collapseGroups[sample.name] = [];
+		delete functionalFilterErrors[sample.name];
+		delete alignments[`${sample.name}/functional-nucleotide`];
+		delete alignments[`${sample.name}/functional-protein`];
+		delete referenceAlignments[`${sample.name}/functional-nucleotide`];
 		if (uncollapsed) {
 			const collapsed = collapseAlignment(uncollapsed, sample.name);
 			collapsedCount = collapsed.groups.length;
@@ -1691,10 +1770,31 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 			if (reference) referenceAlignments[`${sample.name}/nucleotide`] = reference;
 			if (sample.functionalReferenceSequence && collapsedRows.length) {
 				onProgress?.({
-					fraction: (index + .45) / Math.max(1, config.samples.length),
+					fraction: (index + .45) / Math.max(1, activeSamples.length),
 					detail: `Checking ${collapsedRows.length.toLocaleString()} collapsed variants against the functional reference for ${sample.name}`
 				});
-				const batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+				let batch;
+				try {
+					batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+				} catch (cause) {
+					if (signal?.aborted || cause instanceof DOMException && cause.name === "AbortError") throw cause;
+					const message = cause instanceof Error ? cause.message : String(cause);
+					functionalFilterErrors[sample.name] = message;
+					onProgress?.({
+						fraction: (index + .8) / Math.max(1, activeSamples.length),
+						detail: `Functional filtering could not be completed for ${sample.name}; recording the sample-specific error and continuing`
+					});
+					const summary = summaries.find((row) => row.sample === sample.name);
+					if (summary) {
+						summary.collapsedSequences = collapsedCount;
+						delete summary.functionalPassed;
+					}
+					onProgress?.({
+						fraction: (index + 1) / Math.max(1, activeSamples.length),
+						detail: `Collapsed ${sample.name} into ${collapsedCount.toLocaleString()} variants; functional filtering failed only for this sample`
+					});
+					continue;
+				}
 				const functionalNucleotideRows = [{
 					name: batch.referenceName,
 					sequence: batch.referenceNt
@@ -1743,7 +1843,7 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 			summary.functionalPassed = functionalPassed;
 		}
 		onProgress?.({
-			fraction: (index + 1) / Math.max(1, config.samples.length),
+			fraction: (index + 1) / Math.max(1, activeSamples.length),
 			detail: `Collapsed ${sample.name} into ${collapsedCount.toLocaleString()} variants${functionalPassed === void 0 ? "" : `; ${functionalPassed.toLocaleString()} passed functional filtering`}; counts represent UMI families`
 		});
 	}
@@ -1753,6 +1853,7 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 		alignments,
 		referenceAlignments,
 		collapseGroups,
+		functionalFilterErrors,
 		collapseSeconds: output.collapseSeconds + (performance.now() - started) / 1e3
 	};
 }
@@ -3984,17 +4085,28 @@ function validateResult(value) {
 				const functionalPass = bool(group.functionalPass, "collapsed functionalPass");
 				if (functionalPass) collapsedFunctionalPasses++;
 				if (hasEmbeddedFunctionalReference && functionalPass && referenceMatch == null) throw new Error("A functional-pass variant in a reference-inclusive alignment is missing its reference-match measure.");
-				const annotatedName = functionalSequenceName({
+				const fields = {
 					representativeId: representative,
 					referenceMatch
-				});
-				if ((functionalNames.has(annotatedName) || !hasEmbeddedFunctionalReference && functionalNames.has(representative)) !== functionalPass) throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
+				};
+				if ((functionalNames.has(functionalSequenceName(fields)) || functionalNames.has(legacyFunctionalSequenceName(fields)) || !hasEmbeddedFunctionalReference && functionalNames.has(representative)) !== functionalPass) throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
 			}
 		});
 		if (representatives.size !== collapsed.records.length || membersSeen.size !== uncollapsed.records.length) throw new Error("Collapse membership does not cover the stored nucleotide alignments.");
 		const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
 		if (summary?.collapsedSequences != null && count(summary.collapsedSequences, "summary collapsed count") !== representatives.size) throw new Error("A summary has an inconsistent collapsed haplotype count.");
 		if (hasCollapsedFunctionalCalls && summary?.functionalPassed != null && count(summary.functionalPassed, "summary functional count") !== collapsedFunctionalPasses) throw new Error("A summary has an inconsistent collapsed functional-pass count.");
+	}
+	if (bundle.functionalFilterErrors != null) for (const [sample, message] of Object.entries(object(bundle.functionalFilterErrors, "functionalFilterErrors"))) {
+		knownSample(sample, `functionalFilterErrors.${sample}`);
+		text(message, `functionalFilterErrors.${sample}`);
+		if (object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`] != null) throw new Error("A sample with a functional-filter error cannot contain a functional alignment.");
+		if (array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample)?.functionalPassed != null) throw new Error("A sample with a functional-filter error cannot report a functional-pass count.");
+		const groups = bundle.collapseGroups == null ? [] : object(bundle.collapseGroups, "collapseGroups")[sample];
+		if (groups != null && array(groups, `collapseGroups.${sample}`).some((entry) => {
+			const group = object(entry, "collapse group");
+			return group.functionalPass != null || group.functionalRejectionReasons != null;
+		})) throw new Error("A sample with a functional-filter error cannot contain partial functional decisions.");
 	}
 	if (bundle.inputMappings != null) array(bundle.inputMappings, "inputMappings").forEach((rawMapping, index) => {
 		const mapping = object(rawMapping, `inputMappings[${index}]`);
@@ -4607,7 +4719,7 @@ function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-pane
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.14";
+const VERSION = "0.3.15";
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {
@@ -5087,6 +5199,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 		storeTiming("collapse", collapseSeconds, collapsedHaplotypes);
 		stageStarted = downstreamFinished;
 		log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; ${functionalHaplotypes} collapsed functional passes; multiplicities count families, not reads`);
+		for (const [sample, message] of Object.entries(downstream.functionalFilterErrors)) log.push(`${now()} functional filter error: ${sample}; ${message}; this sample's functional outputs were omitted and the run continued`);
 		const treeInputs = Object.entries(downstream.alignments).filter(([name]) => name.endsWith("/nucleotide"));
 		let treeEntries = [];
 		if (!deferPhylogeny) {
@@ -5141,6 +5254,7 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 				deferPostprocessing: false,
 				deferCollapse: false
 			},
+			functionalFilterErrors: Object.keys(downstream.functionalFilterErrors).length ? downstream.functionalFilterErrors : void 0,
 			optionalStages: {
 				contamination: statusRecord("completed", `${contamination.filter((call) => call.discarded).length} consensus sequences excluded.`),
 				postprocessing: statusRecord("completed", `${downstream.records.length} consensus-family records evaluated.`),
@@ -5167,6 +5281,7 @@ async function inspect(path) {
 		quality: result.quality,
 		summaries: result.summaries,
 		timings: result.timings ?? [],
+		functionalFilterErrors: result.functionalFilterErrors ?? {},
 		components: {
 			consensuses: result.consensuses.length,
 			families: result.umiFamilies.length,

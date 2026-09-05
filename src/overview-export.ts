@@ -23,10 +23,12 @@ export function buildOverviewExports(bundle: ResultBundle): OverviewExport[] {
     "functionalReadPercent"] as const;
   return [
     { name: "README.txt", text: "Cross-sample tables from the webPORPID overview. Percentage columns are percentages (0–100), not fractions. Optional-stage status distinguishes zero results from work that was not computed.\n" },
-    { name: "sample-summary.csv", text: csv([...summaryKeys], overview.map((row) => summaryKeys.map((key) =>
-      key === "contaminationReadPercent" && !contaminationComplete ? undefined
+    { name: "sample-summary.csv", text: csv([...summaryKeys, "functionalFilterError"], overview.map((row) => [
+      ...summaryKeys.map((key) => key === "contaminationReadPercent" && !contaminationComplete ? undefined
         : (key === "collapsedHaplotypes" || collapseFields.has(key)) && !collapseComplete ? undefined
-          : postprocessingFields.has(key) && !postprocessingComplete ? undefined : row[key]))) },
+          : postprocessingFields.has(key) && !postprocessingComplete ? undefined : row[key]),
+      bundle.functionalFilterErrors?.[row.sample],
+    ])) },
     { name: "input-filtering.csv", text: csv(["key", "label", "count", "percent", "note"], input.map((row) => [row.key, row.label, row.count, row.percent, row.note])) },
     { name: "parameters.csv", text: csv(["scope", "sample", "parameter", "value"], parameters.map((row) => [row.scope, row.sample, row.parameter, row.value])) },
     { name: "optional-stage-status.csv", text: csv(["stage", "state", "detail", "updated_utc"], OPTIONAL_STAGE_ORDER.map((stage) => {

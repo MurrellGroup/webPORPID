@@ -2,7 +2,7 @@ import { decode, encode } from "@msgpack/msgpack";
 import { gzipSync, gunzipSync } from "fflate";
 import { inspectAlignment, summarizeAlignmentChanges, translateAlignmentFasta, validateCorrectedAlignment } from "./alignment-utils.ts";
 import { deduplicateContaminationCalls } from "./contamination.ts";
-import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, uncollapsedSequenceId, uncollapsedSequenceName } from "./sequence-names.ts";
+import { FUNCTIONAL_REFERENCE_NAME, functionalSequenceName, legacyFunctionalSequenceName, uncollapsedSequenceId, uncollapsedSequenceName } from "./sequence-names.ts";
 import type { ResultBundle } from "./types";
 
 const MAGIC = Uint8Array.of(0x57, 0x50, 0x52, 0x00, 0x01, 0x0d, 0x0a, 0x1a);
@@ -252,8 +252,9 @@ function validateResult(value: unknown): asserts value is ResultBundle {
         if (functionalPass) collapsedFunctionalPasses++;
         if (hasEmbeddedFunctionalReference && functionalPass && referenceMatch == null)
           throw new Error("A functional-pass variant in a reference-inclusive alignment is missing its reference-match measure.");
-        const annotatedName = functionalSequenceName({ representativeId: representative, referenceMatch });
-        const present = functionalNames.has(annotatedName) || (!hasEmbeddedFunctionalReference && functionalNames.has(representative));
+        const fields = { representativeId: representative, referenceMatch };
+        const present = functionalNames.has(functionalSequenceName(fields)) || functionalNames.has(legacyFunctionalSequenceName(fields))
+          || (!hasEmbeddedFunctionalReference && functionalNames.has(representative));
         if (present !== functionalPass)
           throw new Error("A collapsed functional decision is inconsistent with the functional alignment.");
       }
@@ -266,6 +267,17 @@ function validateResult(value: unknown): asserts value is ResultBundle {
     if (hasCollapsedFunctionalCalls && summary?.functionalPassed != null
       && count(summary.functionalPassed, "summary functional count") !== collapsedFunctionalPasses)
       throw new Error("A summary has an inconsistent collapsed functional-pass count.");
+  }
+  if (bundle.functionalFilterErrors != null) for (const [sample, message] of Object.entries(object(bundle.functionalFilterErrors, "functionalFilterErrors"))) {
+    knownSample(sample, `functionalFilterErrors.${sample}`); text(message, `functionalFilterErrors.${sample}`);
+    if (object(bundle.alignments, "alignments")[`${sample}/functional-nucleotide`] != null)
+      throw new Error("A sample with a functional-filter error cannot contain a functional alignment.");
+    const summary = array(bundle.summaries, "summaries").map((entry) => object(entry, "summary")).find((entry) => entry.sample === sample);
+    if (summary?.functionalPassed != null) throw new Error("A sample with a functional-filter error cannot report a functional-pass count.");
+    const groups = bundle.collapseGroups == null ? [] : object(bundle.collapseGroups, "collapseGroups")[sample];
+    if (groups != null && array(groups, `collapseGroups.${sample}`).some((entry) => {
+      const group = object(entry, "collapse group"); return group.functionalPass != null || group.functionalRejectionReasons != null;
+    })) throw new Error("A sample with a functional-filter error cannot contain partial functional decisions.");
   }
   if (bundle.inputMappings != null) array(bundle.inputMappings, "inputMappings").forEach((rawMapping, index) => {
     const mapping = object(rawMapping, `inputMappings[${index}]`);

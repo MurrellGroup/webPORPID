@@ -41,6 +41,10 @@ export interface ConsensusThresholdReanalysisPlan {
   bundle: ResultBundle;
   /** Highest previously completed downstream stage; absent when nothing downstream has run yet. */
   target?: Exclude<OptionalStageName, "contamination">;
+  /** Samples whose effective downstream thresholds changed. */
+  affectedSamples: string[];
+  /** Global changes require a run-wide replay; otherwise affectedSamples is exact. */
+  scope: "none" | "samples" | "all";
   /** Statuses to restore for downstream stages that had deliberately remained deferred or skipped. */
   untouchedStatuses: Partial<NonNullable<ResultBundle["optionalStages"]>>;
 }
@@ -52,35 +56,61 @@ export interface ConsensusThresholdReanalysisPlan {
  */
 export function prepareConsensusThresholdReanalysis(bundle: ResultBundle, selection: ThresholdSelection): ConsensusThresholdReanalysisPlan {
   if (selection.phase !== "consensus-filters") throw new Error("Only consensus-filter thresholds can be replayed from a completed project.");
-  const config = restoreStoredPipelineConfig(bundle), families = bundle.umiFamilies.map((family) => ({ ...family }));
+  const config = restoreStoredPipelineConfig(bundle), before = restoreStoredPipelineConfig(bundle);
+  const families = bundle.umiFamilies.map((family) => ({ ...family }));
   const accepted = applyThresholdSelection(config, families, selection), stamp = accepted.acceptedUtc;
   const postprocessingDone = stageCompleted(bundle, "postprocessing"), collapseDone = stageCompleted(bundle, "collapse"), treeDone = stageCompleted(bundle, "tree");
-  const target: ConsensusThresholdReanalysisPlan["target"] = treeDone ? "tree" : collapseDone ? "collapse" : postprocessingDone ? "postprocessing" : undefined;
+  const priorTarget: ConsensusThresholdReanalysisPlan["target"] = treeDone ? "tree" : collapseDone ? "collapse" : postprocessingDone ? "postprocessing" : undefined;
+  const globalChanged = before.parameters.artefactFraction !== config.parameters.artefactFraction
+    || before.parameters.outlierQuantile !== config.parameters.outlierQuantile
+    || before.parameters.agreementThreshold !== config.parameters.agreementThreshold;
+  const effective = (candidate: PipelineConfig, index: number) => {
+    const sample = candidate.samples[index];
+    return [sample.artefactFractionOverride ?? candidate.parameters.artefactFraction,
+      sample.outlierQuantileOverride ?? candidate.parameters.outlierQuantile,
+      sample.agreementOverride ?? candidate.parameters.agreementThreshold] as const;
+  };
+  let affectedSamples = config.samples.flatMap((sample, index) => {
+    const left = effective(before, index), right = effective(config, index);
+    return left.some((value, field) => value !== right[field]) ? [sample.name] : [];
+  });
+  // Reapplying previously bypassed contamination to only a subset would make
+  // the run-wide contamination-mode flag scientifically ambiguous.
+  const contaminationReapply = priorTarget && bundle.postprocessingContaminationMode === "bypassed"
+    && stageCompleted(bundle, "contamination") && config.parameters.contaminationFilter;
+  const scope: ConsensusThresholdReanalysisPlan["scope"] = globalChanged || contaminationReapply ? "all"
+    : affectedSamples.length ? "samples" : "none";
+  if (scope === "all") affectedSamples = config.samples.map((sample) => sample.name);
+  const target = scope === "none" ? undefined : priorTarget;
   const statuses = explicitStatuses(bundle), untouchedStatuses: ConsensusThresholdReanalysisPlan["untouchedStatuses"] = {};
   if (!collapseDone) untouchedStatuses.collapse = { ...statuses.collapse };
   if (!treeDone) untouchedStatuses.tree = { ...statuses.tree };
   if (target && !bundle.downstreamResources)
     throw new Error("This project does not contain the panel/reference sequences required to rerun downstream analysis. Re-run from the FASTQ with webPORPID 0.3.6 or later.");
 
-  const detail = "Invalidated after an accepted consensus-threshold change; recomputation is starting from stored consensus calls.";
-  if (target) {
+  const detail = "Invalidated after an accepted run-wide consensus-threshold change; recomputation is starting from stored consensus calls.";
+  if (target && scope === "all") {
     statuses.postprocessing = statusRecord("deferred", detail, stamp);
     statuses.collapse = collapseDone ? statusRecord("deferred", detail, stamp) : statuses.collapse;
     statuses.tree = treeDone ? statusRecord("deferred", detail, stamp) : statuses.tree;
   }
   const changed = accepted.changes.join("; ");
-  return { target, untouchedStatuses, bundle: {
+  const replayDetail = scope === "all" ? target ? `recomputing all samples through ${target}` : "global thresholds saved; no completed downstream stage required recomputation"
+    : scope === "samples" ? target ? `recomputing only changed samples through ${target}: ${affectedSamples.join(", ")}` : `sample thresholds saved for ${affectedSamples.join(", ")}; no completed downstream stage required recomputation`
+      : "no effective threshold changed; no downstream recomputation required";
+  return { target, affectedSamples, scope, untouchedStatuses, bundle: {
     ...bundle,
     config: compactResultConfig(config),
     umiFamilies: families,
     thresholdSelections: [...(bundle.thresholdSelections ?? []), accepted],
     optionalStages: statuses,
-    ...(target ? { records: [], alignments: {}, referenceAlignments: {}, collapseGroups: {}, trees: {}, alignmentEdits: undefined,
+    ...(target && scope === "all" ? { records: [], alignments: {}, referenceAlignments: {}, collapseGroups: {}, trees: {}, alignmentEdits: undefined,
+      functionalFilterErrors: undefined,
       postprocessingContaminationMode: undefined,
       timings: bundle.timings?.filter((entry) => !["postprocessing", "collapse", "tree"].includes(entry.stage)) } : {}),
     log: [...bundle.log,
       `${stamp} interactive consensus filter reopened after completion: ${changed}`,
-      `${stamp} consensus-threshold replay: UMI grouping, consensus calls, and contamination calls preserved${target ? `; recomputing through ${target}; derived alignments, trees, and active edits detached` : "; no completed downstream stage required recomputation"}`],
+      `${stamp} consensus-threshold replay: UMI grouping, consensus calls, and contamination calls preserved; ${replayDetail}${target && scope === "all" ? "; all derived alignments, trees, and active edits detached" : target && scope === "samples" ? "; derived products and active edits will be replaced only for those samples" : ""}`],
   } };
 }
 

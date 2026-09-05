@@ -114,7 +114,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
 	  activeBackgroundMode = Boolean(request.runWhenNotInFocus);
-	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.14 started`,
+	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.15 started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} background execution aid: ${activeBackgroundMode ? "requested; quiet audible processing hum controlled by the browser UI" : "disabled"}`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}, panel_filter=${request.config.parameters.panelFilterMode ?? "mafft-batch"}`];
@@ -291,7 +291,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     };
     let contamination: ResultBundle["contamination"] = [];
     let postprocessingContaminationMode: ResultBundle["postprocessingContaminationMode"];
-    let downstream: PostprocessOutput = { records: [], summaries: baseSummaries, alignments: {}, referenceAlignments: {}, collapseGroups: {}, collapseSeconds: 0 };
+    let downstream: PostprocessOutput = { records: [], summaries: baseSummaries, alignments: {}, referenceAlignments: {}, collapseGroups: {}, functionalFilterErrors: {}, collapseSeconds: 0 };
     const trees: Record<string, string> = {};
 
     if (request.deferContamination && request.config.parameters.contaminationFilter) {
@@ -402,6 +402,8 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
           optionalStages.collapse = statusRecord("completed", `${collapsedHaplotypes} haplotypes; ${functionalHaplotypes} collapsed variants passed configured functional filters; multiplicities count UMI families.`);
           progress({ stage: "collapse", fraction: 1, detail: `Collapsed retained sequences into ${collapsedHaplotypes.toLocaleString()} distinct haplotypes; ${functionalHaplotypes.toLocaleString()} passed configured functional filters; counts represent UMI families` });
           log.push(`${now()} collapse: ${collapsedHaplotypes} distinct haplotypes from ${downstream.records.filter((record) => record.alignedNt).length} retained UMI families; ${functionalHaplotypes} collapsed functional passes; multiplicities count families, not reads`);
+          for (const [sample, message] of Object.entries(downstream.functionalFilterErrors))
+            log.push(`${now()} functional filter error: ${sample}; ${message}; this sample's functional outputs were omitted and the run continued`);
         }
       }
     }
@@ -449,7 +451,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.14", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: "0.3.15", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
@@ -458,6 +460,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
       downstreamResources: downstreamResources(request.config),
       records: downstream.records, alignments: downstream.alignments, trees,
       referenceAlignments: downstream.referenceAlignments, collapseGroups: downstream.collapseGroups,
+      functionalFilterErrors: Object.keys(downstream.functionalFilterErrors).length ? downstream.functionalFilterErrors : undefined,
       inputMappings: request.inputMappings, runOptions: { deferPhylogeny: Boolean(request.deferPhylogeny),
         deferContamination: Boolean(request.deferContamination), deferPostprocessing: Boolean(request.deferPostprocessing),
         deferCollapse: Boolean(request.deferCollapse),

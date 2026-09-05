@@ -1,5 +1,5 @@
 import { effectiveAlignment, inspectAlignment, type AlignmentVariant } from "./alignment-utils.ts";
-import { functionalSequenceName, uncollapsedSequenceName } from "./sequence-names.ts";
+import { functionalSequenceName, legacyFunctionalSequenceName, uncollapsedSequenceName } from "./sequence-names.ts";
 import { ladderizeTree, layoutTree, parseNewick, rootOnOutgroup, type TreeNode } from "./tree.ts";
 import { treeTipNames } from "./tree-names.ts";
 import type { ResultBundle } from "./types.ts";
@@ -47,7 +47,10 @@ function familyCounts(bundle: ResultBundle, sample: string, variant: AlignmentVa
   } else {
     for (const group of bundle.collapseGroups?.[sample] ?? []) {
       result.set(group.representativeId, group.familyCount);
-      if (group.functionalPass) result.set(functionalSequenceName(group), group.familyCount);
+      if (group.functionalPass) {
+        result.set(functionalSequenceName(group), group.familyCount);
+        result.set(legacyFunctionalSequenceName(group), group.familyCount);
+      }
     }
   }
   if (variant === "functional") {

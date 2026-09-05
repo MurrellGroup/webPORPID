@@ -26,13 +26,15 @@ export function uncollapsedSequenceId(name: string): string {
   return name.replace(/\s+fs=\d+\s+minag=[^\s]+$/, "");
 }
 
-/**
- * Functional variants retain sample and abundance-rank identity but replace
- * the collapsed family-count suffix with their reference-match annotation.
- */
+/** Functional variants retain their complete collapsed identity and count. */
 export function functionalSequenceName(group: FunctionalNameFields): string {
   if (group.referenceMatch == null) return group.representativeId;
+  return `${group.representativeId} rm=${group.referenceMatch.toFixed(2)}`;
+}
+
+/** Functional label written by webPORPID 0.3.10–0.3.14; read-only compatibility. */
+export function legacyFunctionalSequenceName(group: FunctionalNameFields): string {
+  if (group.referenceMatch == null) return group.representativeId;
   const match = /^(.*_v\d+)_\d+$/.exec(group.representativeId);
-  const stem = match?.[1] ?? group.representativeId;
-  return `${stem} rm=${group.referenceMatch.toFixed(2)}`;
+  return `${match?.[1] ?? group.representativeId} rm=${group.referenceMatch.toFixed(2)}`;
 }

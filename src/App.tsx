@@ -91,7 +91,7 @@ export default function App() {
   const [deferCollapse, setDeferCollapse] = useState(false);
   const [deferPhylogeny, setDeferPhylogeny] = useState(false);
   const [interactiveFiltering, setInteractiveFiltering] = useState(false);
-  const [runWhenNotInFocus, setRunWhenNotInFocus] = useState(false);
+  const [runWhenNotInFocus, setRunWhenNotInFocus] = useState(true);
   const [spoolStorage, setSpoolStorage] = useState<SpoolStorage>(() =>
     typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function" ? "external-directory" : "automatic");
   const [scratchDirectory, setScratchDirectory] = useState<ExternalScratchDirectoryHandle>();
@@ -108,7 +108,7 @@ export default function App() {
   const workerRef = useRef<Worker | undefined>(undefined);
   const wakeLockRef = useRef<WakeLockSentinelLike | undefined>(undefined);
   const processingHumRef = useRef<ProcessingHum | undefined>(undefined), processingHumRequestRef = useRef(0);
-  const runWhenNotInFocusRef = useRef(false);
+  const runWhenNotInFocusRef = useRef(true);
   const protectWorkRef = useRef(false), historyGuardRef = useRef(false), confirmedLeaveRef = useRef(false);
   const maxWorkers = useMemo(() => Math.max(1, navigator.hardwareConcurrency || 1), []);
   const externalScratchSupported = typeof (window as DirectoryPickerWindow).showDirectoryPicker === "function";

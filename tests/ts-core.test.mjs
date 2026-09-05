@@ -21,7 +21,7 @@ import { collapseAlignment } from "../src/collapse.ts";
 import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.ts";
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
-import { functionalFilter, postprocess } from "../src/postprocess.ts";
+import { collapsePostprocess, functionalFilter, postprocess } from "../src/postprocess.ts";
 import { addSequenceToProfile, filterQueriesAgainstPanel } from "../src/independent-panel-filter.ts";
 import { extractAndScorePanel } from "../src/panel-profile.ts";
 import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
@@ -473,6 +473,7 @@ test("completed results can revisit consensus thresholds without changing upstre
   const plan = prepareConsensusThresholdReanalysis(bundle, { id: review.id, phase: review.phase,
     parameters: { agreementThreshold: .8, artefactFraction: .2, outlierQuantile: .95 }, samples: [{ sample: "sample_1" }] });
   assert.equal(plan.target, "tree"); assert.deepEqual(plan.bundle.consensuses, consensusSnapshot);
+  assert.equal(plan.scope, "all"); assert.deepEqual(plan.affectedSamples, ["sample_1"]);
   assert.deepEqual(plan.bundle.contamination, contaminationSnapshot); assert.equal(plan.bundle.config.parameters.agreementThreshold, .8);
   assert.deepEqual(plan.bundle.records, []); assert.deepEqual(plan.bundle.alignments, {}); assert.deepEqual(plan.bundle.trees, {});
   assert.equal(plan.bundle.alignmentEdits, undefined); assert.equal(plan.bundle.alignmentEditHistory.length, 1);
@@ -489,6 +490,41 @@ test("completed results can revisit consensus thresholds without changing upstre
   recomputedCheckpoint.optionalStages.postprocessing = { state: "completed", detail: "recomputed", updatedUtc: "2026-08-27T00:00:02.000Z" };
   recomputedCheckpoint.optionalStages.collapse = { state: "deferred", detail: "reset by postprocessing", updatedUtc: "2026-08-27T00:00:02.000Z" };
   assert.equal(restoreUntouchedThresholdStatuses(recomputedCheckpoint, partialPlan).optionalStages.collapse.state, "skipped");
+});
+
+test("sample override replay targets only samples whose effective thresholds changed", async () => {
+  const bundle = resultBundle(), second = "sample_2";
+  bundle.config.samples.push({ ...bundle.config.samples[0], name: second });
+  bundle.downstreamResources.samples.push({ ...structuredClone(bundle.downstreamResources.samples[0]), name: second });
+  bundle.quality.perSample.push(3); bundle.quality.totalReads += 3; bundle.quality.qualityReads += 3; bundle.quality.demultiplexedReads += 3;
+  bundle.summaries.push({ ...bundle.summaries[0], sample: second });
+  bundle.umiFamilies.push({ ...bundle.umiFamilies[0], sample: second, sampleIndex: 1, umi: "TTGGCCAA" });
+  bundle.consensuses.push({ ...bundle.consensuses[0], id: "c2", sample: second, sampleIndex: 1, umi: "TTGGCCAA" });
+  bundle.records.push({ ...bundle.records[0], id: "c2", sample: second, umi: "TTGGCCAA" });
+  for (const [key, value] of Object.entries({ ...bundle.alignments })) bundle.alignments[key.replace("sample_1", second)] = value.replaceAll("c1", "c2");
+  for (const [key, value] of Object.entries({ ...bundle.referenceAlignments })) bundle.referenceAlignments[key.replace("sample_1", second)] = value;
+  bundle.collapseGroups[second] = [{ sample: second, representativeId: "c2", memberIds: ["c2"], familyCount: 1 }];
+  bundle.trees[`${second}/nucleotide`] = "(c2:0.0);";
+  bundle.alignmentEdits = {
+    "sample_1/nucleotide": { fasta: ">c1\nATGTAA\n", frameOffset: 0, baselineFingerprint: "a", editedFingerprint: "a", source: "sample one", savedUtc: "2026-09-01T00:00:00.000Z" },
+    [`${second}/nucleotide`]: { fasta: ">c2\nATGTAA\n", frameOffset: 0, baselineFingerprint: "b", editedFingerprint: "b", source: "sample two", savedUtc: "2026-09-01T00:00:00.000Z" },
+  };
+  const selection = { id: "sample-only", phase: "consensus-filters", parameters: {
+    agreementThreshold: bundle.config.parameters.agreementThreshold,
+    artefactFraction: bundle.config.parameters.artefactFraction,
+    outlierQuantile: bundle.config.parameters.outlierQuantile,
+  }, samples: [{ sample: "sample_1", agreementOverride: .8 }] };
+  const plan = prepareConsensusThresholdReanalysis(bundle, selection);
+  assert.equal(plan.scope, "samples"); assert.deepEqual(plan.affectedSamples, ["sample_1"]); assert.equal(plan.target, "tree");
+  assert.equal(plan.bundle.records.length, 2, "sample-scoped planning must not invalidate the public bundle");
+  assert.equal(Object.keys(plan.bundle.alignmentEdits).length, 2);
+  assert.equal(plan.bundle.alignments[`${second}/nucleotide`], bundle.alignments[`${second}/nucleotide`]);
+  assert.equal(plan.bundle.trees[`${second}/nucleotide`], bundle.trees[`${second}/nucleotide`]);
+  assert.equal(plan.bundle.alignmentEdits[`${second}/nucleotide`].source, "sample two");
+  assert.match(plan.bundle.log.join("\n"), /recomputing only changed samples.*sample_1/i);
+  const replaySource = await readFile("src/deferred-analysis.ts", "utf8");
+  assert.match(replaySource, /sampleNames:\s*plan\.affectedSamples/);
+  assert.match(replaySource, /omitSampleKeys\(current\.alignmentEdits, selectedSamples/);
 });
 
 test("skipped contamination remains an independent bypass while true downstream prerequisites stay explicit", () => {
@@ -527,7 +563,7 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   assert.equal(functional.columns, query.length); assert.equal(functionalReference.columns, query.length);
   assert.equal(functional.records[0].name, "ref");
   assert.equal(functional.records[0].sequence, "ATGAAAAAA------TAA");
-  assert.equal(functional.records[1].name, "sample_1_v1 rm=0.67");
+  assert.equal(functional.records[1].name, "sample_1_v1_1 rm=0.67");
   assert.equal(functional.records[1].sequence, query);
   assert.match(output.alignments["sample_1/uncollapsed-nucleotide"], /^>c1 fs=3 minag=0\.67\n/);
   assert.equal(output.records[0].functionalPass, undefined, "uncollapsed family records must never carry functional decisions");
@@ -539,6 +575,50 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   stored.referenceAlignments = output.referenceAlignments; stored.collapseGroups = output.collapseGroups; stored.trees = {};
   stored.optionalStages.tree = { state: "deferred", detail: "not inferred", updatedUtc: "2026-09-03T00:00:00.000Z" };
   assert.doesNotThrow(() => encodeResult(stored), "reference-first functional alignments and annotated UMI labels must validate");
+  const legacyFunctionalNames = structuredClone(stored);
+  legacyFunctionalNames.alignments["sample_1/functional-nucleotide"] = legacyFunctionalNames.alignments["sample_1/functional-nucleotide"].replace("sample_1_v1_1 rm=0.67", "sample_1_v1 rm=0.67");
+  legacyFunctionalNames.alignments["sample_1/functional-protein"] = legacyFunctionalNames.alignments["sample_1/functional-protein"].replace("sample_1_v1_1 rm=0.67", "sample_1_v1 rm=0.67");
+  assert.doesNotThrow(() => decodeResult(encodeResult(legacyFunctionalNames)), "0.3.10–0.3.14 functional labels must remain loadable");
+});
+
+test("functional amino-acid alignment recovers a structurally truncated MSA row without changing coding sequences", async () => {
+  const base = resultBundle(), reference = "ATGAAATAA";
+  const config = { dataset: "functional-recovery", contaminationPanel: "contam.fa", contaminationPanelSequences: [],
+    parameters: { ...base.config.parameters, deterministicSeed: 1n, functionalMatchThreshold: 0, agreementThreshold: 0 },
+    samples: [{ name: "sample_1", cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa",
+      panelSequences: [], functionalReference: "functional.fa", functionalReferenceSequence: { name: "ref", sequence: reference } }] };
+  const consensuses = [
+    { ...base.consensuses[0], id: "one", sequence: "ATGAAATAA", minimumAgreement: 1 },
+    { ...base.consensuses[0], id: "two", umi: "TTGGCCAA", sequence: "ATGGGGTAA", minimumAgreement: 1 },
+  ];
+  const runner = async (sequences, _signal, _iterations, mode) => mode === "amino-acid"
+    ? [sequences[0], `${sequences[1].slice(0, -1)}-`] : [...sequences];
+  const output = await postprocess(consensuses, [], config, undefined, runner, 1);
+  const aligned = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1).records;
+  assert.equal(aligned.length, 3); assert.deepEqual(aligned.slice(1).map((row) => row.sequence.replaceAll("-", "")), ["ATGAAATAA", "ATGGGGTAA"]);
+  assert.deepEqual(output.functionalFilterErrors, {});
+});
+
+test("an irrecoverable functional-filter error is isolated to one sample", async () => {
+  const base = resultBundle(), samples = ["bad", "good"].map((name) => ({ name,
+    cdnaPrimer: "AAAaaaNNNNNNNNTTT", secondStrandPrimer: "GGG", panel: "panel.fa", panelSequences: [],
+    functionalReference: "functional.fa", functionalReferenceSequence: { name: "ref", sequence: "ATGAAATAA" } }));
+  const config = { dataset: "isolated-functional", contaminationPanel: "contam.fa", contaminationPanelSequences: [],
+    parameters: { ...base.config.parameters, deterministicSeed: 1n, functionalMatchThreshold: 0 }, samples };
+  const input = { records: [], summaries: samples.map((sample) => ({ sample: sample.name, demultiplexedReads: 2, observedUmis: 2,
+    likelyRealUmis: 2, consensusSequences: 2, postprocPassed: 2, artefactCutoff: 1 })), alignments: {
+      "bad/uncollapsed-nucleotide": ">bad_a\nATGAAATAA\n>bad_b\nATGGGGTAA\n",
+      "good/uncollapsed-nucleotide": ">good_a\nATGAAATAA\n>good_b\nATGGGGTAA\n",
+    }, referenceAlignments: {}, collapseGroups: {}, functionalFilterErrors: {}, collapseSeconds: 0 };
+  let aminoCalls = 0;
+  const output = await collapsePostprocess(input, config, undefined, undefined, async (sequences, _signal, _iterations, mode) => {
+    if (mode === "amino-acid" && aminoCalls++ === 0) throw new Error("deliberate irrecoverable test failure");
+    return [...sequences];
+  });
+  assert.match(output.functionalFilterErrors.bad, /deliberate irrecoverable/); assert.equal(output.functionalFilterErrors.good, undefined);
+  assert.equal(output.alignments["bad/functional-nucleotide"], undefined); assert.match(output.alignments["good/functional-nucleotide"], /^>ref\n/);
+  assert.equal(output.summaries.find((row) => row.sample === "bad").functionalPassed, undefined);
+  assert.equal(output.summaries.find((row) => row.sample === "good").functionalPassed, 2);
 });
 
 test("functional reference profile-add preserves the existing sample MSA", () => {
@@ -702,6 +782,15 @@ test("result bundles round-trip, export, and reject structural corruption", () =
   assert.throws(() => encodeResult(unknownStorage), /spoolStorage is not recognized/);
   const invalidBackgroundMode = structuredClone(bundle); invalidBackgroundMode.runOptions.runWhenNotInFocus = "yes";
   assert.throws(() => encodeResult(invalidBackgroundMode), /runOptions\.runWhenNotInFocus/);
+  const isolatedFunctionalError = structuredClone(bundle);
+  isolatedFunctionalError.functionalFilterErrors = { sample_1: "protein alignment could not be recovered" };
+  delete isolatedFunctionalError.summaries[0].functionalPassed;
+  delete isolatedFunctionalError.alignments["sample_1/functional-nucleotide"];
+  delete isolatedFunctionalError.alignments["sample_1/functional-protein"];
+  delete isolatedFunctionalError.referenceAlignments["sample_1/functional-nucleotide"];
+  assert.doesNotThrow(() => encodeResult(isolatedFunctionalError), "a sample-scoped functional failure must remain a valid result");
+  const inconsistentFunctionalError = structuredClone(isolatedFunctionalError); inconsistentFunctionalError.summaries[0].functionalPassed = 0;
+  assert.throws(() => encodeResult(inconsistentFunctionalError), /functional-filter error cannot report a functional-pass count/);
   const wrongSelection = structuredClone(bundle); wrongSelection.summaries[0].selectedReads = 2; wrongSelection.summaries[0].downsampledReads = 1;
   assert.throws(() => encodeResult(wrongSelection), /selected-read count does not match/);
   const legacyCollapse = structuredClone(bundle); legacyCollapse.collapseGroups.sample_1[0].minimumAgreement = .67;
@@ -758,6 +847,9 @@ test("live demultiplexing and Swig-style navigation-loss guards stay wired into 
   assert.match(app, /Read blocks/); assert.match(styles, /\.read-block-grid/);
   assert.match(app, /wakeLock/); assert.match(app, /addEventListener\("visibilitychange", visibilityChanged\)/);
   assert.match(app, />Run when not in focus</); assert.match(app, /startProcessingHum/); assert.match(app, /stopProcessingHum/);
+  assert.match(app, /runWhenNotInFocus, setRunWhenNotInFocus\] = useState\(true\)/);
+  assert.match(results, /thresholdRunWhenNotInFocus, setThresholdRunWhenNotInFocus\] = useState\(true\)/);
+  assert.match(results, /startThresholdProcessingHum/); assert.match(results, /consensus-threshold replay background execution aid/);
   assert.match(pipeline, /background execution aid:/); assert.match(pipeline, /runWhenNotInFocus: activeBackgroundMode/);
   assert.match(app, /postMessage\(\{ type: "background-mode", enabled \}\)/);
   assert.match(app, /addEventListener\("beforeunload", warnBeforeLeaving\)/);
