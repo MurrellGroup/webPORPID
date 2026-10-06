@@ -8,7 +8,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { build } from "rolldown";
 import { gunzipSync } from "fflate";
 
-import { inspectAlignment, summarizeAlignmentChanges, translateAlignmentFasta, validateCorrectedAlignment } from "../src/alignment-utils.ts";
+import { inspectAlignment, summarizeAlignmentChanges, translateAlignedNucleotides, translateAlignmentFasta, validateCorrectedAlignment } from "../src/alignment-utils.ts";
 import { referenceDisplayColumns } from "../src/alignment-regions.ts";
 import {
   ALIVIBE_BRIDGE_VERSION, ALIVIBE_SOURCE_REVISION, assertAlivibeInitialLoad, assertAlivibeRoundTripTarget,
@@ -22,6 +22,8 @@ import { buildExportArchive, SAMPLE_EXPORT_KINDS } from "../src/export-archive.t
 import { nameMatchingSlot, referenceMappingRecords, referenceSlots } from "../src/input-mapping.ts";
 import { mapParsimonyMutations } from "../src/phylo-mutations.ts";
 import { collapsePostprocess, functionalFilter, postprocess } from "../src/postprocess.ts";
+import { createDirectMafftRunner } from "../cli-src/direct-mafft.mjs";
+import { mafftProfileAddition, parseMafftAlignment } from "../src/mafft-msa-codec.ts";
 import { addSequenceToProfile, filterQueriesAgainstPanel } from "../src/independent-panel-filter.ts";
 import { extractAndScorePanel } from "../src/panel-profile.ts";
 import { functionalFilterStats, porpidCallStats, sampleOverviewStats } from "../src/report-stats.ts";
@@ -34,6 +36,8 @@ import { applyThresholdSelection, buildConsensusThresholdReview, buildUmiThresho
 import { staticTreeHighlighterSvg } from "../src/static-tree-highlighter.ts";
 import { PROCESSING_HUM_LEVEL, ProcessingHum } from "../src/processing-hum.ts";
 import { buildStoredConsensusThresholdReview, prepareConsensusThresholdReanalysis, restoreUntouchedThresholdStatuses } from "../src/consensus-threshold-reanalysis.ts";
+
+const testFunctionalAlignment = (msa) => ({ msa, addToProfile: async (profile, sequence) => addSequenceToProfile(profile, sequence) });
 
 function spoolRecord(sample, hash, umi = "AACCGGTT", name = "read", sequence = "ACGT") {
   const encoder = new TextEncoder(), umiBytes = encoder.encode(umi), nameBytes = encoder.encode(name), sequenceBytes = encoder.encode(sequence);
@@ -557,7 +561,7 @@ test("functional alignment is codon-aware and clipped to the reference endpoints
   const consensus = [{ ...base.consensuses[0], sequence: query }];
   const runner = async (sequences, _signal, _iterations, mode) => mode === "amino-acid"
     ? ["MKK*--", "MKKAA*"] : [`${sequences[0]}------`, sequences[1]];
-  const output = await postprocess(consensus, [], config, undefined, runner, 1);
+  const output = await postprocess(consensus, [], config, undefined, runner, 1, undefined, { functionalAlignment: testFunctionalAlignment(runner) });
   const functional = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1);
   const functionalReference = inspectAlignment(output.referenceAlignments["sample_1/functional-nucleotide"], 1);
   assert.equal(functional.columns, query.length); assert.equal(functionalReference.columns, query.length);
@@ -593,7 +597,7 @@ test("functional amino-acid alignment recovers a structurally truncated MSA row 
   ];
   const runner = async (sequences, _signal, _iterations, mode) => mode === "amino-acid"
     ? [sequences[0], `${sequences[1].slice(0, -1)}-`] : [...sequences];
-  const output = await postprocess(consensuses, [], config, undefined, runner, 1);
+  const output = await postprocess(consensuses, [], config, undefined, runner, 1, undefined, { functionalAlignment: testFunctionalAlignment(async (sequences) => [...sequences]) });
   const aligned = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1).records;
   assert.equal(aligned.length, 3); assert.deepEqual(aligned.slice(1).map((row) => row.sequence.replaceAll("-", "")), ["ATGAAATAA", "ATGGGGTAA"]);
   assert.deepEqual(output.functionalFilterErrors, {});
@@ -611,10 +615,11 @@ test("an irrecoverable functional-filter error is isolated to one sample", async
       "good/uncollapsed-nucleotide": ">good_a\nATGAAATAA\n>good_b\nATGGGGTAA\n",
     }, referenceAlignments: {}, collapseGroups: {}, functionalFilterErrors: {}, collapseSeconds: 0 };
   let aminoCalls = 0;
-  const output = await collapsePostprocess(input, config, undefined, undefined, async (sequences, _signal, _iterations, mode) => {
+  const runner = async (sequences, _signal, _iterations, mode) => {
     if (mode === "amino-acid" && aminoCalls++ === 0) throw new Error("deliberate irrecoverable test failure");
     return [...sequences];
-  });
+  };
+  const output = await collapsePostprocess(input, config, undefined, undefined, runner, undefined, testFunctionalAlignment(runner));
   assert.match(output.functionalFilterErrors.bad, /deliberate irrecoverable/); assert.equal(output.functionalFilterErrors.good, undefined);
   assert.equal(output.alignments["bad/functional-nucleotide"], undefined); assert.match(output.alignments["good/functional-nucleotide"], /^>ref\n/);
   assert.equal(output.summaries.find((row) => row.sample === "bad").functionalPassed, undefined);
@@ -630,6 +635,52 @@ test("functional reference profile-add preserves the existing sample MSA", () =>
   assert.deepEqual(added.profileRows.map((row) => retainedColumns.map((column) => row[column]).join("")), sampleAlignment,
     "removing only newly inserted all-gap columns must recover the byte-identical sample MSA");
   assert.equal(added.sequence.replaceAll("-", ""), "MKA*");
+});
+
+test("MAFFT protein profile addition preserves demo residues, column relationships, and stop codons", async () => {
+  const sequences = (await readFile("tests/fixtures/functional-env.fasta", "utf8")).trim().split(/^>/m).slice(1)
+    .map((record) => record.split(/\r?\n/).slice(1).join(""));
+  const proteins = sequences.map((sequence) => translateAlignedNucleotides(sequence));
+  const runner = createDirectMafftRunner(resolve("public/biowasm/mafft/disttbfast.mjs"), resolve("public/biowasm/mafft/disttbfast.wasm"));
+  const profile = await runner(proteins.slice(1), undefined, 0, "amino-acid");
+  const added = await runner.addToProfile(profile, proteins[0]);
+  assert.deepEqual(added.profileRows.map((row) => row.replaceAll("-", "")), proteins.slice(1));
+  assert.equal(added.sequence.replaceAll("-", ""), proteins[0]);
+  assert(added.profileRows.every((row) => row.includes("*")), "MAFFT must not drop stop codons");
+  const columns = Array.from({ length: added.sequence.length }, (_, index) => index)
+    .filter((column) => added.profileRows.some((row) => row[column] !== "-"));
+  assert.deepEqual(added.profileRows.map((row) => columns.map((column) => row[column]).join("")), profile);
+  assert.throws(() => mafftProfileAddition(profile, [added.profileRows[1], added.profileRows[0], added.profileRows[2], added.sequence]), /changed the existing/);
+  assert.throws(() => parseMafftAlignment(">0\nMKA\n", ["MKA*"], "amino-acid"), /changed sequence/);
+  const aborted = new AbortController(); aborted.abort();
+  await assert.rejects(runner.addToProfile(profile, proteins[0], aborted.signal), /cancelled/);
+});
+
+test("functional export realigns only passes and preserves terminal residues without changing screening scores", async () => {
+  const base = resultBundle(), reference = "ATGAAAGCTTAA", rejected = "ATG" + "GGT".repeat(9) + "TAA";
+  const input = { records: [], summaries: [{ ...base.summaries[0] }], alignments: {
+    "sample_1/uncollapsed-nucleotide": `>one\n${reference.padEnd(rejected.length, "-")}\n>two\n${"ATGAAGGCTTAA".padEnd(rejected.length, "-")}\n>bad\n${rejected}\n`,
+  }, referenceAlignments: {}, collapseGroups: {}, functionalFilterErrors: {}, collapseSeconds: 0 };
+  const config = { ...base.config, parameters: { ...base.config.parameters, deterministicSeed: 1n, functionalMatchThreshold: .5 },
+    samples: [{ ...base.config.samples[0], panelSequences: [], functionalReferenceSequence: { name: "ref", sequence: reference } }] };
+  const screen = async (sequences) => sequences.map((row) => row.padEnd(Math.max(...sequences.map((s) => s.length)), "-"));
+  const calls = [];
+  const output = await collapsePostprocess(input, config, undefined, undefined, screen, undefined, {
+    msa: async (sequences, _signal, _iterations, mode) => {
+      calls.push({ sequences: [...sequences], mode }); return sequences.map((row) => `${row}-`);
+    },
+    addToProfile: async (profileRows, sequence) => ({ profileRows: [...profileRows], sequence: `-${sequence}` }),
+  });
+  assert.deepEqual(output.functionalFilterErrors, {});
+  assert.equal(output.summaries[0].functionalPassed, 2);
+  assert.deepEqual(calls, [{ sequences: ["MKA*", "MKA*"], mode: "amino-acid" }]);
+  const exported = inspectAlignment(output.alignments["sample_1/functional-nucleotide"], 1).records;
+  assert.equal(exported[0].name, "ref"); assert.equal(exported[0].sequence, `---${reference}`);
+  assert.deepEqual(exported.slice(1).map((row) => row.sequence.replaceAll("-", "")),
+    output.collapseGroups.sample_1.filter((group) => group.functionalPass).map((group) => group.trimmedNt));
+  assert(exported.slice(1).every((row) => row.sequence.startsWith("ATG")), "reference terminal gaps must not trigger a second clipping");
+  assert(output.collapseGroups.sample_1.filter((group) => group.functionalPass).every((group) => group.referenceMatch >= .5));
+  assert(exported.every((row) => ![...row.sequence.matchAll(/-+/g)].some((match) => match[0].length % 3)));
 });
 
 test("static tree highlights only variants strictly above ten percent", () => {

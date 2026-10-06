@@ -1,4 +1,4 @@
-import { t as WebPorpidRuntime } from "./chunks/wasm-runtime-D2YnsFQQ.mjs";
+import { t as WebPorpidRuntime } from "./chunks/wasm-runtime-Che1h7b0.mjs";
 import { readFile } from "node:fs/promises";
 import { parentPort } from "node:worker_threads";
 //#region cli-src/porpid-worker.mjs

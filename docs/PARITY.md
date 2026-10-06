@@ -64,3 +64,7 @@ bash scripts/parity-demo.sh
 - a gzipped CLI analysis, result inspection, FASTA export, and identical consensus with one versus two workers.
 
 The parity fixtures are neutral synthetic strings. The bundled demo is simulated and contains no original biological demo material.
+
+## Functional export realignment
+
+The parity counts above describe functional screening. Functional-pass exports now rebuild the MSA from only passing, reference-trimmed proteins with MAFFT 7.520 FFT-NS-2 and add the reference to that fixed profile. Gap layouts therefore differ from the historical exports; decisions, screening match scores, and ungapped trimmed coding sequences remain unchanged. A rerun of the public nanopore demo retains all 335 donor_1_REN passes and reduces its reference-first protein alignment from 898 to 873 columns while preserving every residue and terminal stop. The manually reported 869-column alignment has not been reproduced without its MAFFT version and exact command/options.
