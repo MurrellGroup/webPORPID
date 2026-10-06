@@ -12,6 +12,9 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { createGunzip } from "node:zlib";
 import { Worker as Worker$1 } from "node:worker_threads";
+//#region package.json
+var version = "0.3.16";
+//#endregion
 //#region src/contamination.ts
 /** Samples without donor metadata remain separate biological self groups. */
 function selfGroupsBySample(config) {
@@ -4753,7 +4756,7 @@ function createIndependentPanelFilterRunner(workerPath = new URL("../porpid-pane
 }
 //#endregion
 //#region cli-src/porpid-cli.mjs
-const VERSION = "0.3.15";
+const VERSION = version;
 const UPSTREAM_COMMIT = "201af7942029cfb7974880e41674be9f0ddfaf3b";
 const CLI_DIRECTORY = dirname(new URL(import.meta.url).pathname);
 function defaultCliAssets() {

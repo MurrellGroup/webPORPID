@@ -1,6 +1,7 @@
 /// <reference lib="webworker" />
 
 import { bytesToHex } from "@noble/hashes/utils.js";
+import packageInformation from "../package.json";
 import coreWasmUrl from "/webporpid.wasm?url";
 import { classifyContaminationAsync } from "./contamination";
 import { runAlivibeMsa } from "./alivibe-msa-runtime";
@@ -114,7 +115,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
   const storageLabel = store.mode === "external-directory" ? "user-selected external scratch directory"
     : store.mode === "opfs" ? "browser OPFS" : "bounded memory fallback";
 	  activeBackgroundMode = Boolean(request.runWhenNotInFocus);
-	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID 0.3.15 started`,
+	  const inputHash = createStreamingHash(), log = [`${now()} webPORPID ${packageInformation.version} started`,
     `${now()} execution: ${workers} WASM workers; ${storageLabel} ${request.config.parameters.maxReadsPerSample > 0 ? "adaptive selected-read" : "all-read"} partition spool`,
     `${now()} background execution aid: ${activeBackgroundMode ? "requested; quiet audible processing hum controlled by the browser UI" : "disabled"}`,
     `${now()} parameters: error_rate=${request.config.parameters.errorRate}, lengths=(${request.config.parameters.minLength},${request.config.parameters.maxLength}), lda=${request.config.parameters.ldaThreshold}, panel_filter=${request.config.parameters.panelFilterMode ?? "mafft-batch"}`];
@@ -451,7 +452,7 @@ async function run(request: RunRequest, signal: AbortSignal): Promise<ResultBund
     progress({ stage: "complete", fraction: 1, detail: "Results ready" });
     return {
       schema: "webporpid-results/1",
-      provenance: { webporpidVersion: "0.3.15", createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
+      provenance: { webporpidVersion: packageInformation.version, createdUtc: now(), engine: "C++20 WASM/WASI SIMD",
         workers, inputName: request.file.name, inputSha256: finishStreamingHash(inputHash),
         configSha256: bytesToHex(new Uint8Array(configHashBytes)), deterministicSeed: request.config.parameters.deterministicSeed.toString(),
         upstreamBranch: "nanopore", upstreamCommit: "201af7942029cfb7974880e41674be9f0ddfaf3b" },
