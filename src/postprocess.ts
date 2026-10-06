@@ -1,7 +1,7 @@
 import { runAlivibeMsa } from "./alivibe-msa-runtime.ts";
 import { runIndependentPanelFilter } from "./independent-panel-filter-runtime.ts";
-import type { PanelFilterResult } from "./independent-panel-filter.ts";
-import { runMafftFftnsMsa } from "./mafft-msa-runtime.ts";
+import type { PanelFilterResult, ProfileAddition } from "./independent-panel-filter.ts";
+import { runMafftFftnsMsa, runMafftProfileAdd } from "./mafft-msa-runtime.ts";
 import { inspectAlignment, translateAlignedNucleotides } from "./alignment-utils.ts";
 import { collapseAlignment } from "./collapse.ts";
 import { extractAndScorePanel } from "./panel-profile.ts";
@@ -28,7 +28,15 @@ export type PanelFilterRunner = (sequences: readonly string[], panelRows: readon
   workers?: number, onProgress?: (progress: { completed: number; total: number }) => void) => Promise<PanelFilterResult>;
 
 export interface PostprocessProgress { fraction: number; detail: string }
+export interface FunctionalAlignmentRunner {
+  msa: MsaRunner;
+  addToProfile: (profileRows: readonly string[], sequence: string, signal?: AbortSignal) => Promise<ProfileAddition>;
+}
+const defaultFunctionalAlignment: FunctionalAlignmentRunner = { msa: runMafftFftnsMsa, addToProfile: runMafftProfileAdd };
+
 export interface PostprocessOptions {
+  /** Passing-protein export MSA and reference addition; defaults to MAFFT. */
+  functionalAlignment?: FunctionalAlignmentRunner;
   /** Keep false when collapse is run as its own cancellable pipeline stage. */
   collapse?: boolean;
   onCollapseProgress?: (progress: PostprocessProgress) => void;
@@ -198,7 +206,7 @@ interface FunctionalOutcome {
   aa?: string;
   /** Exact-position identity to the clipped aligned reference, rounded to two decimal places. */
   referenceMatch?: number;
-  /** Codon-aware alignment, clipped to the first/last reference residue. */
+  /** Codon-aware export alignment preserving the reference-trimmed sequence. */
   alignedNt?: string;
   alignedAa?: string;
 }
@@ -294,6 +302,7 @@ function preserveProteinSequences(inputs: readonly string[], aligned: readonly s
  */
 async function functionalFilterBatch(
   referenceName: string, reference: string, sequences: string[], threshold: number, runMsa: MsaRunner, signal?: AbortSignal,
+  exportAlignment: FunctionalAlignmentRunner = defaultFunctionalAlignment,
 ): Promise<FunctionalBatchOutcome> {
   const outcomes: FunctionalOutcome[] = Array(sequences.length), coding: Array<{ index: number; sequence: string }> = [];
   sequences.forEach((raw, index) => {
@@ -335,7 +344,30 @@ async function functionalFilterBatch(
     outcomes[entry.index] = { passed: !reasons.length, reasons, nt: trimmed, aa,
       alignedNt: queryRegion, alignedAa: translateAlignedNucleotides(queryRegion, 0), referenceMatch: Number(rawRatio.toFixed(2)) };
   });
-  return { outcomes, referenceName: resolvedReferenceName, referenceNt: referenceRegion, referenceAa: translateAlignedNucleotides(referenceRegion, 0) };
+  // Screening and its match scores remain independent of export layout. Build
+  // a fresh MSA of only the passing, reference-trimmed proteins: rejected ORFs
+  // and their gap columns must not determine the functional-pass alignment.
+  const passing = outcomes.filter((outcome) => outcome.passed);
+  if (!passing.length) return { outcomes, referenceName: resolvedReferenceName,
+    referenceNt: referenceRegion, referenceAa: translateAlignedNucleotides(referenceRegion, 0) };
+  const proteins = passing.map((outcome) => outcome.aa!);
+  const profile = proteins.length > 1
+    ? await runScalableMsa(proteins, exportAlignment.msa, signal, 0, "amino-acid") : proteins;
+  if (profile.length !== proteins.length || profile.some((row, index) =>
+    row.length !== profile[0].length || degap(row) !== proteins[index]))
+    throw new Error("The functional export alignment did not preserve its input proteins.");
+  const aligned = await exportAlignment.addToProfile(profile, translate(referenceCoding), signal);
+  if (aligned.profileRows.length !== passing.length || degap(aligned.sequence) !== translate(referenceCoding)
+    || aligned.profileRows.some((row, index) => row.length !== aligned.sequence.length || degap(row) !== proteins[index]))
+    throw new Error("The functional export reference addition did not preserve its input proteins.");
+  // Keep all residues of the already-trimmed passing sequences. Clipping this
+  // second alignment again could silently remove terminal sample residues.
+  passing.forEach((outcome, index) => {
+    outcome.alignedAa = aligned.profileRows[index];
+    outcome.alignedNt = backtranslate(outcome.alignedAa, outcome.nt!);
+  });
+  return { outcomes, referenceName: resolvedReferenceName,
+    referenceNt: backtranslate(aligned.sequence, referenceCoding), referenceAa: aligned.sequence };
 }
 
 export async function postprocess(
@@ -459,7 +491,7 @@ export async function postprocess(
     referenceAlignments: Object.assign({}, ...completed.map((output) => output.referenceAlignments)),
     collapseGroups: Object.assign({}, ...completed.map((output) => output.collapseGroups)),
     functionalFilterErrors: Object.assign({}, ...completed.map((output) => output.functionalFilterErrors)), collapseSeconds: 0 };
-  return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress, runMsa);
+  return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress, runMsa, undefined, options.functionalAlignment);
 }
 
 /** Run family-count-preserving haplotype collapse as its own resumable stage. */
@@ -468,6 +500,7 @@ export async function collapsePostprocess(
   onProgress?: (progress: PostprocessProgress) => void,
   runMsa: MsaRunner = runAlivibeMsa,
   sampleNames?: ReadonlySet<string>,
+  functionalAlignment: FunctionalAlignmentRunner = defaultFunctionalAlignment,
 ): Promise<PostprocessOutput> {
   const started = performance.now(), alignments = { ...output.alignments }, referenceAlignments = { ...output.referenceAlignments };
   const collapseGroups = { ...output.collapseGroups }, summaries = output.summaries.map((summary) => ({ ...summary }));
@@ -502,7 +535,7 @@ export async function collapsePostprocess(
         let batch: FunctionalBatchOutcome;
         try {
           batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence,
-            collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+            collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal, functionalAlignment);
         } catch (cause) {
           if (signal?.aborted || (cause instanceof DOMException && cause.name === "AbortError")) throw cause;
           const message = cause instanceof Error ? cause.message : String(cause);

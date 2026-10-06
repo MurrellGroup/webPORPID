@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 import { a as resolveReferenceFiles, i as parseConfigYaml, n as createFastTreeRunner, o as resultConfig, r as compileConfig } from "./chunks/direct-fasttree-CuMSsXhU.mjs";
-import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-Bnko_59s.mjs";
-import { n as filterQueriesAgainstPanel, t as addSequenceToProfile } from "./chunks/independent-panel-filter-DTwAa3St.mjs";
-import { a as encodeFamilyModel, c as mergeFamilyCounts, i as decodeFamilyModel, l as mergeStats, n as decodeConsensusOutput, o as makeCutoffValues, r as decodeFamilyCounts, s as makeCutoffs } from "./chunks/wasm-runtime-D2YnsFQQ.mjs";
-import { n as createMafftRunner } from "./chunks/direct-mafft-W7tDpHgK.mjs";
+import { a as encodeAlivibeMsaSequences, i as decodeAlivibeMsaSequences, n as createMsaRunner, r as assertAlivibeMsaResult } from "./chunks/direct-msa-gemMlFDe.mjs";
+import { n as createMafftRunner, r as mafftProfileAddition } from "./chunks/direct-mafft-BgTc0bqp.mjs";
+import { n as filterQueriesAgainstPanel, t as addSequenceToProfile } from "./chunks/independent-panel-filter-DxKQKnbW.mjs";
+import { a as encodeFamilyModel, c as mergeFamilyCounts, i as decodeFamilyModel, l as mergeStats, n as decodeConsensusOutput, o as makeCutoffValues, r as decodeFamilyCounts, s as makeCutoffs } from "./chunks/wasm-runtime-Che1h7b0.mjs";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, mkdtemp, open, readFile, rm, stat, writeFile } from "node:fs/promises";
@@ -647,8 +647,22 @@ async function runIndependentPanelFilter(sequences, panelRows, signal, workers =
 //#region src/mafft-msa-runtime.ts
 /** Run MAFFT 7.520 FFT-NS-2 in an isolated worker with growable WASM memory. */
 async function runMafftFftnsMsa(sequences, signal, _iterations = 0, scoringMode = "nucleotide", onProgress) {
+	if (signal?.aborted) throw new DOMException("MAFFT alignment cancelled.", "AbortError");
 	if (sequences.length < 2) return [...sequences];
-	if (scoringMode === "amino-acid") throw new Error("The reference-panel MAFFT runner expects nucleotide sequences.");
+	return runMafft({
+		sequences: sequences.map(String),
+		scoringMode
+	}, signal, onProgress);
+}
+/** Equivalent to mafft --amino --add reference.fa sample-alignment.fa. */
+async function runMafftProfileAdd(profileRows, sequence, signal) {
+	return mafftProfileAddition(profileRows, await runMafft({
+		sequences: [...profileRows, sequence],
+		scoringMode: "amino-acid",
+		profileRows: profileRows.length
+	}, signal));
+}
+async function runMafft(request, signal, onProgress) {
 	const worker = new Worker(new URL("./mafft-msa-worker.ts", import.meta.url), { type: "module" });
 	return new Promise((resolve, reject) => {
 		let settled = false;
@@ -660,11 +674,11 @@ async function runMafftFftnsMsa(sequences, signal, _iterations = 0, scoringMode 
 			return true;
 		};
 		const abort = () => {
-			if (finish()) reject(new DOMException("MAFFT panel alignment cancelled.", "AbortError"));
+			if (finish()) reject(new DOMException("MAFFT alignment cancelled.", "AbortError"));
 		};
 		worker.onmessage = (event) => {
 			if (event.data.type === "progress") {
-				onProgress?.({ detail: event.data.detail ?? "MAFFT is aligning candidate sequences" });
+				onProgress?.({ detail: event.data.detail ?? "MAFFT is aligning sequences" });
 				return;
 			}
 			if (!finish()) return;
@@ -679,7 +693,7 @@ async function runMafftFftnsMsa(sequences, signal, _iterations = 0, scoringMode 
 			return;
 		}
 		signal?.addEventListener("abort", abort, { once: true });
-		worker.postMessage({ sequences: sequences.map(String) });
+		worker.postMessage(request);
 	});
 }
 //#endregion
@@ -1199,6 +1213,10 @@ async function runScalableMsa(sequences, runMsa, signal, iterations = 3, scoring
 }
 //#endregion
 //#region src/postprocess.ts
+const defaultFunctionalAlignment = {
+	msa: runMafftFftnsMsa,
+	addToProfile: runMafftProfileAdd
+};
 const degap = (sequence) => sequence.replaceAll("-", "").toUpperCase();
 const fasta$1 = (rows) => rows.map((row) => `>${row.name}\n${row.sequence.match(/.{1,80}/g)?.join("\n") ?? ""}`).join("\n") + (rows.length ? "\n" : "");
 function quantile(values, probability) {
@@ -1515,7 +1533,7 @@ function preserveProteinSequences(inputs, aligned) {
 * Projecting every resulting gap back as a codon triplet prevents an aligner
 * from manufacturing one- or two-base frameshifts.
 */
-async function functionalFilterBatch(referenceName, reference, sequences, threshold, runMsa, signal) {
+async function functionalFilterBatch(referenceName, reference, sequences, threshold, runMsa, signal, exportAlignment = defaultFunctionalAlignment) {
 	const outcomes = Array(sequences.length), coding = [];
 	sequences.forEach((raw, index) => {
 		const sequence = degap(raw);
@@ -1570,11 +1588,27 @@ async function functionalFilterBatch(referenceName, reference, sequences, thresh
 			referenceMatch: Number(rawRatio.toFixed(2))
 		};
 	});
-	return {
+	const passing = outcomes.filter((outcome) => outcome.passed);
+	if (!passing.length) return {
 		outcomes,
 		referenceName: resolvedReferenceName,
 		referenceNt: referenceRegion,
 		referenceAa: translateAlignedNucleotides(referenceRegion, 0)
+	};
+	const proteins = passing.map((outcome) => outcome.aa);
+	const profile = proteins.length > 1 ? await runScalableMsa(proteins, exportAlignment.msa, signal, 0, "amino-acid") : proteins;
+	if (profile.length !== proteins.length || profile.some((row, index) => row.length !== profile[0].length || degap(row) !== proteins[index])) throw new Error("The functional export alignment did not preserve its input proteins.");
+	const aligned = await exportAlignment.addToProfile(profile, translate(referenceCoding), signal);
+	if (aligned.profileRows.length !== passing.length || degap(aligned.sequence) !== translate(referenceCoding) || aligned.profileRows.some((row, index) => row.length !== aligned.sequence.length || degap(row) !== proteins[index])) throw new Error("The functional export reference addition did not preserve its input proteins.");
+	passing.forEach((outcome, index) => {
+		outcome.alignedAa = aligned.profileRows[index];
+		outcome.alignedNt = backtranslate(outcome.alignedAa, outcome.nt);
+	});
+	return {
+		outcomes,
+		referenceName: resolvedReferenceName,
+		referenceNt: backtranslate(aligned.sequence, referenceCoding),
+		referenceAa: aligned.sequence
 	};
 }
 async function postprocess(consensuses, contamination, config, signal, runMsa = runAlivibeMsa, sampleConcurrency = 1, onProgress, options = {}) {
@@ -1734,10 +1768,10 @@ async function postprocess(consensuses, contamination, config, signal, runMsa = 
 		functionalFilterErrors: Object.assign({}, ...completed.map((output) => output.functionalFilterErrors)),
 		collapseSeconds: 0
 	};
-	return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress, runMsa);
+	return options.collapse === false ? combined : collapsePostprocess(combined, config, signal, options.onCollapseProgress, runMsa, void 0, options.functionalAlignment);
 }
 /** Run family-count-preserving haplotype collapse as its own resumable stage. */
-async function collapsePostprocess(output, config, signal, onProgress, runMsa = runAlivibeMsa, sampleNames) {
+async function collapsePostprocess(output, config, signal, onProgress, runMsa = runAlivibeMsa, sampleNames, functionalAlignment = defaultFunctionalAlignment) {
 	const started = performance.now(), alignments = { ...output.alignments }, referenceAlignments = { ...output.referenceAlignments };
 	const collapseGroups = { ...output.collapseGroups }, summaries = output.summaries.map((summary) => ({ ...summary }));
 	const functionalFilterErrors = { ...output.functionalFilterErrors };
@@ -1775,7 +1809,7 @@ async function collapsePostprocess(output, config, signal, onProgress, runMsa = 
 				});
 				let batch;
 				try {
-					batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal);
+					batch = await functionalFilterBatch(sample.functionalReferenceSequence.name, sample.functionalReferenceSequence.sequence, collapsedRows.map((row) => row.sequence), sample.functionalMatchOverride ?? config.parameters.functionalMatchThreshold, runMsa, signal, functionalAlignment);
 				} catch (cause) {
 					if (signal?.aborted || cause instanceof DOMException && cause.name === "AbortError") throw cause;
 					const message = cause instanceof Error ? cause.message : String(cause);
@@ -5179,7 +5213,11 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
 		try {
 			downstream = await postprocess(consensuses, contamination, config, void 0, msaRunner, workers, void 0, {
 				panelMsa: panelMsaRunner,
-				panelFilter: panelFilterRunner
+				panelFilter: panelFilterRunner,
+				functionalAlignment: {
+					msa: panelMsaRunner,
+					addToProfile: panelMsaRunner.addToProfile
+				}
 			});
 		} finally {
 			await Promise.all([msaRunner.close?.(), panelMsaRunner.close?.()]);

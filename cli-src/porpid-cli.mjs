@@ -318,7 +318,8 @@ async function runPipeline({ inputPath, configPath, outputPath, workers, assets,
     const panelFilterRunner = createIndependentPanelFilterRunner(assets.panelWorkerPath);
     const downstreamStarted = performance.now(); let downstream;
     try { downstream = await postprocess(consensuses, contamination, config, undefined, msaRunner, workers, undefined,
-      { panelMsa: panelMsaRunner, panelFilter: panelFilterRunner }); }
+      { panelMsa: panelMsaRunner, panelFilter: panelFilterRunner,
+        functionalAlignment: { msa: panelMsaRunner, addToProfile: panelMsaRunner.addToProfile } }); }
     finally { await Promise.all([msaRunner.close?.(), panelMsaRunner.close?.()]); }
     downstream.summaries.forEach((summary, index) => {
       summary.demultiplexedReads = quality.perSample[index] ?? 0;
